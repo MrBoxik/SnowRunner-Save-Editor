@@ -37,6 +37,11 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 > **Peace out – MrBoxik**
 
 
+## ☕ Support
+
+If this save editor helped you and you want to say thanks you can [buy me a coffee](https://buymeacoffee.com/mrboxik). Totally optional, just appreciated. 🙂
+
+
 ## License
 
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
