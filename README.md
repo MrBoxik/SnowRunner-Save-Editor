@@ -27,7 +27,9 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 >  
 > All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 15**, and it *should* work fine for upcoming Seasons 16, 17, etc.  
 >  
-> Also — no save editor I found could change **game rules** or **game mode**, so I added those too. I even added time settings... just for fun.  
+> Also — no save editor I found could change **game rules** or **game mode**, so I added those too. I even added time settings... just for fun.
+> 
+> > 🔄 This editor **remembers the last save file you used**, so you don’t need to browse for it every time you launch the app.
 >  
 > What this save editor **is not**: good-looking, polished, or professional. It’s crude, rough, and basic.  
 >  
