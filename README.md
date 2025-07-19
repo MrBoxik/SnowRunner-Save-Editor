@@ -1,10 +1,3 @@
-
-## License
-
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
-
-This project is not affiliated with or endorsed by SnowRunner, Focus Home Interactive, or Saber Interactive.
-
 # SnowRunner Save Editor
 
 A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
@@ -40,3 +33,11 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 > If you don’t like how it looks, feel free to take the code and redo the visuals — that’s totally fine under the [MIT License](LICENSE).  
 >  
 > **Peace out – MrBoxik**
+
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+This project is not affiliated with or endorsed by SnowRunner, Focus Home Interactive, or Saber Interactive.
+
