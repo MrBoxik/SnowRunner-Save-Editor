@@ -37,6 +37,13 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 > **Peace out – MrBoxik**
 
 
+## 💬 Feedback or Questions?
+
+You can leave feedback [here on GitHub](https://github.com/MrBoxik/SnowRunner-Save-Editor/issues) — but I’m not going to be super active here.
+
+You’ll have better chances of getting a reply if you message me on [Discord](https://discord.com/users/638802769393745950).
+
+
 ## ☕ Support
 
 If this save editor helped you and you want to say thanks you can [buy me a coffee](https://buymeacoffee.com/mrboxik). Totally optional, just appreciated.
