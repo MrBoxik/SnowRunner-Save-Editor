@@ -9,7 +9,7 @@ This project is not affiliated with or endorsed by SnowRunner, Focus Home Intera
 
 A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 
-➡️ [Click here to download the latest version](https://github.com/MrBoxik/1.0/releases)
+➡️ [Click here to download the latest version](https://github.com/MrBoxik/SnowRunner-Save-Editor/releases)
 
 Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip`), extract it, and run the .exe file inside:
 
