@@ -20,3 +20,21 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 - ⚙️ Customize **game rules** (trucks, tires, fuel, repair, etc.)
 - 🌄 Modify **time settings** (always day, night, long day/night, etc.)
 - ✅ Mark **missions and contests** as complete
+
+## 💬 Note from the Creator
+
+> Here is my SnowRunner Save Editor that I made after losing progress in my 600-hour save — specifically in the Quebec map.  
+>  
+> All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 15**, and it *should* work fine for upcoming Seasons 16, 17, etc.  
+>  
+> Also — no save editor I found could change **game rules** or **game mode**, so I added those too. I even added time settings... just for fun.  
+>  
+> What this save editor **is not**: good-looking, polished, or professional. It’s crude, rough, and basic.  
+>  
+> What it **is**: working (hopefully 🤞).  
+>  
+> ⚠️ Still — **make a backup of your save file** before using it. I’m not accountable if you lose progress.  
+>  
+> If you don’t like how it looks, feel free to take the code and redo the visuals — that’s totally fine under the [MIT License](LICENSE).  
+>  
+> **Peace out – MrBoxik**
