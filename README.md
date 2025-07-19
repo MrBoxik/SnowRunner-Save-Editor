@@ -39,7 +39,7 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 
 ## ☕ Support
 
-If this save editor helped you and you want to say thanks you can [buy me a coffee](https://buymeacoffee.com/mrboxik). Totally optional, just appreciated. 🙂
+If this save editor helped you and you want to say thanks you can [buy me a coffee](https://buymeacoffee.com/mrboxik). Totally optional, just appreciated.
 
 
 ## License
