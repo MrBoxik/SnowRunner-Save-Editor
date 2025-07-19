@@ -28,7 +28,9 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 >  
 > What it **is**: working (hopefully 🤞).  
 >  
-> ⚠️ Still — **make a backup of your save file** before using it. I’m not accountable if you lose progress.  
+> ⚠️ Still — **make a backup of your save file** before using it. I’m not accountable if you lose progress.
+>
+> 🛡️ **Important:** Windows Defender or other antivirus software may flag this tool as suspicious or malicious. I don’t know why — maybe because it’s a small `.exe` built with PyInstaller and I’m not a verified publisher. You can choose to trust it or not — that’s up to you.
 >  
 > If you don’t like how it looks, feel free to take the code and redo the visuals — that’s totally fine under the [MIT License](LICENSE).  
 >  
