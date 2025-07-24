@@ -16,6 +16,10 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 
 ## 💬 Note from the Creator
 
+<table>
+<tr>
+<td>
+
 > Here is my SnowRunner Save Editor that I made after losing progress in my 300 hour save  specifically in the Quebec map.  
 >  
 > All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 15**, and it *should* work fine for upcoming Seasons 16, 17, etc.  
@@ -36,7 +40,14 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 >  
 > **Peace out – MrBoxik**
 
-![editor](https://github.com/MrBoxik/SnowRunner-Save-Editor/blob/main/editor.gif)
+</td>
+<td align="center" valign="top">
+
+<img src="https://github.com/MrBoxik/SnowRunner-Save-Editor/blob/main/editor.gif" alt="editor gif" width="310"/>
+
+</td>
+</tr>
+</table>
 
 ## 💬 Feedback or Questions?
 
@@ -55,4 +66,3 @@ If this save editor helped you and you want to say thanks you can [buy me a coff
 This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
 
 This project is not affiliated with or endorsed by SnowRunner, Focus Home Interactive, or Saber Interactive.
-
