@@ -20,7 +20,7 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 >  
 > All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 15**, and it *should* work fine for upcoming Seasons 16, 17, etc.  
 >  
-> Also — no save editor I found could change **game rules** , **game mode** or **time**, so I added those too.
+> Also no save editor I found could change **game rules** , **game mode** or **time**, so I added those too.
 > 
 > This editor **remembers the last save file you used**, so you don’t need to browse for it every time you launch the app.
 >  
@@ -28,11 +28,11 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 >  
 > What it **is**: working (hopefully 🤞).  
 >  
-> ⚠️ This editor has an **auto-backup system** that saves a copy of your original save before making changes — but I still recommend doing your own manual backup just to be safe. I’m not accountable if you lose progress.
+> ⚠️ This editor has an **auto-backup system** that saves a copy of your original save before making changes but I still recommend doing your own manual backup just to be safe. I’m not accountable if you lose progress.
 >
 > 🛡️ **Important:** Windows Defender or other antivirus software may flag this tool as suspicious or malicious. I don’t know why — maybe because it’s a small `.exe` built with PyInstaller and I’m not a verified publisher. You can choose to trust it or not — that’s up to you.
 >  
-> If you don’t like how it looks, feel free to take the code and redo the visuals — that’s totally fine under the [MIT License](LICENSE).  
+> If you don’t like how it looks, feel free to take the code and redo the visuals that’s totally fine under the [MIT License](LICENSE).  
 >  
 > **Peace out – MrBoxik**
 
