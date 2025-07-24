@@ -36,8 +36,6 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 >  
 > **Peace out – MrBoxik**
 
-https://cdn.discordapp.com/attachments/1298257786345361430/1397912033743208539/virus.exe.gif?ex=68837288&is=68822108&hm=bdf0cd720bb30af1334164eedf002febd7ca5fe7e791b62bb7d4aadb55fc8e49&
-
 ## 💬 Feedback or Questions?
 
 You can leave feedback [here on GitHub](https://github.com/MrBoxik/SnowRunner-Save-Editor/issues) — but I’m not going to be super active here.
