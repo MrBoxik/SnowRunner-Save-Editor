@@ -16,9 +16,9 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 
 ## 💬 Note from the Creator
 
-<div align="left" style="display: flex; align-items: flex-start; gap: 20px;">
-
-<div style="flex: 1;">
+<table>
+<tr>
+<td style="border: none; vertical-align: top;">
 
 > Here is my SnowRunner Save Editor that I made after losing progress in my 300 hour save  specifically in the Quebec map.  
 >  
@@ -40,13 +40,12 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 >  
 > **Peace out – MrBoxik**
 
-</div>
-
-<div style="flex-shrink: 0;">
+</td>
+<td style="border: none; vertical-align: top; padding-left: 20px;">
 <img src="https://github.com/MrBoxik/SnowRunner-Save-Editor/blob/main/editor.gif" alt="editor gif" width="310"/>
-</div>
-
-</div>
+</td>
+</tr>
+</table>
 
 ## 💬 Feedback or Questions?
 
