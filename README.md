@@ -42,7 +42,6 @@ You can leave feedback [here on GitHub](https://github.com/MrBoxik/SnowRunner-Sa
 
 You’ll have better chances of getting a reply if you message me on [Discord](https://discord.com/users/638802769393745950).
 
-!(https://github.com/MrBoxik/SnowRunner-Save-Editor/blob/main/editor%20gif.gif)
 
 ## ☕ Support
 
