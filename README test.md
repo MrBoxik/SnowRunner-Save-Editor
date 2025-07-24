@@ -43,7 +43,7 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Save_Editor.zip
 </td>
 <td align="center" valign="top">
 
-<img src="https://github.com/MrBoxik/SnowRunner-Save-Editor/blob/main/editor.gif" alt="editor gif" width="350"/>
+<img src="https://github.com/MrBoxik/SnowRunner-Save-Editor/blob/main/editor.gif" alt="editor gif" width="310"/>
 
 </td>
 </tr>
