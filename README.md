@@ -66,6 +66,12 @@ If this save editor helped you and you want to say thanks you can [buy me a coff
 
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+This project is licensed under a **Custom Non-Commercial License**.
+
+You are free to use, modify, and share the code for personal and non-commercial purposes, with attribution.  
+**Commercial use is not allowed** without prior written permission from the author.
+
+See the [LICENSE](LICENSE) file for full details.
 
 This project is not affiliated with or endorsed by SnowRunner, Focus Home Interactive, or Saber Interactive.
+
