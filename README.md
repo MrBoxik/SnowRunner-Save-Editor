@@ -15,6 +15,7 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Editor.zip), ex
 - ⚙️ Customize **game rules** (trucks, tires, fuel, repair, etc.)
 - 🌄 Modify **time settings** (always day, night, long day/night, etc.)
 - ✅ Mark **missions, Tasks and contests** as complete
+- 🔓 Unlock upgrades per season or map
 
 ## 💬 Note from the Creator
 
