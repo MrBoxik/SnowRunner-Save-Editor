@@ -31,7 +31,7 @@ Download the `.zip` file from the **Assets** section (SnowRunner_Editor.zip), ex
 
 > Here is my SnowRunner Save Editor that I made after losing progress in my 300 hour save  specifically in the Quebec map.  
 >  
-> All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 15**, and it *should* work fine for upcoming Seasons 16, 17, etc.  
+> All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 16**, and it *should* work fine for upcoming Seasons 17, 18, etc.  
 >  
 > Also no save editor I found could change **game rules** , **game mode** or **time**, so I added those too.
 > 
