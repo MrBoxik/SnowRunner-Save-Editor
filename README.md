@@ -4,9 +4,9 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 
 ➡️ [Click here to download the latest windows version](https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/69a)
 
-➡️ [Click here to download the latest mac version](https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/69b)
+➡️ [Click here to download the latest mac version](https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/69c)
 
-➡️ [Click here to download the latest Linux version](https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/66)
+➡️ [Click here to download the latest Linux version](https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/69b)
 
 
 Download the `.exe` file from the **Assets** section (SnowRunner_Editor.exe), and run it
