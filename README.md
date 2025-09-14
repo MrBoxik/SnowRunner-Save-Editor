@@ -20,10 +20,16 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 
 - 💰 Edit **money** and **rank**
 - 🛠️ Change **game difficulty mode**
-- ⚙️ Customize **game rules** (trucks, tires, fuel, repair, etc.)
-- 🌄 Modify **time settings** (always day, night, long day/night, etc.)
+- ⚙️ Modify **game rules** (trucks, tires, fuel, repair, etc.)
+- 🌄 Adjust **time settings** (day-only, night-only, multipliers, time stop & more)
 - ✅ Mark **missions, tasks, and contests** as complete
-- 🔓 Unlock upgrades per season or map
+- 🔓 Unlock **upgrades and watchtowers**
+- 🌫️ **Fog Tool** — edit Fog of War directly
+- 📊 **Game Stats** viewer & editor
+- 🛡️ **Auto-backup system** (with cleanup & recall)
+- 📦 Supports **Seasons 1–16** (future-ready for later seasons)
+- 📂 Remembers your **last used save file**
+- 🔄 Built-in **update checker**
 
 ---
 
