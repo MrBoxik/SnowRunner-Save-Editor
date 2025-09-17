@@ -12,13 +12,14 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 <a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/85c" style="font-size:20px;">➡️ <b>Download for Mac</b></a><br><br>
 <a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/85b" style="font-size:20px;">➡️ <b>Download for Linux</b></a>
 
-<a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/70" style="font-size:20px;">
-  ➡️ <b>Download live video maker in map (windows only)</b>
+<a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/70">
+  ➡️ <b>Download live video maker in map (Windows only)</b>
 </a>
 <br>
-<a href="https://youtu.be/zm66iWsVAvA" style="font-size:16px;">
-  🎥 Example Video
+<a href="https://youtu.be/zm66iWsVAvA">
+  <img src="https://img.youtube.com/vi/zm66iWsVAvA/hqdefault.jpg" alt="🎥 Example Video" width="400">
 </a>
+
 
 
 </p>
