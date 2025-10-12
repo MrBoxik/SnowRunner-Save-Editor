@@ -1,14 +1,64 @@
-# Combined SnowRunner Editor with Minesweeper and Fog Tool in one file
+from __future__ import annotations
+import sys
+import platform
+import os
 
-# --- Inlined: minesweeper_patched.py ---
+# --- Windows AppID: MUST run before any Tk / PhotoImage / ImageTk usage ---
+if platform.system() == "Windows":
+    import ctypes
+    from ctypes import wintypes
+    try:
+        wintypes.HRESULT = ctypes.c_long
+    except Exception:
+        pass
+    try:
+        MYAPPID = "com.mrboxik.snowrunnereditor"
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(MYAPPID)
+    except Exception:
+        # ignore if not available
+        pass
 
-import tkinter as tk
-from tkinter import ttk
-from tkinter import messagebox
+# now safe to import other stdlib and GUI libs
+import time
+import struct
+import zlib
+import traceback
+import shutil
+import threading
+import random
+import glob
+import re
+import json
+import importlib.util
+from datetime import datetime
 import requests
+import webbrowser
+
+# optional heavy libs (ok after AppID)
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+# Import PIL and tkinter AFTER AppID is set.
+# IMPORTANT: make sure no other modules imported earlier import tkinter themselves.
+from PIL import Image, ImageDraw
+# Delay ImageTk import until you actually need it (see (B) below).
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+# if you use PhotoImage objects from files, you can still use tkinter.PhotoImage
 
 
 SAVE_FILE = "minesweeper_save.json"
+
+def resource_path(relative_path):
+    """ Get absolute path to resource, works for dev and for PyInstaller """
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+dropdown_widgets = {}
 
 def load_progress():
     if not os.path.exists(SAVE_FILE):
@@ -81,18 +131,22 @@ class MinesweeperApp:
                     bg=CELL_COLORS["default"], activebackground=CELL_COLORS["default"],
                     command=lambda r=r, c=c: self.reveal(r, c)
                 )
+                # Cross-platform right-click support
                 btn.bind("<Button-3>", lambda e, r=r, c=c: self.toggle_flag(r, c))
+                btn.bind("<Button-2>", lambda e, r=r, c=c: self.toggle_flag(r, c))
                 btn.grid(row=r, column=c)
                 row.append(Cell(r, c, btn))
             self.cells.append(row)
 
     def place_mines(self, safe_r, safe_c):
         exclude = {(safe_r + dr, safe_c + dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)}
-        while len(self.mine_locations) < self.mines:
-            r, c = random.randrange(self.size), random.randrange(self.size)
-            if (r, c) not in exclude and not self.cells[r][c].has_mine:
-                self.cells[r][c].has_mine = True
-                self.mine_locations.add((r, c))
+        available = [(r, c) for r in range(self.size) for c in range(self.size) if (r, c) not in exclude]
+        if len(available) < self.mines:
+            raise ValueError("Not enough space to place mines!")
+        chosen = random.sample(available, self.mines)
+        for r, c in chosen:
+            self.cells[r][c].has_mine = True
+            self.mine_locations.add((r, c))
 
     def reveal(self, r, c):
         cell = self.cells[r][c]
@@ -143,20 +197,21 @@ class MinesweeperApp:
         return all(cell.revealed or cell.has_mine for row in self.cells for cell in row)
 
     def win_level(self):
-        if self.level == 1: self.data["has_bronze"] = True; self.level = 2
-        elif self.level == 2: self.data["has_silver"] = True; self.level = 3
-        elif self.level == 3: self.data["has_gold"] = True
+        if self.level == 1:
+            self.data["has_bronze"] = True
+            self.level = 2
+        elif self.level == 2:
+            self.data["has_silver"] = True
+            self.level = 3
+        elif self.level == 3:
+            self.data["has_gold"] = True
+            # After gold, reset to level 1 for replay
+            self.level = 1
         self.data["level"] = self.level
         save_progress(self.data)
         self.start_level()
 
 MINESWEEPER_AVAILABLE = True
-
-import os
-import struct
-import zlib
-import traceback
-from PIL import Image, ImageTk, ImageDraw
 
 # ---------- BitWriter ----------
 class BitWriter:
@@ -188,7 +243,6 @@ class BitWriter:
             self.cur = 0
             self.bitpos = 0
         return bytes(self.bytes)
-
 
 # ---------- Path handling ----------
 def load_editor_last_path():
@@ -230,7 +284,6 @@ def load_initial_path():
 
     # 3) Fallback
     return os.getcwd()
-
 
 # ---------- Main App ----------
 class FogToolApp(ttk.Frame):
@@ -943,29 +996,12 @@ class FogToolFrame(ttk.Frame):
         self.app = FogToolApp(self, initial_save_dir=initial_save_dir)
         self.app.pack(fill="both", expand=True)
 
-
-# ---------------- Run standalone ----------------
-
 # --- Original editor (snowrunner_editor.py) ---
 
-import os
-import sys
-import platform
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, PhotoImage
 
 make_backup_var = None
-
-import os, sys, platform
-if platform.system() == "Windows":
-    import ctypes
-    from ctypes import wintypes
-    
-
-wintypes.HRESULT = ctypes.c_long  # Fix missing HRESULT
-
-import sys, os, platform, ctypes
-from ctypes import wintypes
 
 def get_desktop_path():
     if platform.system() == "Windows":
@@ -1025,32 +1061,7 @@ def get_desktop_path():
     if result != 0:
         raise ctypes.WinError(result)
     return path_ptr.value
-
-
-import ctypes
-from ctypes import wintypes
-
-import platform
-import sys
-import os
-
-def resource_path(relative_path):
-    """ Get absolute path to resource, works for dev and for PyInstaller """
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
-dropdown_widgets = {}
-import json
-import tkinter as tk
-
-from tkinter import filedialog, messagebox, simpledialog, ttk
-import os
-import re
-import importlib.util
-import glob
-
+    
 def set_var(var, val_map, actual_val):
     for label, value in val_map.items():
         if value == actual_val:
@@ -1107,10 +1118,6 @@ FACTOR_RULE_DEFINITIONS = [
     ("Contracts Payouts", "contractsPayoutsFactor", {"normal": 1, "50%": 0.5, "150%": 1.5, "200%": 2.0, "300%": 3.0})
 ]
 FACTOR_RULE_VARS = []
-
-
-import shutil
-from datetime import datetime
 
 def make_backup_if_enabled(path):
     try:
@@ -1170,7 +1177,6 @@ def make_backup_if_enabled(path):
     except Exception as e:
         print(f"[Backup Error] Failed to create backup: {e}")
 
-        
 def recall_backup(path):
     try:
         save_dir = os.path.dirname(path)
@@ -1231,7 +1237,6 @@ def load_last_path():
             return f.read().strip()
     return ""
 
-
 def safe_load_save(path):
     """Try to load a save file, return content or None with popup error."""
     if not os.path.exists(path):
@@ -1249,7 +1254,6 @@ def safe_load_save(path):
             f"Could not load save file:\n{path}\n\nThe file appears to be corrupted or incomplete."
         )
         return None
-
 
 def try_autoload_last_save(save_path_var):
     last_path = load_last_path()
@@ -1284,7 +1288,6 @@ def try_autoload_last_save(save_path_var):
             f"Could not load save file:\n{last_path}\n\nThe file appears to be corrupted or incomplete."
         )
         save_path_var.set("")
-
 
 def save_path(path):
     if "dont_remember_path_var" in globals() and dont_remember_path_var.get():
@@ -1443,7 +1446,6 @@ def sync_rule_dropdowns(path):
                     var.set(label)
                     return
 
-        
         tyre_val = extract_int("tyreAvailability")
         set_var(tyre_var, {
             "all tires available": 0,
@@ -1468,11 +1470,8 @@ def sync_rule_dropdowns(path):
                     dropdown_widgets["tyreAvailability"].set(label)
                     break
     
-
     except Exception as e:
         print("Error syncing rule dropdowns:", e)
-
-
 
 def sync_factor_rule_dropdowns(file_path):
     try:
@@ -1495,8 +1494,6 @@ def sync_factor_rule_dropdowns(file_path):
                         break
     except Exception as e:
         print("Failed to sync factor rules:", e)
-
-
 
 def extend_rules_tab(tab, context):
     var = tk.StringVar(value="default")
@@ -1526,7 +1523,6 @@ def extend_rules_tab(tab, context):
                     break
         except Exception as e:
             print(f"[External Addon Rule Sync Error]: {e}")
-
 
 def run_complete():
     make_backup_if_enabled(save_path_var.get())
@@ -1591,16 +1587,7 @@ def run_complete():
     except Exception as e:
         messagebox.showerror("Contest Completion Error", str(e))
 
-
-
-
 # ---- Contests Tab Logic ----
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
-import json
-import os
-import re
-
 def extract_brace_block(s, start_index):
     open_braces = 0
     in_string = False
@@ -1619,25 +1606,24 @@ def extract_brace_block(s, start_index):
                 if open_braces == 0:
                     return s[block_start:i+1], block_start, i+1
         escape = (char == '\\' and not escape)
-    raise ValueError("Matching closing brace not found")
+    raise ValueError("Matching closing brace not found.")
 
-def extract_json_block_by_key(text, key):
-    key_start = text.find(f'"{key}"')
-    if key_start == -1:
+def extract_json_block_by_key(s, key):
+    m = re.search(rf'"{re.escape(key)}"\s*:\s*{{', s)
+    if not m:
         raise ValueError(f"Key '{key}' not found")
-    while key_start > 0 and text[key_start] != '{':
-        key_start -= 1
-    return extract_brace_block(text, key_start)
+    return extract_brace_block(s, m.end() - 1)
 
 def update_all_contest_times_blocks(content, new_entries):
     matches = list(re.finditer(r'"contestTimes"\s*:\s*{', content))
     updated_content = content
-    for match in reversed(matches):  # Process from end to preserve indexes
+    for match in reversed(matches):  # process backwards to preserve offsets
         json_block, block_start, block_end = extract_brace_block(content, match.end() - 1)
         parsed = json.loads(json_block)
-        for key in new_entries:
+        # ensure new entries exist without overwriting existing values
+        for key, val in new_entries.items():
             if key not in parsed:
-                parsed[key] = 1
+                parsed[key] = val
         new_block_str = json.dumps(parsed, separators=(",", ":"))
         updated_content = updated_content[:block_start] + new_block_str + updated_content[block_end:]
     return updated_content
@@ -1648,56 +1634,55 @@ def mark_discovered_contests_complete(save_path, selected_seasons, selected_maps
         messagebox.showerror("Error", "Save file not found.")
         return
 
-    with open(save_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
     try:
+        with open(save_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # find CompleteSave block key like "CompleteSave2"
         save_key_match = re.search(r'"(CompleteSave\d*)"\s*:\s*{', content)
         if not save_key_match:
             messagebox.showerror("Error", "No valid CompleteSave* block found.")
             return
         save_key = save_key_match.group(1)
+
         json_block, start, end = extract_json_block_by_key(content, save_key)
         data = json.loads(json_block)
-        ssl_value = data[save_key]["SslValue"]
+        ssl_value = data.get(save_key, {}).get("SslValue", {})
 
         discovered = ssl_value.get("discoveredObjectives", {})
-        finished = ssl_value.get("finishedObjs", [])
-        if not isinstance(finished, list):
-            messagebox.showerror("Error", "finishedObjs is not a list")
-            return
+        # Normalize finishedObjs (accept list OR dict) and remember original shape
+        orig_finished = ssl_value.get("finishedObjs", [])
+        finished_is_dict = isinstance(orig_finished, dict)
+        if isinstance(orig_finished, list):
+            finished_set = set(orig_finished)
+        elif isinstance(orig_finished, dict):
+            finished_set = set(orig_finished.keys())
+        else:
+            finished_set = set()
 
+        # Ensure contestTimes is a dict we can write to
         contest_times = ssl_value.get("contestTimes", {})
         if not isinstance(contest_times, dict):
             contest_times = {}
 
-        
+        # season->region map (keep your mapping)
         season_region_map = {
-            1: "RU_03",  # Season 1: Kola Peninsula
-            2: "US_04",  # Season 2: Yukon
-            3: "US_03",  # Season 3: Wisconsin
-            4: "RU_04",  # Season 4: Amur
-            5: "RU_05",  # Season 5: Don
-            6: "US_06",  # Season 6: Maine
-            7: "US_07",  # Season 7: Tennessee
-            8: "RU_08",  # Season 8: Glades
-            9: "US_09",  # Season 9: Ontario
-            10: "US_10", # Season 10: British Columbia
-            11: "US_11", # Season 11: Scandinavia
-            12: "US_12", # Season 12: North Carolina
-            13: "RU_13", # Season 13: Almaty
-            14: "US_14", # Season 14: Austria
-            15: "US_15", # Season 15: Quebec
-            16: "US_16", # Season 16: Washington
+            1: "RU_03", 2: "US_04", 3: "US_03", 4: "RU_04",
+            5: "RU_05", 6: "US_06", 7: "US_07", 8: "RU_08",
+            9: "US_09", 10: "US_10", 11: "US_11", 12: "US_12",
+            13: "RU_13", 14: "US_14", 15: "US_15", 16: "US_16"
         }
         selected_region_codes = [season_region_map[s] for s in selected_seasons if s in season_region_map]
 
         added_keys = []
-        for key in discovered:
-            if any(part in key for part in ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "P", "O", "Q", "R", "T", "S", "U", "V", "W", "X", "Y", "Z")):
+        # discovered might be dict (keys) or list; handle both
+        discovered_iter = discovered.keys() if isinstance(discovered, dict) else (discovered or [])
+
+        for key in discovered_iter:
+            if any(part in key for part in ("A","B","C","D","E","F","G","H","I","J","K","L","M","N","P","O","Q","R","T","S","U","V","W","X","Y","Z")):
                 if any(code in key for code in selected_region_codes + selected_maps):
-                    if key not in finished:
-                        finished.append(key)
+                    if key not in finished_set:
+                        finished_set.add(key)
                         added_keys.append(key)
                     if key not in contest_times:
                         contest_times[key] = 1
@@ -1706,25 +1691,27 @@ def mark_discovered_contests_complete(save_path, selected_seasons, selected_maps
             messagebox.showinfo("Info", "No new contests were modified.")
             return
 
-        ssl_value["finishedObjs"] = finished
+        # Write back finishedObjs in the original shape
+        if finished_is_dict:
+            ssl_value["finishedObjs"] = {k: True for k in finished_set}
+        else:
+            ssl_value["finishedObjs"] = list(finished_set)
+
         ssl_value["contestTimes"] = contest_times
 
-        
-        
         # Remove from viewedUnactivatedObjectives if present
         viewed = ssl_value.get("viewedUnactivatedObjectives", [])
         if isinstance(viewed, list):
-            before = len(viewed)
             viewed = [v for v in viewed if v not in added_keys]
             ssl_value["viewedUnactivatedObjectives"] = viewed
 
-        # Replace the original JSON block in the file with the updated one
+        # put SslValue back into the data structure and replace block
+        data[save_key]["SslValue"] = ssl_value
         updated_json_block = json.dumps(data, separators=(",", ":"))
         updated_content = content[:start] + updated_json_block + content[end:]
 
-        # Now update all contestTimes blocks inside updated_content
+        # update any other contestTimes blocks
         updated_content = update_all_contest_times_blocks(updated_content, contest_times)
-    
 
         with open(save_path, "w", encoding="utf-8") as f:
             f.write(updated_content)
@@ -1732,8 +1719,9 @@ def mark_discovered_contests_complete(save_path, selected_seasons, selected_maps
         messagebox.showinfo("Success", f"{len(added_keys)} contests marked as completed.")
 
     except Exception as e:
-        messagebox.showerror("Error", str(e))
-
+        # show full exception to help debugging
+        messagebox.showerror("Error", repr(e))
+        
 def unlock_watchtowers(save_path, selected_regions):
     make_backup_if_enabled(save_path)
     try:
@@ -1765,6 +1753,1152 @@ def unlock_watchtowers(save_path, selected_regions):
         messagebox.showinfo("Success", f"Unlocked {updated} watchtowers.")
     except Exception as e:
         messagebox.showerror("Error", str(e))
+# ---------------- objectives_tab_standalone_guarded.py ----------------
+# Import-safe, drop-in replacement of the Objectives+ tab snippet.
+# Safe to import: no GUI calls, no background threads, no file reads run at import-time.
+# Full implementation preserved. Use create_objectives_tab(tab, save_path_var)
+# to mount in your editor. Nothing runs on import.
+
+import os
+import time
+import re
+import json
+import threading
+import traceback
+from typing import Any, Dict, List, Set, Optional
+
+# Do NOT import tkinter, PIL.ImageTk, or create ttk.Style at module import time.
+# We'll import them lazily inside the class when the UI is created.
+
+# optional pandas — lazily imported inside loader when needed
+_pd = None  # placeholder for pandas when loaded
+
+# ---------------- CONFIG / DEBUG ----------------
+DEBUG: bool = True
+_APP_START: Optional[float] = None
+
+def _now_ms() -> float:
+    global _APP_START
+    if _APP_START is None:
+        _APP_START = time.perf_counter()
+    return (time.perf_counter() - _APP_START) * 1000.0
+
+STRIPE_A = "#e0e0e0"
+STRIPE_B = "#f8f8f8"
+
+def log(msg: str) -> None:
+    if not DEBUG:
+        return
+    elapsed = _now_ms()
+    t = time.strftime('%H:%M:%S')
+    try:
+        print(f"[{t} +{elapsed:.0f}ms] {msg}")
+    except Exception:
+        try:
+            print(msg)
+        except Exception:
+            pass
+
+def default_parquet_path() -> str:
+    base = os.path.dirname(__file__)
+    return os.path.join(base, "maprunner_data.parquet")
+
+REGION_NAME_MAP = {
+    "US_01": "Michigan", "US_02": "Alaska", "RU_02": "Taymyr",
+    "RU_03": "Kola Peninsula", "US_03": "Wisconsin", "US_04": "Yukon",
+}
+
+# ---------------- helpers ----------------
+def extract_brace_block(s: str, start_index: int):
+    open_braces = 0
+    in_string = False
+    escape = False
+    block_start = None
+    for i in range(start_index, len(s)):
+        char = s[i]
+        if char == '"' and not escape:
+            in_string = not in_string
+        if not in_string:
+            if char == '{':
+                if open_braces == 0:
+                    block_start = i
+                open_braces += 1
+            elif char == '}':
+                open_braces -= 1
+                if open_braces == 0 and block_start is not None:
+                    return s[block_start:i + 1], block_start, i + 1
+        escape = (char == '\\' and not escape)
+    raise ValueError("Matching closing brace not found.")
+
+def extract_json_block_by_key(s: str, key: str):
+    m = re.search(rf'"{re.escape(key)}"\s*:\s*{{', s)
+    if not m:
+        raise ValueError("Key not found")
+    return extract_brace_block(s, m.end() - 1)
+
+def _read_finished_contests(path: str) -> Set[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return set()
+
+    m = re.search(r'"(CompleteSave[^"]*)"\s*:\s*{', content)
+    if not m:
+        return set()
+
+    save_key = m.group(1)
+    try:
+        json_block, _, _ = extract_json_block_by_key(content, save_key)
+        data = json.loads(json_block)
+    except Exception:
+        return set()
+
+    save_obj = data.get(save_key, data)
+    ssl = save_obj.get("SslValue", {})
+    finished = ssl.get("finishedObjs", {})
+
+    if isinstance(finished, dict):
+        return {k for k, v in finished.items() if v}
+    elif isinstance(finished, list):
+        return set(finished)
+    return set()
+
+def _read_finished_missions(save_path: str) -> Set[str]:
+    try:
+        with open(save_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        start = content.find('"objectiveStates"')
+        if start == -1:
+            return set()
+        block, bs, be = extract_brace_block(content, start)
+        obj_states = json.loads(block)
+        return {k for k, v in obj_states.items() if isinstance(v, dict) and v.get("isFinished")}
+    except Exception:
+        return set()
+
+def _write_toggle_contest(save_path: str, key: str, checked: bool):
+    log(f"[ACTION] toggle contest {key} -> {checked} (save: {save_path})")
+
+def _write_toggle_mission(save_path: str, key: str, checked: bool):
+    log(f"[ACTION] toggle mission {key} -> {checked} (save: {save_path})")
+
+# ---------------- safe parquet loader (lazy pandas import) ----------------
+def _load_parquet_safe(parquet_path: Optional[str] = None):
+    global _pd
+    if parquet_path is None:
+        parquet_path = default_parquet_path()
+    log("Starting parquet load: %s" % parquet_path)
+    t0 = time.perf_counter()
+    if _pd is None:
+        try:
+            import pandas as pd
+            _pd = pd
+        except Exception:
+            _pd = None
+    if _pd is None:
+        log("pandas not available — cannot read parquet.")
+        return None
+    if not os.path.exists(parquet_path):
+        log(f"parquet file not found: {parquet_path}")
+        return None
+    try:
+        df = _pd.read_parquet(parquet_path)
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        dt = (time.perf_counter() - t0) * 1000.0
+        log(f"Parquet read complete: {len(df)} rows (read time {dt:.0f}ms)")
+        return df
+    except Exception as e:
+        log(f"Failed to read parquet: {e}")
+        return None
+
+# ---------------- Virtualized Objectives view (lazy GUI imports) ----------------
+class VirtualObjectivesFast:
+    def __init__(self, parent, save_path_var):
+        # Lazy import: only import tkinter and related GUI modules when we instantiate the class.
+        # This prevents any Tk initialization at module import time.
+        try:
+            import tkinter as _tk
+            from tkinter import ttk as _ttk, messagebox as _messagebox, filedialog as _filedialog
+            # Pillow's ImageTk only needed if thumbnails/tooltips are used - import lazily later if needed.
+        except Exception:
+            # If GUI modules are unavailable, raise so the caller knows UI can't be built.
+            raise
+
+        # Expose symbols at module level so the rest of the class implementation can use them verbatim.
+        # This avoids changing the entire implementation to reference self.tk/self.ttk everywhere.
+        globals()['tk'] = _tk
+        globals()['ttk'] = _ttk
+        globals()['messagebox'] = _messagebox
+        globals()['filedialog'] = _filedialog
+
+        # Save parent and variable
+        self.parent = parent
+        self.save_var = save_path_var
+        self._last_save_path = None
+        # start watching only after caller mounts the UI (we still install watcher here, but it won't run until the main app loop exists)
+        self._watch_save_var()
+
+        # Basic UI placeholders (actual widgets created in build_ui)
+        self.frame = None
+        self.topbar = None
+        self.canvas = None
+        self.canvas_width = 0
+        self.canvas_height = 0
+
+        # Data
+        self.items: List[Dict[str, Any]] = []
+        self.filtered: List[int] = []
+        self.original_checked: Set[str] = set()
+        self.session_locked: Set[str] = set()
+        self.selected_changes: Dict[str, bool] = {}
+
+        # Virtualization config
+        self.row_height = 30
+        self.buffer_rows = 6
+        self.pool = []
+        self.pool_size = 0
+        self.pool_initialized = False
+
+        # UI state variables (create after tkinter import)
+        self.search_var = tk.StringVar()
+        self.type_var = tk.StringVar()
+        self.region_var = tk.StringVar()
+        self.category_var = tk.StringVar()
+
+        # Tooltip placeholders
+        self._tip = None
+        self._tip_label = None
+
+        # Lock for thread-safety
+        self._lock = threading.Lock()
+
+        # last visible index for logging scroll changes
+        self._last_first_visible = -1
+
+        # type map
+        self._type_label_to_internal = {"": "", "Task": "TASK", "Contract": "CONTRACT", "Contest": "CONTEST"}
+
+        # Style: create when GUI exists (but safe here since tkinter imported inside __init__)
+        try:
+            self.style = ttk.Style()
+            # Configure stripes; if a theme ignores these, it's fine.
+            try:
+                self.style.configure("RowA.TCheckbutton", background=STRIPE_A)
+                self.style.map("RowA.TCheckbutton", background=[("active", STRIPE_A)])
+                self.style.configure("RowB.TCheckbutton", background=STRIPE_B)
+                self.style.map("RowB.TCheckbutton", background=[("active", STRIPE_B)])
+            except Exception:
+                pass
+        except Exception:
+            # Some environments may not allow style configuration before a real root — ignore.
+            self.style = None
+
+    # ---------------- UI builder ----------------
+    def build_ui(self):
+        # Build the actual UI. This must be called from main thread and after this object is instantiated.
+        self.frame = ttk.Frame(self.parent)
+        self.topbar = ttk.Frame(self.frame)
+        self.frame.pack(fill="both", expand=True)
+        self.topbar.pack(side="top", fill="x", padx=6, pady=6)
+
+        ttk.Label(self.topbar, text="Search:").pack(side="left")
+        se = ttk.Entry(self.topbar, textvariable=self.search_var, width=30)
+        se.pack(side="left", padx=(4, 8))
+        se.bind("<KeyRelease>", lambda e: self.apply_filters())
+
+        ttk.Label(self.topbar, text="Type:").pack(side="left")
+        cb1 = ttk.Combobox(self.topbar, textvariable=self.type_var, values=["", "Task", "Contract", "Contest"], width=12, state="readonly")
+        cb1.pack(side="left", padx=(4, 8))
+        cb1.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
+
+        ttk.Label(self.topbar, text="Region:").pack(side="left")
+        cb2 = ttk.Combobox(self.topbar, textvariable=self.region_var, values=[""], width=20, state="readonly")
+        cb2.pack(side="left", padx=(4, 8))
+        cb2.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
+
+        ttk.Label(self.topbar, text="Category:").pack(side="left")
+        cb3 = ttk.Combobox(self.topbar, textvariable=self.category_var, values=["", "Truck Delivery", "Cargo Delivery", "Exploration"], width=16, state="readonly")
+        cb3.pack(side="left", padx=(4, 8))
+        cb3.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
+
+        ttk.Button(self.topbar, text="Reload Save", command=self.reload_checked_from_save).pack(side="right", padx=4)
+
+        holder = tk.Frame(self.frame)
+        holder.pack(fill="both", expand=True, padx=6, pady=(0,6))
+
+        self.canvas = tk.Canvas(holder, highlightthickness=0)
+        vsb = ttk.Scrollbar(holder, orient="vertical", command=self._on_scrollbar)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        # capture sizes
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        bottom = ttk.Frame(self.frame)
+        bottom.pack(side="bottom", fill="x", padx=6, pady=6)
+
+        def _show_objectives_warning():
+            msg = (
+                "Warning — persistent save edits:\n\n"
+                "1) Once you exit the editor with applied changes you can't un-complete those objectives without restoring a backup.\n\n"
+                "2) You will not receive in-game rewards for objectives you mark as completed through this editor.\n\n"
+                "3) Marking contracts that are locked behind other contracts will break the game until you also mark the prerequisite contracts — check in-game prerequisites before using this tool.\n\n"
+            )
+            try:
+                messagebox.showwarning("Objectives+ — Important", msg)
+            except Exception:
+                pass
+
+        warn_label = ttk.Label(
+            bottom,
+            text="⚠️",
+            foreground="red",
+            font=("TkDefaultFont", 9, "bold"),
+            wraplength=500,
+            justify="left"
+        )
+        warn_label.pack(side="left", padx=(0, 8))
+
+        read_btn = tk.Button(
+            bottom,
+            text="Read warning",
+            command=_show_objectives_warning,
+            bg="#c62828",
+            fg="white",
+            activebackground="#b71c1c",
+            relief="raised"
+        )
+        read_btn.pack(side="left", padx=(0, 8))
+
+        ttk.Button(bottom, text="Check filtered", command=self.check_filtered).pack(side="right", padx=4)
+        ttk.Button(bottom, text="Uncheck filtered", command=self.uncheck_filtered).pack(side="right", padx=4)
+        ttk.Button(bottom, text="Apply Changes", command=self.apply_changes_thread).pack(side="right")
+
+    # ---------------- canvas & virtual pool management ----------------
+    def _on_canvas_configure(self, event):
+        changed = False
+        if event.width != self.canvas_width:
+            self.canvas_width = event.width
+            changed = True
+        if event.height != self.canvas_height:
+            self.canvas_height = event.height
+            changed = True
+        if changed and self.items:
+            log(f"Canvas resized -> width={self.canvas_width}, height={self.canvas_height}")
+            self._ensure_pool()
+
+    def _on_mousewheel(self, event):
+        delta = int(-1*(event.delta/120))
+        self.canvas.yview_scroll(delta, "units")
+        self._update_visible_rows()
+
+    def _on_scrollbar(self, *args):
+        self.canvas.yview(*args)
+        self._update_visible_rows()
+
+    def _watch_save_var(self):
+        try:
+            current = self.save_var.get() if hasattr(self.save_var, "get") else self.save_var
+            if current != getattr(self, "_last_save_path", None):
+                self._last_save_path = current
+                if current and os.path.exists(current):
+                    log(f"[WATCH] Save path changed -> {current}")
+                    self.reload_checked_from_save()
+        except Exception as e:
+            log(f"[WATCH ERROR] {e}")
+        # Recheck every second
+        try:
+            # parent might not have .after if not yet in mainloop; guard it
+            if hasattr(self, "parent") and hasattr(self.parent, "after"):
+                self.parent.after(1000, self._watch_save_var)
+        except Exception:
+            pass
+
+    def _ensure_pool(self):
+        visible_rows = max(1, int(self.canvas_height / self.row_height))
+        desired_pool = min(len(self.filtered), visible_rows + self.buffer_rows)
+        if desired_pool == 0:
+            desired_pool = min(10, max(1, visible_rows + self.buffer_rows))
+
+        if not self.pool_initialized or desired_pool != self.pool_size:
+            log(f"Creating/resizing pool: old={self.pool_size}, new={desired_pool} (filtered={len(self.filtered)})")
+            for p in self.pool:
+                try:
+                    self.canvas.delete(p["window_id"])
+                except Exception:
+                    pass
+            self.pool.clear()
+
+            self.pool_size = desired_pool
+            for i in range(self.pool_size):
+                f = tk.Frame(self.canvas, height=self.row_height, bg=STRIPE_A)
+                f.pack_propagate(False)
+
+                cb_var = tk.BooleanVar(value=False)
+                cb = ttk.Checkbutton(f, variable=cb_var, style="RowA.TCheckbutton")
+                cb.pack(side="left", padx=6)
+
+                lbl = tk.Label(f, text="", anchor="w", bg=STRIPE_A)
+                lbl.pack(side="left", fill="x", expand=True, padx=(6,6))
+                info = tk.Label(f, text="i", width=2, relief="ridge", bg=STRIPE_A)
+                info.pack(side="right", padx=6)
+
+                def enter(e, pool_index=i):
+                    self._show_tooltip_for_pool(pool_index, e)
+                def leave(e):
+                    self._hide_tooltip()
+
+                info.bind("<Enter>", enter)
+                info.bind("<Leave>", leave)
+
+                window_id = self.canvas.create_window((0, 0), window=f, anchor="nw", width=self.canvas_width)
+
+                p = {
+                    "frame": f,
+                    "cb_var": cb_var,
+                    "cb": cb,
+                    "label": lbl,
+                    "info": info,
+                    "window_id": window_id,
+                    "item_index": None
+                }
+                self.pool.append(p)
+
+            self.pool_initialized = True
+
+            try:
+                self._refresh_visible_checkbox_vars(force=True)
+                self.canvas.update_idletasks()
+            except Exception:
+                pass
+
+        total_h = len(self.filtered) * self.row_height
+        self.canvas.configure(scrollregion=(0, 0, self.canvas_width, max(total_h, self.canvas_height)))
+        self._update_visible_rows()
+
+    def _update_visible_rows(self):
+        if not self.pool_initialized or not self.filtered:
+            if self.pool_initialized:
+                for p in self.pool:
+                    try:
+                        self.canvas.itemconfigure(p["window_id"], state="hidden")
+                    except Exception:
+                        pass
+            return
+
+        y0 = self.canvas.canvasy(0)
+        first_visible = int(max(0, y0 // self.row_height))
+        visible_rows_count = max(1, int(self.canvas_height / self.row_height))
+        if first_visible != self._last_first_visible:
+            self._last_first_visible = first_visible
+            log(f"Viewport first_visible={first_visible} visible_rows={visible_rows_count} (filtered_total={len(self.filtered)})")
+
+        for pool_pos, p in enumerate(self.pool):
+            item_idx = first_visible + pool_pos
+            if item_idx >= len(self.filtered):
+                try:
+                    self.canvas.itemconfigure(p["window_id"], state="hidden")
+                except Exception:
+                    pass
+                p["item_index"] = None
+                try:
+                    if "_trace_ids" in p:
+                        for tid in p["_trace_ids"]:
+                            try:
+                                p["cb_var"].trace_remove("write", tid)
+                            except Exception:
+                                pass
+                        p["_trace_ids"] = []
+                    if p.get("cb"):
+                        try:
+                            p["cb"].configure(command=lambda: None)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                continue
+
+            try:
+                self.canvas.itemconfigure(p["window_id"], state="normal")
+            except Exception:
+                pass
+
+            y = item_idx * self.row_height
+            try:
+                self.canvas.coords(p["window_id"], 0, y)
+                self.canvas.itemconfig(p["window_id"], width=self.canvas_width)
+            except Exception:
+                pass
+
+            if p.get("item_index") != item_idx:
+                real_idx = self.filtered[item_idx]
+                item = self.items[real_idx]
+                item_id = item.get("id")
+
+                try:
+                    p["label"].config(text=item.get("displayName", ""))
+                except Exception:
+                    pass
+
+                with self._lock:
+                    if item_id in self.selected_changes and item_id not in getattr(self, "session_locked", set()):
+                        val = bool(self.selected_changes[item_id])
+                    else:
+                        val = bool(item_id in self.original_checked)
+
+                try:
+                    p["cb_var"].set(val)
+                except Exception:
+                    pass
+
+                try:
+                    if "_trace_ids" in p:
+                        for tid in p["_trace_ids"]:
+                            try:
+                                p["cb_var"].trace_remove("write", tid)
+                            except Exception:
+                                pass
+                        p["_trace_ids"] = []
+                    try:
+                        p["cb"].configure(command=lambda: None)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                try:
+                    cb_widget = p.get("cb")
+                    if item_id in getattr(self, "session_locked", set()):
+                        try:
+                            if hasattr(cb_widget, "state"):
+                                cb_widget.state(("disabled",))
+                            else:
+                                cb_widget.configure(state="disabled")
+                        except Exception:
+                            try:
+                                cb_widget.configure(state="disabled")
+                            except Exception:
+                                pass
+                        try:
+                            cb_widget.configure(command=lambda: None)
+                        except Exception:
+                            pass
+                    else:
+                        def on_toggle(iid=item_id, var=p["cb_var"]):
+                            with self._lock:
+                                self.selected_changes[iid] = bool(var.get())
+                            log(f"Toggle -> id={iid} checked={self.selected_changes[iid]}")
+                        try:
+                            cb_widget.configure(command=on_toggle)
+                        except Exception:
+                            try:
+                                def _trace(*a, var=p["cb_var"], iid=item_id):
+                                    with self._lock:
+                                        self.selected_changes[iid] = bool(var.get())
+                                    log(f"Toggle(trace) -> id={iid} checked={self.selected_changes[iid]}")
+                                tid = p["cb_var"].trace_add("write", _trace)
+                                if "_trace_ids" not in p:
+                                    p["_trace_ids"] = []
+                                p["_trace_ids"].append(tid)
+                            except Exception:
+                                pass
+                        try:
+                            if hasattr(cb_widget, "state"):
+                                cb_widget.state(("!disabled",))
+                            else:
+                                cb_widget.configure(state="normal")
+                        except Exception:
+                            try:
+                                cb_widget.configure(state="normal")
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+                p["item_index"] = item_idx
+                p["frame"]._tip_payload = item
+
+                color = STRIPE_A if (item_idx % 2 == 0) else STRIPE_B
+                try:
+                    p["frame"].config(bg=color)
+                    p["label"].config(bg=color)
+                    p["info"].config(bg=color)
+                    style_name = "RowA.TCheckbutton" if color == STRIPE_A else "RowB.TCheckbutton"
+                    try:
+                        p["cb"].configure(style=style_name)
+                    except Exception:
+                        pass
+                    try:
+                        p["cb"].config(background=color)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+                try:
+                    cb_widget = p.get("cb")
+                    if cb_widget:
+                        if item_id in getattr(self, "session_locked", set()):
+                            try:
+                                if hasattr(cb_widget, "state"):
+                                    cb_widget.state(("disabled",))
+                                else:
+                                    cb_widget.configure(state="disabled")
+                            except Exception:
+                                try:
+                                    cb_widget.configure(state="disabled")
+                                except Exception:
+                                    pass
+                        else:
+                            try:
+                                if hasattr(cb_widget, "state"):
+                                    cb_widget.state(("!disabled",))
+                                else:
+                                    cb_widget.configure(state="normal")
+                            except Exception:
+                                try:
+                                    cb_widget.configure(state="normal")
+                                except Exception:
+                                    pass
+                        try:
+                            cb_widget.update_idletasks()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                if DEBUG:
+                    log(f"Assigned pool_pos={pool_pos} -> item_idx={item_idx} (real_idx={real_idx}) id={item['id']} name={item.get('displayName')}")
+                if item_idx >= len(self.filtered) - (visible_rows_count + 2):
+                    log(f"Near end of filtered list (pos {item_idx} / {len(self.filtered)})")
+
+    # ---------------- refresh visible checkbox vars ----------------
+    def _refresh_visible_checkbox_vars(self, force=False):
+        if not self.pool_initialized:
+            return
+        updated = 0
+        with self._lock:
+            for p in self.pool:
+                item_idx = p.get("item_index")
+                if item_idx is None:
+                    continue
+                if item_idx < 0 or item_idx >= len(self.filtered):
+                    continue
+                real_idx = self.filtered[item_idx]
+                item = self.items[real_idx]
+                item_id = item.get("id")
+
+                if item_id in self.selected_changes and item_id not in self.session_locked:
+                    val = self.selected_changes[item_id]
+                else:
+                    val = (item_id in self.original_checked)
+
+                if force or bool(p["cb_var"].get()) != bool(val):
+                    p["cb_var"].set(bool(val))
+                    updated += 1
+
+                try:
+                    cb_widget = p.get("cb")
+                    if cb_widget:
+                        if item_id in self.session_locked:
+                            if hasattr(cb_widget, "state"):
+                                try:
+                                    cb_widget.state(("disabled",))
+                                except Exception:
+                                    cb_widget.configure(state="disabled")
+                            else:
+                                cb_widget.configure(state="disabled")
+                        else:
+                            if hasattr(cb_widget, "state"):
+                                try:
+                                    cb_widget.state(("!disabled",))
+                                except Exception:
+                                    cb_widget.configure(state="normal")
+                            else:
+                                cb_widget.configure(state="normal")
+                except Exception:
+                    pass
+
+        try:
+            self.canvas.update_idletasks()
+        except Exception:
+            pass
+        if DEBUG:
+            log(f"_refresh_visible_checkbox_vars: updated {updated} visible checkboxes")
+
+    # ---------------- tooltip reuse ----------------
+    def _show_tooltip_for_pool(self, pool_index, event):
+        if pool_index < 0 or pool_index >= len(self.pool):
+            return
+        p = self.pool[pool_index]
+        item_idx = p.get("item_index")
+        if item_idx is None:
+            return
+        real_idx = self.filtered[item_idx]
+        item = self.items[real_idx]
+        category_type = item.get("categoryType") or item.get("category") or ""
+        cargo_info = item.get("cargo", "")
+        tip = (
+            f"Name: {item.get('displayName','')}\n"
+            f"Type: {item.get('type','').title()}\n"
+            f"Category: {category_type}\n"
+            f"Region: {REGION_NAME_MAP.get(item.get('region'), item.get('region_name') or item.get('region') or '')}\n"
+            f"Money: {item.get('money','')}\nXP: {item.get('xp','')}\n"
+        )
+        if category_type == "cargoDelivery":
+            tip += f"Cargo: {cargo_info}\n"
+        desc = item.get("desc", "")
+        if desc:
+            tip += f"\n{desc}"
+
+        if self._tip is None or not tk.Toplevel.winfo_exists(self._tip):
+            self._tip = tk.Toplevel(self.parent)
+            self._tip.wm_overrideredirect(True)
+            self._tip_label = tk.Label(self._tip, text=tip, justify="left", background="#fefecd", relief="solid", borderwidth=1, wraplength=400)
+            self._tip_label.pack(ipadx=4, ipady=3)
+        else:
+            self._tip_label.config(text=tip)
+        try:
+            x = event.x_root + 10
+            y = event.y_root + 10
+            self._tip.wm_geometry(f"+{x}+{y}")
+            self._tip.deiconify()
+        except Exception:
+            pass
+
+    def _hide_tooltip(self):
+        if self._tip is not None and tk.Toplevel.winfo_exists(self._tip):
+            try:
+                self._tip.withdraw()
+            except Exception:
+                pass
+
+    # ---------------- data loading & filtering ----------------
+    def load_data_thread(self):
+        self.items = []
+        self.filtered = []
+        self.original_checked = set()
+        self.session_locked = set()
+        self.selected_changes = {}
+
+        def worker():
+            log("Worker: starting data processing thread")
+            tstart = time.perf_counter()
+            df = _load_parquet_safe()
+            if df is None or (hasattr(df, "empty") and df.empty):
+                log("No data in parquet or failed to read.")
+                return
+            df.columns = [str(c).strip().lower() for c in df.columns]
+            all_items = []
+            for idx, row in df.iterrows():
+                def g(k):
+                    try:
+                        v = row.get(k.lower(), "")
+                    except Exception:
+                        v = ""
+                    if _pd is not None:
+                        try:
+                            if _pd.isna(v):
+                                return ""
+                        except Exception:
+                            pass
+                    return "" if v is None else str(v)
+                key = g("key") or g("id") or g("name") or f"ITEM_{idx}"
+                display = g("displayname") or g("name") or key
+                if not display.strip() or display.startswith("---"):
+                    continue
+                excel_type = g("type")
+                raw_source = (g("source") or "").upper().strip()
+                category_val = g("category") or excel_type
+                _source_map = {"CONTESTS": "CONTEST", "CONTEST": "CONTEST", "TASKS": "TASK", "TASK": "TASK", "CONTRACTS":"CONTRACT","CONTRACT":"CONTRACT"}
+                norm_type = _source_map.get(raw_source)
+                if not norm_type and raw_source:
+                    norm_type = raw_source[:-1] if raw_source.endswith("S") else raw_source
+                if not norm_type:
+                    rt = excel_type.lower() if excel_type else ""
+                    if "contest" in rt: norm_type = "CONTEST"
+                    elif "task" in rt: norm_type = "TASK"
+                    elif "contract" in rt: norm_type = "CONTRACT"
+                    else: norm_type = ""
+                item = {
+                    "id": key,
+                    "displayName": display,
+                    "categoryType": excel_type,
+                    "type": norm_type,
+                    "region": g("region"),
+                    "region_name": g("region_name"),
+                    "category": category_val,
+                    "money": g("money"),
+                    "xp": g("experience"),
+                    "cargo": g("cargo_needed"),
+                    "desc": g("descriptiontext") or "",
+                    "source": raw_source
+                }
+                all_items.append(item)
+            tmid = (time.perf_counter() - tstart) * 1000.0
+            log(f"Parsed items: {len(all_items)} (processing time {tmid:.0f}ms)")
+
+            sp = self.save_var.get() if hasattr(self.save_var, "get") else self.save_var
+            pre = set()
+            if sp and os.path.exists(sp):
+                try:
+                    pre = _read_finished_contests(sp) | _read_finished_missions(sp)
+                except Exception:
+                    pre = set()
+
+            def finish():
+                self.items = all_items
+                self.original_checked = pre
+                self.session_locked = set(pre)
+
+                regs = sorted({
+                    REGION_NAME_MAP.get(it.get("region"), it.get("region_name") or it.get("region") or "")
+                    for it in all_items if (it.get("region") or it.get("region_name"))
+                })
+                for child in (self.topbar.winfo_children() if self.topbar else []):
+                    if isinstance(child, ttk.Combobox) and child.cget("width") == 20:
+                        child.config(values=[""] + [r for r in regs if r])
+                log(f"Scheduling finish: items={len(self.items)} original_checked={len(self.original_checked)})")
+                self.apply_filters()
+            try:
+                if hasattr(self.parent, "after"):
+                    self.parent.after(10, finish)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def apply_filters(self):
+        q = (self.search_var.get() or "").lower().strip()
+        t_label = (self.type_var.get() or "").strip()
+        t = self._type_label_to_internal.get(t_label, (t_label or "").upper()).strip()
+        rsel = (self.region_var.get() or "").strip()
+        csel = (self.category_var.get() or "").strip()
+
+        log(f"Filtering: q='{q}' type='{t}' region='{rsel}' category='{csel}'")
+
+        results = []
+        for idx, it in enumerate(self.items):
+            if q and q not in it.get("displayName", "").lower():
+                continue
+            if t and it.get("type", "").upper() != t:
+                continue
+            rn = REGION_NAME_MAP.get(it.get("region"), it.get("region_name") or it.get("region") or "")
+            if rsel and rsel != rn:
+                continue
+            if csel:
+                category_raw = (it.get("categoryType") or it.get("category") or "").strip()
+                cat_map = {"Truck Delivery": "truckDelivery", "Cargo Delivery": "cargoDelivery", "Exploration": "exploration"}
+                expected = cat_map.get(csel)
+                if expected and category_raw != expected:
+                    continue
+            results.append(idx)
+        self.filtered = results
+        log(f"Filtering result count: {len(self.filtered)})")
+
+        if self.pool_initialized:
+            for p in self.pool:
+                p["item_index"] = None
+
+        total_h = len(self.filtered) * self.row_height
+        if self.canvas:
+            try:
+                self.canvas.configure(scrollregion=(0, 0, self.canvas_width, max(total_h, self.canvas_height)))
+            except Exception:
+                pass
+        self._ensure_pool()
+        self._refresh_visible_checkbox_vars()
+        try:
+            if self.canvas:
+                self.canvas.update_idletasks()
+        except Exception:
+            pass
+
+    # ---------------- bulk check/uncheck ----------------
+    def check_filtered(self):
+        if not self.filtered:
+            log("Check filtered: no filtered items")
+            return
+        cnt = 0
+        with self._lock:
+            for idx in self.filtered:
+                iid = self.items[idx]["id"]
+                self.selected_changes[iid] = True
+                cnt += 1
+        log(f"Check filtered: marked {cnt} items (matching current filters)")
+        self._refresh_visible_checkbox_vars()
+
+    def uncheck_filtered(self):
+        if not self.filtered:
+            log("Uncheck filtered: no filtered items")
+            return
+        cnt = 0
+        with self._lock:
+            for idx in self.filtered:
+                iid = self.items[idx]["id"]
+                self.selected_changes[iid] = False
+                cnt += 1
+        log(f"Uncheck filtered: marked {cnt} items (matching current filters)")
+        self._refresh_visible_checkbox_vars()
+
+    # ---------------- applying changes ----------------
+    def apply_changes_thread(self):
+        sp = self.save_var.get() if hasattr(self.save_var, "get") else self.save_var
+        if not sp or not os.path.exists(sp):
+            try:
+                messagebox.showinfo("Info", "No valid save file provided; Apply Changes will only print actions to console.")
+            except Exception:
+                pass
+            return
+
+        # Create backup if host's make_backup_if_enabled exists
+        try:
+            if 'make_backup_if_enabled' in globals():
+                make_backup_if_enabled(sp)
+        except Exception:
+            pass
+
+        with self._lock:
+            changes = dict(self.selected_changes)
+            self.selected_changes.clear()
+
+        if not changes:
+            log("ApplyChanges: nothing to do")
+            return
+
+        log(f"ApplyChanges: batch-applying {len(changes)} changes")
+
+        def worker():
+            try:
+                id_to_type = {it["id"]: (it.get("type") or "TASK").upper() for it in self.items}
+                contest_changes = {k: v for k, v in changes.items() if id_to_type.get(k, "TASK") == "CONTEST"}
+                mission_changes = {k: v for k, v in changes.items() if id_to_type.get(k, "TASK") != "CONTEST"}
+
+                if not sp or not os.path.exists(sp):
+                    log("[BATCH WRITE] no save file; printing planned changes:")
+                    log(f"  contests: {len(contest_changes)} missions: {len(mission_changes)}")
+                else:
+                    with open(sp, "r", encoding="utf-8") as f:
+                        content = f.read()
+
+                    bak = sp + ".bak"
+                    try:
+                        if not os.path.exists(bak):
+                            with open(bak, "wb") as wb:
+                                wb.write(content.encode("utf-8"))
+                    except Exception:
+                        log("[BATCH WRITE] backup creation failed/ignored")
+
+                    if mission_changes:
+                        start = content.find('"objectiveStates"')
+                        if start != -1:
+                            try:
+                                block, bs, be = extract_brace_block(content, start)
+                                try:
+                                    obj_states = json.loads(block)
+                                except Exception:
+                                    obj_states = {}
+                                for kid, kval in mission_changes.items():
+                                    cur = obj_states.get(kid)
+                                    if not isinstance(cur, dict):
+                                        cur = {}
+                                    cur["isFinished"] = bool(kval)
+                                    obj_states[kid] = cur
+                                new_block = json.dumps(obj_states, indent=4, ensure_ascii=False)
+                                content = content[:bs] + new_block + content[be:]
+                            except Exception as e:
+                                log(f"[BATCH WRITE] failed to patch objectiveStates: {e}")
+                        else:
+                            log("[BATCH WRITE] objectiveStates block not found; mission changes skipped")
+
+                    if contest_changes:
+                        m = re.search(r'"(CompleteSave[^"]*)"\s*:\s*{', content)
+                        if not m:
+                            log("[BATCH WRITE] CompleteSave block not found; contest changes skipped")
+                        else:
+                            save_key = m.group(1)
+                            try:
+                                json_block, s_idx, e_idx = extract_json_block_by_key(content, save_key)
+                                data = json.loads(json_block)
+                                save_obj = data.get(save_key, {}) or {}
+                                ssl = save_obj.get("SslValue", {}) or {}
+
+                                orig_finished = ssl.get("finishedObjs", [])
+                                finished_is_dict = isinstance(orig_finished, dict)
+                                if isinstance(orig_finished, list):
+                                    finished_set = set(orig_finished)
+                                elif isinstance(orig_finished, dict):
+                                    finished_set = set(orig_finished.keys())
+                                else:
+                                    finished_set = set()
+
+                                contest_times = ssl.get("contestTimes", {})
+                                if not isinstance(contest_times, dict):
+                                    contest_times = {}
+
+                                added = []
+                                removed = []
+
+                                for key, val in contest_changes.items():
+                                    if val:
+                                        if key not in finished_set:
+                                            finished_set.add(key)
+                                            added.append(key)
+                                        if key not in contest_times:
+                                            contest_times[key] = 1
+                                    else:
+                                        if key in finished_set:
+                                            finished_set.remove(key)
+                                            removed.append(key)
+                                        if key in contest_times:
+                                            del contest_times[key]
+
+                                if finished_is_dict:
+                                    ssl["finishedObjs"] = {k: True for k in finished_set}
+                                else:
+                                    ssl["finishedObjs"] = list(finished_set)
+
+                                ssl["contestTimes"] = contest_times
+
+                                viewed = ssl.get("viewedUnactivatedObjectives", [])
+                                if isinstance(viewed, list) and added:
+                                    ssl["viewedUnactivatedObjectives"] = [v for v in viewed if v not in added]
+
+                                save_obj["SslValue"] = ssl
+                                data[save_key] = save_obj
+
+                                new_json_block = json.dumps(data, separators=(",", ":"))
+                                content = content[:s_idx] + new_json_block + content[e_idx:]
+
+                                if 'update_all_contest_times_blocks' in globals():
+                                    try:
+                                        content = update_all_contest_times_blocks(content, contest_times)
+                                    except Exception:
+                                        pass
+
+                                log(f"[BATCH WRITE] Contests updated: +{len(added)} / -{len(removed)}")
+                            except Exception as e:
+                                log(f"[BATCH WRITE] Failed to patch CompleteSave block: {e}")
+
+                    try:
+                        with open(sp, "w", encoding="utf-8") as f:
+                            f.write(content)
+                        log(f"[BATCH WRITE] applied {len(changes)} changes to {sp}")
+                    except Exception as e:
+                        log(f"[BATCH WRITE] write failed: {e}")
+            except Exception as ex:
+                log(f"[BATCH WRITE][ERROR] {ex}")
+
+            try:
+                new_checked = _read_finished_contests(sp) | _read_finished_missions(sp) if sp and os.path.exists(sp) else set()
+            except Exception:
+                new_checked = set()
+            self.original_checked = new_checked
+            log(f"ApplyChanges: finished; original_checked now {len(self.original_checked)} items")
+
+            self._refresh_visible_checkbox_vars()
+            self._update_visible_rows()
+
+            try:
+                if changes:
+                    messagebox.showinfo(
+                        "Objectives+",
+                        f"Successfully applied {len(changes)} change(s) to your save file."
+                    )
+                else:
+                    messagebox.showinfo(
+                        "Objectives+",
+                        "No changes were applied (nothing selected)."
+                    )
+            except Exception as e:
+                log(f"[BATCH WRITE][POPUP ERROR] {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def reload_checked_from_save(self):
+        sp = self.save_var.get() if hasattr(self.save_var, "get") else self.save_var
+        if not sp or not os.path.exists(sp):
+            return
+        try:
+            new_checked = _read_finished_contests(sp) | _read_finished_missions(sp)
+        except Exception:
+            new_checked = set()
+
+        self.original_checked = new_checked
+        self.session_locked = set(new_checked)
+        self.selected_changes.clear()
+
+        for item in self.items:
+            item_id = item.get("id")
+            item["checked"] = item_id in self.original_checked
+
+        log(f"Reloaded save: original_checked={len(self.original_checked)}")
+        self._refresh_visible_checkbox_vars(force=True)
+        self._update_visible_rows()
+
+# --- Adapter: create_objectives_tab for in-editor mounting ---
+def create_objectives_tab(tab, save_path_var):
+    """
+    Mounts the VirtualObjectivesFast into the provided `tab`.
+    Must be called after host has set AppID and prepared main Tk root.
+    """
+    try:
+        v = VirtualObjectivesFast(tab, save_path_var)
+
+        try:
+            v.build_ui()
+        except Exception as e:
+            try:
+                from tkinter import messagebox as _mb
+                _mb.showwarning("Objectives+ error", f"build_ui() failed:\n{e}")
+            except Exception:
+                pass
+
+        try:
+            if hasattr(v, "frame") and not v.frame.winfo_ismapped():
+                v.frame.pack(fill="both", expand=True)
+        except Exception:
+            pass
+
+        try:
+            v.load_data_thread()
+        except Exception as e:
+            try:
+                from tkinter import messagebox as _mb
+                _mb.showwarning("Objectives+ loader error", f"Failed to start data loader:\n{e}")
+            except Exception:
+                pass
+
+    except Exception as e:
+        # Fallback placeholder (created lazily here to avoid GUI imports at module import time)
+        try:
+            import tkinter as _tk
+            from tkinter import ttk as _ttk, filedialog as _fd, messagebox as _mb
+            top = _ttk.Frame(tab)
+            top.pack(fill='x', padx=6, pady=6)
+            parquet_var = _tk.StringVar(value="")
+            _ttk.Label(top, text="Parquet file:").pack(side='left')
+            _ttk.Entry(top, textvariable=parquet_var, width=60).pack(side='left', padx=(6,4))
+            def pick_parquet():
+                p = _fd.askopenfilename(filetypes=[("Parquet files","*.parquet"),("All","*.*")])
+                if p:
+                    parquet_var.set(p)
+            _ttk.Button(top, text="Browse...", command=pick_parquet).pack(side='left', padx=4)
+
+            body = _ttk.Frame(tab)
+            body.pack(fill='both', expand=True, padx=6, pady=6)
+            info = _ttk.Label(body, text="Objectives+ — failed to initialize (see console).", wraplength=700, justify='left')
+            info.pack(anchor='w', pady=(0,8))
+        except Exception:
+            # If we can't even import tkinter for the fallback, do nothing (import-safety preserved).
+            log(f"Failed to initialize Objectives+ fallback placeholder: {e}")
+
+# Exported names
+__all__ = ["VirtualObjectivesFast", "create_objectives_tab", "default_parquet_path", "DEBUG"]
+# -------------------- end Objectives+ --------------------
 
 
 def create_contest_tab(tab, save_path_var):
@@ -1992,8 +3126,8 @@ def create_upgrades_tab(tab, save_path_var):
     ttk.Label(tab, text="If a new season is added, you may need to mark or collect one new upgrade.",
               foreground="red").pack()
     
+
 def create_game_stats_tab(tab, save_path_var, plugin_loaders):
-    import json
 
     stats_vars = {}
     distance_vars = {}
@@ -2245,7 +3379,7 @@ def create_watchtowers_tab(tab, save_path_var):
     ttk.Label(tab, text="It will mark them as found but wont reveal the map use the Fog Tool for that.",
               foreground="red").pack()
     
-import threading, requests, webbrowser, re
+
 
 GITHUB_RELEASES_API = "https://api.github.com/repos/MrBoxik/SnowRunner-Save-Editor/releases"
 GITHUB_RELEASES_PAGE = "https://github.com/MrBoxik/SnowRunner-Save-Editor/releases"
@@ -2405,7 +3539,19 @@ def launch_gui():
 
     plugin_loaders = []
     root = tk.Tk()
+    root.title("SnowRunner Editor")
+
+    # --- Set AppUserModelID early (must happen before icon usage) ---
+    if platform.system() == "Windows":
+        try:
+            MYAPPID = "com.mrboxik.snowrunnereditor"
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(MYAPPID)
+            print("[DEBUG] AppUserModelID set:", MYAPPID)
+        except Exception as e:
+            print("[AppID Warning]", e)
+
     check_for_updates_background(root, debug=True)
+
     # --- Remove ugly dotted focus rings globally ---
     root.option_add("*TEntry.highlightThickness", 0)
     root.option_add("*TEntry.highlightColor", "SystemWindowBackground")
@@ -2413,56 +3559,62 @@ def launch_gui():
     root.option_add("*TButton.takeFocus", 0)
     root.option_add("*TCheckbutton.takeFocus", 0)
     root.option_add("*TRadiobutton.takeFocus", 0)
+
     global tyre_var, custom_day_var, custom_night_var
-
     max_backups_var = tk.StringVar(value="0")  # default 0 = unlimited
-
 
     global delete_path_on_close_var, dont_remember_path_var
     delete_path_on_close_var = tk.BooleanVar(value=False)
     dont_remember_path_var = tk.BooleanVar(value=False)
     config = load_config()
-    config = load_config()
     max_backups_var.set(str(config.get("max_backups", "0")))
     delete_path_on_close_var.set(config.get("delete_path_on_close", False))
     dont_remember_path_var.set(config.get("dont_remember_path", False))
 
-    global tyre_var
     tyre_var = tk.StringVar(value="default")
-    global custom_day_var, custom_night_var
     custom_day_var = tk.DoubleVar(value=1.0)
     custom_night_var = tk.DoubleVar(value=1.0)
 
-    import sys
-    # inside your GUI initialization
-    icon_path_ico = resource_path("app_icon.ico")
-    icon_path_png = resource_path("app_icon.png")
-
+    # --- ICON SETUP ---
     try:
+        icon_path_ico = resource_path("app_icon.ico")
+        icon_path_png = resource_path("app_icon.png")
+
         if platform.system() == "Windows" and os.path.exists(icon_path_ico):
-            # .ico works only on Windows
-            root.iconbitmap(icon_path_ico)
+            try:
+                root.iconbitmap(icon_path_ico)
+            except Exception:
+                root.wm_iconbitmap(icon_path_ico)
+
+            # Also apply to taskbar
+            try:
+                WM_SETICON = 0x0080
+                ICON_SMALL = 0
+                ICON_BIG = 1
+                LR_LOADFROMFILE = 0x00000010
+                IMAGE_ICON = 1
+
+                hwnd = root.winfo_id()
+                hicon = ctypes.windll.user32.LoadImageW(
+                    None, icon_path_ico, IMAGE_ICON, 0, 0, LR_LOADFROMFILE
+                )
+                if hicon:
+                    ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+                    ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
+                else:
+                    print("LoadImageW failed to load icon for taskbar.")
+            except Exception as e:
+                print("Failed to set Win32 icons:", e)
+
         elif os.path.exists(icon_path_png):
-            # use PNG everywhere else
             icon_img = PhotoImage(file=icon_path_png)
+            root._icon_img = icon_img
             root.iconphoto(True, icon_img)
         else:
             print("No suitable icon found, skipping icon setup.")
     except Exception as e:
-        print("Failed to set window icon:", e)
+        print("Failed to set window/taskbar icon:", repr(e))
 
-    root.title("SnowRunner Save Editor")
-
-     
-    def on_close():
-        # Save settings before closing
-        save_settings()
-
-        if delete_path_on_close_var.get():
-            config = load_config()
-            if "last_opened_path" in config:
-                del config["last_opened_path"]
-                save_config(config)
 
         root.destroy()
 
@@ -2760,6 +3912,9 @@ def launch_gui():
     tab_contests = ttk.Frame(tab_control)
     tab_control.add(tab_contests, text='Contests')
     create_contest_tab(tab_contests, save_path_var)
+    tab_objectives = ttk.Frame(tab_control)
+    tab_control.add(tab_objectives, text='Objectives+')
+    create_objectives_tab(tab_objectives, save_path_var)
     tab_upgrades = ttk.Frame(tab_control)
     tab_control.add(tab_upgrades, text='Upgrades')
     create_upgrades_tab(tab_upgrades, save_path_var)
@@ -2902,8 +4057,6 @@ def launch_gui():
 
     ttk.Button(tab_settings, text="Check for Update", command=manual_update_check).pack(pady=(5, 10))
 
-
-
     # Separator and embedded Minesweeper
     if MINESWEEPER_AVAILABLE:
         ttk.Separator(tab_settings, orient='horizontal').pack(fill='x', pady=(10, 5))
@@ -2912,9 +4065,6 @@ def launch_gui():
         minesweeper_frame = tk.Frame(tab_settings)
         minesweeper_frame.pack(pady=5)
         MinesweeperApp(minesweeper_frame)
-
-
-
 
 
     # Save file tab
@@ -3329,11 +4479,6 @@ def launch_gui():
     rule_savers.append(save_sell)
     rule_index += 1
 
-
-    # --- Upgraded: Tyre Availability Rule with Styled Frame ---
-    
-    
-    
     
     # --- External Addon Availability (modifies externalAddonsAmount automatically) ---
     external_addon_var = tk.StringVar(value="default")
@@ -3540,10 +4685,6 @@ def launch_gui():
     rule_savers.append(save_trailer_sell)
     rule_index += 1
 
-
-    # (placeholder for actual code, injected in the next step)
-
-
     # --- Embedded: Addon Selling Price ---
     addon_sell_var = tk.StringVar(value="normal price")
     addon_sell_map = {
@@ -3607,9 +4748,6 @@ def launch_gui():
 
     rule_savers.append(save_tyre_rule)
 
-
-    
-    
     
     # --- Embedded: Factor Rules ---
 
@@ -3932,12 +5070,45 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
         except Exception as e:
             print("[Warning] Auto-sync failed:", e)
 
+    # --- HARDEN TASKBAR ICON: prevent default Tk feather icon ---
+    try:
+        if platform.system() == "Windows":
+            def enforce_taskbar_icon():
+                try:
+                    MYAPPID = "com.mrboxik.snowrunnereditor"
+                    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(MYAPPID)
+
+                    icon_path = resource_path("app_icon.ico")
+                    if os.path.exists(icon_path):
+                        hwnd = root.winfo_id()
+                        WM_SETICON = 0x0080
+                        ICON_SMALL = 0
+                        ICON_BIG = 1
+                        LR_LOADFROMFILE = 0x00000010
+                        IMAGE_ICON = 1
+                        hicon = ctypes.windll.user32.LoadImageW(
+                            None, icon_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE
+                        )
+                        if hicon:
+                            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon)
+                            ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon)
+                            print("[DEBUG] Feather icon overridden with custom .ico")
+                        else:
+                            print("[WARN] Failed to load .ico to override feather icon.")
+                    else:
+                        print("[WARN] app_icon.ico missing in runtime path")
+                except Exception as inner_e:
+                    print("[Feather Override Error]", inner_e)
+
+            # Run enforcement once window is ready and again after a delay (Tk likes to override late)
+            root.after(100, enforce_taskbar_icon)
+            root.after(2000, enforce_taskbar_icon)  # double pass, prevents feather returning
+    except Exception as e:
+        print("[AppID/Icon Enforcement Error]", e)
+
+
     root.mainloop()
 
-
-
-if __name__ == "__main__":
-    launch_gui()
 def write_save_file(path, content):
     try:
         with open(path, 'w', encoding='utf-8') as f:
@@ -3948,3 +5119,6 @@ def write_save_file(path, content):
 
 # Alias for compatibility with editor code
 FogToolFrame = FogToolApp
+
+if __name__ == "__main__":
+    launch_gui()
