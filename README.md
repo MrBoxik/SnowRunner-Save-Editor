@@ -33,6 +33,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 - 🌄 Adjust **time settings** (day-only, night-only, multipliers, time stop & more)
 - ✅ Mark **missions, tasks, and contests** as complete
 - 🔓 Unlock **upgrades and watchtowers**
+- 🏆 Complete **trials**
 - 🌫️ **Fog Tool** — edit Fog of War directly
 - 📊 **Game Stats** viewer & editor
 - 🛡️ **Auto-backup system** (with cleanup & recall)
