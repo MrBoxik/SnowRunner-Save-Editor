@@ -40,6 +40,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 - 📦 Supports **all base maps** and **Seasons 1–16** (future-ready for later seasons)
 - 📂 Remembers your **last used save file**
 - 🔄 Built-in **update checker**
+- 🏅 Edit **achievements**
 
 ---
 
