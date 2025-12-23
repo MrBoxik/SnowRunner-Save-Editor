@@ -34,13 +34,13 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 - ✅ Mark **missions, tasks, and contests** as complete
 - 🔓 Unlock **upgrades and watchtowers**
 - 🏆 Complete **trials**
+- 🏅 Edit **achievements**
 - 🌫️ **Fog Tool** — edit Fog of War directly
 - 📊 **Game Stats** viewer & editor
 - 🛡️ **Auto-backup system** (with cleanup & recall)
 - 📦 Supports **all base maps** and **Seasons 1–16** (future-ready for later seasons)
 - 📂 Remembers your **last used save file**
 - 🔄 Built-in **update checker**
-- 🏅 Edit **achievements**
 
 ---
 
