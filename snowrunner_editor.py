@@ -15,6 +15,7 @@ import zlib
 import traceback
 import shutil
 import threading
+import subprocess
 import random
 import glob
 import re
@@ -22,6 +23,7 @@ import json
 import importlib.util
 from datetime import datetime
 import requests
+import fnmatch
 import webbrowser
 try:
     import pandas as pd
@@ -44,12 +46,16 @@ skip_time_var = None
 custom_day_var = None
 custom_night_var = None
 other_season_var = None
+# time_presets mappings are defined further below in the file, but some
+# functions reference `time_presets` before that definition. Provide a
+# safe default here so static analyzers (Pylance) don't report an
+# undefined-variable warning. The full mapping is assigned later.
+time_presets = {}
 season_vars = []
 map_vars = []
 tyre_var = None
 delete_path_on_close_var = None
 dont_remember_path_var = None
-# Additional variables
 difficulty_var = None
 truck_avail_var = None
 truck_price_var = None
@@ -58,6 +64,9 @@ addon_amount_var = None
 time_day_var = None
 time_night_var = None
 garage_refuel_var = None
+autosave_var = None
+_AUTOSAVE_THREAD = None
+_AUTOSAVE_STOP_EVENT = None
 
 SAVE_FILE = "minesweeper_save.json"
 def resource_path(relative_path):
@@ -1178,6 +1187,267 @@ RANK_XP_REQUIREMENTS = {
 external_addon_map = {}
 FACTOR_RULE_DEFINITIONS = []
 FACTOR_RULE_VARS = []
+
+def _is_snowrunner_running():
+    """
+    Cross-platform check: returns True if any running process name/command line contains 'snowrunner' (case-insensitive).
+    Uses tasklist on Windows and pgrep/ps on Unix. Defensive and avoids extra dependencies.
+    """
+    try:
+        system = platform.system()
+        if system == "Windows":
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+            out = subprocess.check_output(
+                ["tasklist"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                startupinfo=si,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            return "snowrunner" in out.lower()
+        else:
+            # try pgrep for efficiency
+            try:
+                out = subprocess.check_output(
+                    ["pgrep", "-af", "snowrunner"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+                return bool(out.strip())
+            except Exception:
+                # fallback to ps aux
+                out = subprocess.check_output(
+                    ["ps", "aux"],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+                return "snowrunner" in out.lower()
+    except Exception:
+        # if detection fails for any reason, return False (safe fallback)
+        return False
+
+
+
+def _create_autobackup(save_dir):
+    """
+    Copy all .cfg/.dat files from save_dir into backup/autobackup-<timestamp>[_full] preserving subpaths.
+    Uses the same skip logic as make_backup_if_enabled (skips the backup folder itself).
+    """
+    try:
+        if not save_dir or not os.path.isdir(save_dir):
+            print("[Autosave] Save dir missing or invalid:", save_dir)
+            return
+        timestamp = datetime.now().strftime("autobackup-%d.%m.%Y %H-%M-%S")
+        backup_dir = os.path.join(save_dir, "backup")
+        os.makedirs(backup_dir, exist_ok=True)
+        folder_name = timestamp + ("_full" if full_backup_var.get() else "")
+        full_dir = os.path.join(backup_dir, folder_name)
+        os.makedirs(full_dir, exist_ok=True)
+
+        for root, _, files in os.walk(save_dir):
+            # skip backups-of-backups
+            if os.path.abspath(root).startswith(os.path.abspath(backup_dir)):
+                continue
+            for file in files:
+                if file.lower().endswith((".cfg", ".dat")):
+                    src_path = os.path.join(root, file)
+                    rel_path = os.path.relpath(src_path, save_dir)
+                    dst_path = os.path.join(full_dir, rel_path)
+                    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                    try:
+                        shutil.copy2(src_path, dst_path)
+                    except Exception as e:
+                        print(f"[Autosave] copy failed {src_path} -> {dst_path}: {e}")
+        print(f"[Autosave] Created autobackup at: {full_dir}")
+    except Exception as e:
+        print("[Autosave] Failed:", e, flush=True)
+
+
+def _scan_folder_mtimes(save_dir):
+    """Return dict {relative_path: mtime} for .cfg/.dat files in save_dir (non-recursive for file-list consistency)."""
+    mt = {}
+    if not save_dir or not os.path.isdir(save_dir):
+        return mt
+    for root, _, files in os.walk(save_dir):
+        # skip backup folder
+        if os.path.abspath(root).startswith(os.path.abspath(os.path.join(save_dir, "backup"))):
+            continue
+        for f in files:
+            if f.lower().endswith((".cfg", ".dat")):
+                full = os.path.join(root, f)
+                try:
+                    mt[os.path.relpath(full, save_dir)] = os.path.getmtime(full)
+                except Exception:
+                    pass
+    return mt
+
+def _autosave_monitor_loop(get_save_path_callable, stop_event, poll_interval=60):
+    """
+    Monitor loop (one-minute cadence):
+      - If autosave disabled -> sleep poll_interval between checks (so toggle is checked every minute).
+      - If save folder invalid -> sleep poll_interval and re-check.
+      - If game not running -> reset baseline and sleep poll_interval (only check again after interval).
+      - If game running -> check folder mtimes every poll_interval seconds and create autobackup on change.
+    """
+    last_seen_mtimes = {}
+    while not stop_event.is_set():
+        try:
+            # Respect the poll interval consistently
+            if not autosave_var or not autosave_var.get():
+                print(f"[Autosave] disabled - will re-check every {poll_interval}s.", flush=True)
+                # Sleep full interval before checking again
+                for _ in range(poll_interval):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(1)
+                continue
+
+            # Obtain full save file path from provided callable
+            full_path = ""
+            try:
+                full_path = (get_save_path_callable() or "") if get_save_path_callable else ""
+            except Exception as e:
+                full_path = ""
+                print(f"[Autosave] get_save_path_callable() raised: {e}", flush=True)
+
+            # Resolve folder to watch
+            if not full_path:
+                lastp = ""
+                try:
+                    lastp = load_last_path()
+                except Exception:
+                    lastp = ""
+                if lastp:
+                    save_dir = lastp if os.path.isdir(lastp) else os.path.dirname(lastp)
+                else:
+                    save_dir = ""
+            else:
+                save_dir = os.path.dirname(full_path)
+
+            print(f"[Autosave] checking. save_dir='{save_dir}'", flush=True)
+
+            if not save_dir or not os.path.isdir(save_dir):
+                print(f"[Autosave] save dir missing or invalid: '{save_dir}'. Will retry in {poll_interval}s.", flush=True)
+                for _ in range(poll_interval):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(1)
+                continue
+
+            # Check whether SnowRunner is running (once per interval)
+            running = _is_snowrunner_running()
+            print(f"[Autosave] process running: {running}", flush=True)
+
+            # If not running -> reset baseline and wait one interval before checking again
+            if not running:
+                last_seen_mtimes = _scan_folder_mtimes(save_dir)
+                if last_seen_mtimes:
+                    most_recent_file, mt = max(last_seen_mtimes.items(), key=lambda it: it[1])
+                    try:
+                        most_recent = datetime.fromtimestamp(mt).strftime("%d.%m.%Y %H:%M:%S")
+                    except Exception:
+                        most_recent = str(mt)
+                    print(f"[Autosave] baseline set (not running). most recent file: {most_recent_file} @ {most_recent}", flush=True)
+                else:
+                    print("[Autosave] baseline set (not running). no files found.", flush=True)
+                for _ in range(poll_interval):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(1)
+                continue
+
+            # Game is running — scan folder mtimes now
+            current_mtimes = _scan_folder_mtimes(save_dir)
+            if current_mtimes:
+                most_recent_file, most_recent_m = max(current_mtimes.items(), key=lambda it: it[1])
+                try:
+                    most_recent_human = datetime.fromtimestamp(most_recent_m).strftime("%d.%m.%Y %H:%M:%S")
+                except Exception:
+                    most_recent_human = str(most_recent_m)
+                print(f"[Autosave] most recent file: {most_recent_file} @ {most_recent_human}", flush=True)
+            else:
+                print("[Autosave] no .cfg/.dat files found in save folder.", flush=True)
+
+            # If first time seeing the folder while running, initialise baseline and wait one interval
+            if not last_seen_mtimes:
+                last_seen_mtimes = current_mtimes
+                print(f"[Autosave] initialized baseline while running; next check in {poll_interval}s", flush=True)
+                for _ in range(poll_interval):
+                    if stop_event.is_set():
+                        break
+                    time.sleep(1)
+                continue
+
+            # detect changes: new file, removed file, or modified mtime
+            changed_files = []
+            for f, m in current_mtimes.items():
+                if f not in last_seen_mtimes or last_seen_mtimes.get(f) != m:
+                    changed_files.append(f)
+            for f in list(last_seen_mtimes.keys()):
+                if f not in current_mtimes:
+                    changed_files.append(f + " (deleted)")
+
+            if changed_files:
+                print(f"[Autosave] changes detected: {len(changed_files)} -> {changed_files}", flush=True)
+                try:
+                    _create_autobackup(save_dir)
+                except Exception as e:
+                    print("[Autosave] failed to create autobackup:", e, flush=True)
+                last_seen_mtimes = current_mtimes
+            else:
+                print("[Autosave] no changes detected.", flush=True)
+
+            # Wait exactly poll_interval seconds (split into 1s steps so stop_event wakes quickly)
+            for _ in range(poll_interval):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+
+        except Exception as e:
+            print("[Autosave] monitor exception:", e, flush=True)
+            # On error, sleep one interval before retrying
+            for _ in range(poll_interval):
+                if stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    print("[Autosave] monitor exiting", flush=True)
+
+
+def start_autosave_monitor(get_save_path_callable):
+    global _AUTOSAVE_THREAD, _AUTOSAVE_STOP_EVENT
+    if _AUTOSAVE_THREAD and _AUTOSAVE_THREAD.is_alive():
+        return
+    _AUTOSAVE_STOP_EVENT = threading.Event()
+    _AUTOSAVE_THREAD = threading.Thread(target=_autosave_monitor_loop, args=(get_save_path_callable, _AUTOSAVE_STOP_EVENT), daemon=True)
+    _AUTOSAVE_THREAD.start()
+    print("[Autosave] monitor started")
+
+
+def stop_autosave_monitor():
+    global _AUTOSAVE_THREAD, _AUTOSAVE_STOP_EVENT
+    try:
+        if _AUTOSAVE_STOP_EVENT:
+            _AUTOSAVE_STOP_EVENT.set()
+        if _AUTOSAVE_THREAD:
+            _AUTOSAVE_THREAD.join(timeout=2)
+    except Exception:
+        pass
+    _AUTOSAVE_THREAD = None
+    _AUTOSAVE_STOP_EVENT = None
+    print("[Autosave] monitor stopped")
+
+
 def make_backup_if_enabled(path):
     try:
         if not os.path.exists(path):
@@ -1220,21 +1490,50 @@ def make_backup_if_enabled(path):
             max_backups = int(max_backups_var.get())
         except Exception:
             max_backups = 20
+        try:
+            max_autobackups = int(max_autobackups_var.get())
+        except Exception:
+            max_autobackups = 50
 
-        if max_backups > 0:
-            all_backups = sorted(os.listdir(backup_dir))
-            if len(all_backups) > max_backups:
-                to_delete = all_backups[:len(all_backups) - max_backups]
-                for old in to_delete:
-                    old_path = os.path.join(backup_dir, old)
+        # list contents in backup_dir, keep them sorted (oldest first because name contains date)
+        all_entries = sorted(os.listdir(backup_dir))
+
+        # normal backups: names starting with "backup-"
+        normal_backups = [n for n in all_entries if n.startswith("backup-")]
+        # autobackups: names starting with "autobackup-"
+        auto_backups = [n for n in all_entries if n.startswith("autobackup-")]
+
+        # delete oldest normal backups if over limit
+        if max_backups > 0 and len(normal_backups) > max_backups:
+            to_delete = normal_backups[:len(normal_backups) - max_backups]
+            for old in to_delete:
+                old_path = os.path.join(backup_dir, old)
+                try:
                     if os.path.isdir(old_path):
                         shutil.rmtree(old_path)
                     else:
                         os.remove(old_path)
-                print(f"[Cleanup] Removed {len(to_delete)} old backup(s).")
+                except Exception:
+                    pass
+            print(f"[Backup] Removed {len(to_delete)} old normal backup(s)")
+
+        # delete oldest autobackups if over limit
+        if max_autobackups > 0 and len(auto_backups) > max_autobackups:
+            to_delete = auto_backups[:len(auto_backups) - max_autobackups]
+            for old in to_delete:
+                old_path = os.path.join(backup_dir, old)
+                try:
+                    if os.path.isdir(old_path):
+                        shutil.rmtree(old_path)
+                    else:
+                        os.remove(old_path)
+                except Exception:
+                    pass
+            print(f"[Autosave] Removed {len(to_delete)} old autobackup(s)")
 
     except Exception as e:
         print(f"[Backup Error] Failed to create backup: {e}")
+        
 def recall_backup(path):
     try:
         save_dir = os.path.dirname(path)
@@ -1406,6 +1705,21 @@ def prompt_save_version_mismatch_and_choose(path, modal=True):
                 new_content = f.read()
             # reuse the parser you already have
             m, r, xp, d, t, s, day, night, tp = get_file_info(new_content)
+            try:
+                if day is not None and night is not None:
+                    custom_day_var.set(round(float(day), 2))
+                    custom_night_var.set(round(float(night), 2))
+                    skip_time_var.set(bool(s))
+
+                    match = next(
+                        (k for k, v in time_presets.items()
+                         if abs(day - v[0]) < 0.01 and abs(night - v[1]) < 0.01),
+                        "Custom"
+                    )
+                    time_preset_var.set(match)
+            except Exception as e:
+                print("[WATCH] Failed to refresh Time tab:", e)
+
             if day is None or night is None:
                 raise ValueError("Missing time settings")
 
@@ -1559,8 +1873,9 @@ def get_file_info(content):
                 continue
         return max(vals) if vals else None
 
-    money = int(re.search(r'"money"\s*:\s*(\d+)', content).group(1)) if re.search(r'"money"\s*:\s*(\d+)', content) else 0
-
+    money_val = read_max_int("money")   # read_max_int is already defined in get_file_info
+    money = int(money_val) if money_val is not None else 0
+    
     # prefer the largest value found in the file (some saves have duplicates)
     rank_val = read_max_int("rank")
     rank = int(rank_val) if rank_val is not None else 0
@@ -1586,6 +1901,29 @@ def modify_time(file_path, time_day, time_night, skip_time):
     with open(file_path, 'w', encoding='utf-8') as out_file:
         out_file.write(content)
     messagebox.showinfo("Success", "Time updated.")
+def update_time_btn():
+    make_backup_if_enabled(save_path_var.get())
+    path = save_path_var.get()
+    if not os.path.exists(path):
+        return messagebox.showerror("Error", "Save file not found.")
+
+    if time_preset_var.get() == "Custom":
+        day = round(custom_day_var.get(), 2)
+        night = round(custom_night_var.get(), 2)
+    else:
+        day, night = time_presets.get(time_preset_var.get(), (1.0, 1.0))
+
+    st = skip_time_var.get()
+    modify_time(path, day, night, st)
+
+    # --- NEW: refresh GUI from disk after writing ---
+    try:
+        if "sync_all_rules" in globals():
+            globals()["sync_all_rules"](path)
+    except Exception:
+        # keep editor alive even if refresh fails
+        pass
+
 SEASON_ID_MAP = {
     1: "RU_03",  # Season 1: Kola Peninsula
     2: "US_04",  # Season 2: Yukon
@@ -3119,6 +3457,566 @@ class VirtualObjectivesFast:
         log(f"Reloaded save: original_checked={len(self.original_checked)}")
         self._refresh_visible_checkbox_vars(force=True)
         self._update_visible_rows()
+
+def _decode_save_timestamp_hex(hex_str):
+    try:
+        # accept either a '0x...' string or a plain integer
+        if isinstance(hex_str, str) and hex_str.lower().startswith("0x"):
+            v = int(hex_str, 16)
+        else:
+            v = int(hex_str)
+    except Exception:
+        return ""
+
+    try:
+        # Decide whether value is milliseconds or seconds
+        if v >= 10**12:
+            ts = v / 1000.0       # milliseconds -> seconds float
+        elif v >= 10**10:
+            ts = float(v)         # seconds
+        else:
+            # small/unexpected value — fall back to numeric representation
+            return str(v)
+
+        # Use local time (datetime.fromtimestamp) and format as requested:
+        dt = datetime.fromtimestamp(ts)
+        # Format: day.month. space year space HH:MM:SS  (24-hour)
+        return dt.strftime("%d.%m. %Y %H:%M:%S")
+
+    except Exception:
+        # If conversion fails, return the numeric for debugging
+        return str(v)
+
+    
+def extract_save_timestamp_from_file(path):
+    try:
+        raw = open(path, "rb").read()
+    except Exception:
+        return (None, "")
+
+    # ----- 1) Search decoded-as-latin1 (preserves bytes) for quoted or unquoted patterns -----
+    txt = raw.decode("latin1")  # avoids drops; keeps 1:1 byte->codepoint mapping
+    # try quoted "timestamp":"0x..."
+    m = re.search(r'"saveTime"\s*:\s*\{\s*"timestamp"\s*:\s*"(0x[0-9A-Fa-f]{8,20})"', txt)
+    if m:
+        hx = m.group(1)
+        return (hx, _decode_save_timestamp_hex(hx))
+    # try unquoted "timestamp":0x...
+    m = re.search(r'"saveTime"\s*:\s*\{\s*"timestamp"\s*:\s*(0x[0-9A-Fa-f]{8,20})', txt)
+    if m:
+        hx = m.group(1)
+        return (hx, _decode_save_timestamp_hex(hx))
+
+    # ----- 2) If not found, try to find inside zlib-compressed blocks -----
+    # common zlib stream starts with 0x78
+    for off in (i for i, b in enumerate(raw) if b == 0x78):
+        try:
+            dec = zlib.decompress(raw[off:])
+            if not dec:
+                continue
+            s = dec.decode("utf-8", errors="ignore")
+            m = re.search(r'"saveTime"\s*:\s*\{\s*"timestamp"\s*:\s*"(0x[0-9A-Fa-f]{8,20})"', s)
+            if m:
+                hx = m.group(1)
+                return (hx, _decode_save_timestamp_hex(hx))
+            m = re.search(r'"saveTime"\s*:\s*\{\s*"timestamp"\s*:\s*(0x[0-9A-Fa-f]{8,20})', s)
+            if m:
+                hx = m.group(1)
+                return (hx, _decode_save_timestamp_hex(hx))
+        except Exception:
+            # if decompression fails, just continue
+            continue
+
+    # ----- 3) Fallback: find any 0x... hex and pick the one that makes sense (year 1970-2100) -----
+    hexes = re.findall(r'0x[0-9A-Fa-f]{8,20}', txt)
+    if not hexes:
+        # also attempt on raw bytes as hex string (latin1 already used)
+        hexes = re.findall(r'0x[0-9A-Fa-f]{8,20}', raw.hex())
+    best = None
+    for hx in hexes:
+        try:
+            v = int(hx, 16)
+            # try milliseconds -> dt
+            if v >= 10**12:
+                dt = datetime.datetime.fromtimestamp(v/1000.0)
+            elif v >= 10**10:
+                dt = datetime.datetime.fromtimestamp(v)
+            else:
+                continue
+            if 1970 <= dt.year <= 2100:
+                # pick the first plausible one (you can prefer newest by comparing dt)
+                best = (hx, dt.strftime("%Y-%m-%d %H:%M:%S"))
+                break
+        except Exception:
+            continue
+
+    if best:
+        return best
+
+    # nothing found
+    return (None, "")
+
+def create_backups_tab(tab_backups, save_path_var):
+    """
+    Backups tab: lists backup folders -> clicking a folder lists CompleteSave*.cfg/.dat
+    Columns: Name | Saved Time | Money | XP | Rank
+    - Single-click selects (enables Recall Selected).
+    - Double-click folder -> open (list files).
+    - Double-click file -> recall that file (+ associated companion files).
+    - Recall Selected: when a folder-row is selected -> restore entire backup folder.
+                       when a file-row is selected   -> restore that file + companions.
+    """
+    container = ttk.Frame(tab_backups)
+    container.pack(fill="both", expand=True, padx=8, pady=8)
+
+    top_row = ttk.Frame(container)
+    top_row.pack(fill="x", pady=(0,6))
+
+    title = ttk.Label(top_row, text="Backups", font=("TkDefaultFont", 11, "bold"))
+    title.pack(side="left", anchor="w")
+
+        # add this near the top_row button definitions (after refresh/back/recall buttons)
+    settings_btn = ttk.Button(top_row, text="Settings")
+    settings_btn.pack(side="right", padx=(6,0))
+
+    def open_backup_settings():
+        """
+        Robust Backup Settings popup: uses globals if present, otherwise local fallbacks.
+        Persists settings into CONFIG_FILE via save_config(). Ensures the global autosave_var
+        is used (so toggles take effect immediately) and attaches a single trace to it.
+        """
+        # Determine parent safely
+        try:
+            parent = tab_backups.winfo_toplevel() if 'tab_backups' in globals() and hasattr(tab_backups, 'winfo_toplevel') else (tk._default_root if getattr(tk, "_default_root", None) is not None else None)
+        except Exception:
+            parent = None
+
+        win = tk.Toplevel(parent) if parent else tk.Toplevel()
+        win.title("Backup Settings")
+        win.geometry("480x260")
+        win.resizable(False, False)
+        try:
+            if parent:
+                try:
+                    win.transient(parent)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Load config safely
+        try:
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+
+        # Ensure globals references
+        global make_backup_var, full_backup_var, max_backups_var, max_autobackups_var, autosave_var, save_path_var
+
+        # Local fallbacks if globals missing (UI-bound vars for the popup)
+        if 'make_backup_var' not in globals() or make_backup_var is None:
+            make_backup_var_local = tk.BooleanVar(win, value=bool(cfg.get("make_backup", True)))
+        else:
+            make_backup_var_local = make_backup_var
+
+        if 'full_backup_var' not in globals() or full_backup_var is None:
+            full_backup_var_local = tk.BooleanVar(win, value=bool(cfg.get("full_backup", False)))
+        else:
+            full_backup_var_local = full_backup_var
+
+        if 'max_backups_var' not in globals() or max_backups_var is None:
+            max_backups_var_local = tk.StringVar(win, value=str(cfg.get("max_backups", "20")))
+        else:
+            max_backups_var_local = max_backups_var
+
+        if 'max_autobackups_var' not in globals() or max_autobackups_var is None:
+            max_autobackups_var_local = tk.StringVar(win, value=str(cfg.get("max_autobackups", "50")))
+        else:
+            max_autobackups_var_local = max_autobackups_var
+
+        # Force the app-global autosave_var to exist and use it (so popup toggles affect the app immediately)
+        try:
+            if 'autosave_var' not in globals() or autosave_var is None:
+                autosave_var = tk.BooleanVar(win, value=bool(cfg.get("autosave", False)))
+        except Exception:
+            autosave_var = tk.BooleanVar(win, value=bool(cfg.get("autosave", False)))
+
+        # Build UI
+        frm = ttk.Frame(win, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, text="Backup options", font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0,8))
+
+        # Checkbuttons
+        try:
+            ttk.Checkbutton(frm, text="Small Backup (only the main save file)", variable=make_backup_var_local).pack(anchor="w", pady=(2,4))
+        except Exception:
+            ttk.Checkbutton(frm, text="Small Backup (only the main save file)").pack(anchor="w", pady=(2,4))
+
+        try:
+            ttk.Checkbutton(frm, text="Full Backup (entire save folder) Recommended", variable=full_backup_var_local).pack(anchor="w", pady=(0,8))
+        except Exception:
+            ttk.Checkbutton(frm, text="Full Backup (entire save folder) Recommended").pack(anchor="w", pady=(0,8))
+
+        # Autosave checkbox bound to the global var so it affects the monitor immediately
+        ttk.Checkbutton(frm, text="Enable Autosave (create autobackup when game autosaves)", variable=autosave_var).pack(anchor="w", pady=(0,8))
+        # small red help text under the autosave checkbox
+        tk.Label(frm,
+                 text="Autosaves work only if the editor is running in the background",
+                 fg="red",
+                 justify="left",
+                 wraplength=440).pack(anchor="w", pady=(0,8))
+
+        # Max backups (normal)
+        row1 = ttk.Frame(frm)
+        row1.pack(fill="x", pady=(6, 2))
+        ttk.Label(row1, text="Max backups (0 = unlimited):").pack(side="left")
+        try:
+            ttk.Entry(row1, textvariable=max_backups_var_local, width=8).pack(side="left", padx=(8, 0))
+        except Exception:
+            tmp_mb_val = tk.StringVar(win, value=str(cfg.get("max_backups", "20")))
+            ttk.Entry(row1, textvariable=tmp_mb_val, width=8).pack(side="left", padx=(8, 0))
+
+        # Max autobackups (separate)
+        row2 = ttk.Frame(frm)
+        row2.pack(fill="x", pady=(4, 2))
+        ttk.Label(row2, text="Max autobackups (0 = unlimited):").pack(side="left")
+        try:
+            ttk.Entry(row2, textvariable=max_autobackups_var_local, width=8).pack(side="left", padx=(8, 0))
+        except Exception:
+            tmp_ab_val = tk.StringVar(win, value=str(cfg.get("max_autobackups", "50")))
+            ttk.Entry(row2, textvariable=tmp_ab_val, width=8).pack(side="left", padx=(8, 0))
+
+        # Buttons
+        btn_row = ttk.Frame(frm)
+        btn_row.pack(fill="x", pady=(14, 0))
+
+        def _cfg_bool(v):
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "on")
+            try:
+                return bool(int(v))
+            except Exception:
+                return False
+
+        def _save_and_close():
+            # push local popup values back into globals if they exist, and persist to config
+            try:
+                if 'make_backup_var' in globals() and make_backup_var is not None:
+                    make_backup_var.set(_cfg_bool(make_backup_var_local.get()))
+            except Exception:
+                pass
+            try:
+                if 'full_backup_var' in globals() and full_backup_var is not None:
+                    full_backup_var.set(_cfg_bool(full_backup_var_local.get()))
+            except Exception:
+                pass
+            try:
+                if 'max_backups_var' in globals() and max_backups_var is not None:
+                    max_backups_var.set(str(max_backups_var_local.get()))
+            except Exception:
+                pass
+            try:
+                if 'max_autobackups_var' in globals() and max_autobackups_var is not None:
+                    max_autobackups_var.set(str(max_autobackups_var_local.get()))
+            except Exception:
+                pass
+            try:
+                if 'autosave_var' in globals() and autosave_var is not None:
+                    autosave_var.set(_cfg_bool(autosave_var.get()))
+            except Exception:
+                pass
+
+            # Persist to config file as canonical source of truth
+            try:
+                new_cfg = load_config() or {}
+            except Exception:
+                new_cfg = {}
+            try:
+                new_cfg["make_backup"] = _cfg_bool(make_backup_var_local.get())
+                new_cfg["full_backup"] = _cfg_bool(full_backup_var_local.get())
+                new_cfg["max_backups"] = int(max_backups_var_local.get()) if str(max_backups_var_local.get()).isdigit() else int(new_cfg.get("max_backups", 20))
+                new_cfg["max_autobackups"] = int(max_autobackups_var_local.get()) if str(max_autobackups_var_local.get()).isdigit() else int(new_cfg.get("max_autobackups", 50))
+                new_cfg["autosave"] = _cfg_bool(autosave_var.get())
+            except Exception:
+                # fallbacks
+                new_cfg.setdefault("max_backups", 20)
+                new_cfg.setdefault("max_autobackups", 50)
+            try:
+                save_config(new_cfg)
+            except Exception as e:
+                print("[Backup Settings] Failed to save config:", e)
+
+            messagebox.showinfo("Settings", "Backup settings saved.")
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        def _cancel():
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(btn_row, text="Cancel", command=_cancel).pack(side="right", padx=(6,0))
+        ttk.Button(btn_row, text="Save", command=_save_and_close).pack(side="right")
+
+        # ---- autosave toggle wiring: remove old traces and attach a single one ----
+        def _autosave_toggled(*a):
+            try:
+                if autosave_var.get():
+                    # pass callable returning full save-file path (monitor resolves folder)
+                    start_autosave_monitor(lambda: save_path_var.get() if save_path_var is not None else "")
+                else:
+                    stop_autosave_monitor()
+            except Exception as e:
+                print("[Autosave] toggle error:", e)
+
+        try:
+            # remove previous traces to avoid duplication
+            traces = autosave_var.trace_info() or []
+            for t in traces:
+                try:
+                    autosave_var.trace_vdelete(t[0], t[1])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        try:
+            autosave_var.trace_add("write", _autosave_toggled)
+        except Exception:
+            try:
+                autosave_var.trace("w", _autosave_toggled)
+            except Exception:
+                pass
+
+        # Ensure monitor state matches checkbox now (no restart needed)
+        try:
+            _autosave_toggled()
+        except Exception:
+            pass
+
+        # Keep popup modal until dismissed
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+
+
+    # wire the button
+    settings_btn.config(command=open_backup_settings)
+
+
+    refresh_btn = ttk.Button(top_row, text="Refresh")
+    refresh_btn.pack(side="right", padx=(4,0))
+
+    # Back button removed — navigation is simplified (only folder-level recall supported)
+
+    recall_btn = ttk.Button(top_row, text="Recall Selected", state="disabled")
+    recall_btn.pack(side="right", padx=(6,0))
+
+    # treeview / table with additional columns
+    tree_frame = ttk.Frame(container)
+    tree_frame.pack(fill="both", expand=True)
+
+    # Only show folder name and saved time. Individual-file recall removed.
+    cols = ("name", "time")
+    tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+    tree.heading("name", text="Name")
+    tree.heading("time", text="Saved Time")
+    tree.column("name", width=600, anchor="w")
+    tree.column("time", width=180, anchor="center")
+
+    vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vsb.set)
+    tree.pack(side="left", fill="both", expand=True)
+    vsb.pack(side="right", fill="y")
+
+    # state dict removed — UI operates in folder-only mode
+
+    def _get_backup_dir():
+        path = save_path_var.get() if save_path_var is not None else ""
+        if not path:
+            return None
+        save_dir = os.path.dirname(path)
+        backup_dir = os.path.join(save_dir, "backup")
+        return backup_dir
+
+    def list_backup_folders():
+        tree.delete(*tree.get_children())
+        backup_dir = _get_backup_dir()
+        if not backup_dir or not os.path.exists(backup_dir):
+            tree.insert("", "end", values=("No backups found (set save path or create backups first)", ""))
+            return
+        try:
+            items = sorted(os.listdir(backup_dir), reverse=True)
+            if not items:
+                tree.insert("", "end", values=("No backups found", ""))
+                return
+
+            for name in items:
+                p = os.path.join(backup_dir, name)
+                label = name + ("/" if os.path.isdir(p) else "")
+
+                # --- Saved time: try folder name first, then folder mtime, else failure ---
+                time_str = ""
+                try:
+                    m = re.match(r'^(?:backup|autobackup)-(\d{2}\.\d{2}\.\d{4}) (\d{2}-\d{2}-\d{2})', name)
+                    if m:
+                        try:
+                            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%d.%m.%Y %H-%M-%S")
+                            time_str = dt.strftime("%d.%m.%Y %H:%M:%S")
+                        except Exception:
+                            time_str = ""
+                except Exception:
+                    time_str = ""
+
+                if not time_str:
+                    try:
+                        mtime = os.path.getmtime(p)
+                        time_str = datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M:%S")
+                    except Exception:
+                        time_str = "Failed to get time"
+
+                # Insert folder row (name, saved time). Per-file stats removed.
+                tree.insert("", "end", values=(label, time_str))
+
+            # operate in folder-only mode; ensure recall disabled until selection
+            recall_btn.config(state="disabled")
+        except Exception as e:
+            tree.insert("", "end", values=(f"Error listing backups: {e}", ""))
+
+
+    # list_files_in_backup removed: per-file recall and folder drilling disabled
+
+    def _selected_item():
+        sel = tree.selection()
+        if not sel:
+            return None
+        vals = tree.item(sel[0], "values")
+        if not vals:
+            return None
+        return vals[0]  # relname or folder label
+
+    def on_tree_double_click(event):
+        # Double-click disabled: do nothing to avoid drilling into backup folders.
+        return
+
+    def on_tree_select(event):
+        sel = tree.selection()
+        if not sel:
+            recall_btn.config(state="disabled")
+            return
+        vals = tree.item(sel[0], "values")
+        if not vals:
+            recall_btn.config(state="disabled")
+            return
+        # Only folder-level rows are shown; enable recall when an item is selected
+        recall_btn.config(state="normal")
+
+    def on_refresh():
+        # Always show folder-level listing; disable drilling into backup folders.
+        list_backup_folders()
+    
+
+    def on_recall_selected():
+        """
+        If in folders mode: restore the entire selected backup folder into save folder.
+        If in files mode: restore the selected CompleteSave file + matching companions (existing logic).
+        """
+        sel = _selected_item()
+        if not sel:
+            messagebox.showinfo("Recall", "No item selected.")
+            return
+
+        backup_dir = _get_backup_dir()
+        if not backup_dir:
+            messagebox.showerror("Recall", "Save folder/backup folder not found.")
+            return
+
+        # Restore the entire selected backup folder
+        folder_label = sel
+        folder_name = folder_label.rstrip("/")
+        chosen = os.path.join(backup_dir, folder_name)
+        if not os.path.exists(chosen):
+            messagebox.showerror("Recall", f"Backup folder not found: {folder_name}")
+            return
+        if not messagebox.askyesno("Recall full backup", f"Restore entire backup '{folder_name}' to the save folder? This will overwrite files. Continue?"):
+            return
+        save_dir = os.path.dirname(save_path_var.get()) if save_path_var is not None else None
+        if not save_dir or not os.path.isdir(save_dir):
+            return messagebox.showerror("Recall", "Save folder not set or invalid.")
+        copied = 0
+        for root, _, files in os.walk(chosen):
+            for f in files:
+                src = os.path.join(root, f)
+                rel = os.path.relpath(src, chosen)
+                dst = os.path.join(save_dir, rel)
+                try:
+                    os.makedirs(os.path.dirname(dst), exist_ok=True)
+                    shutil.copy2(src, dst)
+                    copied += 1
+                except Exception as e:
+                    print(f"[Recall full] failed {src} -> {dst}: {e}")
+                    continue
+        messagebox.showinfo("Recall", f"Recalled {copied} files from backup '{folder_name}'.")
+        # refresh listing
+        list_backup_folders()
+
+    # Bindings
+    tree.bind("<Double-1>", on_tree_double_click)
+    tree.bind("<<TreeviewSelect>>", on_tree_select)
+    refresh_btn.config(command=on_refresh)
+    # back_btn removed — no command to bind
+    recall_btn.config(command=on_recall_selected)
+
+    # initial populate
+    list_backup_folders()
+    
+# ───────────────────────────────────    
+    # --- Attach auto-refresh to save_path_var AFTER tree exists (works on new and old tkinter) ---
+    def _on_save_path_change(*_args):
+        try:
+            # clear current rows then re-list (list_backup_folders will repopulate)
+            try:
+                # defensive: ensure `tree` still exists
+                for iid in tree.get_children():
+                    tree.delete(iid)
+            except Exception:
+                pass
+            list_backup_folders()
+        except Exception:
+            # swallow to avoid trace crashes
+            pass
+
+    try:
+        # remove any previous traces to avoid duplication (best-effort)
+        if hasattr(save_path_var, "trace_info"):
+            for t in (save_path_var.trace_info() or []):
+                try:
+                    save_path_var.trace_vdelete(t[0], t[1])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        # modern tkinter
+        save_path_var.trace_add("write", _on_save_path_change)
+    except Exception:
+        try:
+            # fallback for older tkinter
+            save_path_var.trace("w", _on_save_path_change)
+        except Exception:
+            pass
+    # --- end auto-refresh wiring ---
+
+# ───────────────────────────────────
+
 def create_objectives_tab(tab, save_path_var):
     """
     Mounts the VirtualObjectivesFast into the provided `tab`.
@@ -3940,7 +4838,6 @@ def create_achievements_tab(tab, save_path_var, plugin_loaders):
         except Exception:
             pass
 
-
     top = ttk.Frame(tab)
     top.pack(fill="x", pady=6, padx=8)
     ttk.Label(top, text="CommonSslSave file:").pack(side="left")
@@ -3966,12 +4863,12 @@ def create_achievements_tab(tab, save_path_var, plugin_loaders):
     hint = ("The editor will try to auto-detect the CommonSslSave (from config or the save folder) and load it automatically. "
             "Use Browse... to select another file.")
     ttk.Label(tab, text=hint, wraplength=1000, justify="left").pack(fill="x", padx=10, pady=(6, 8))
-    ttk.Style().configure("RedWarning.TLabel", foreground="red"); ttk.Label(tab, text="Steam achievements will also be unlocked, but they can’t be removed with this editor. It’s meant mainly for the in-game Achievements tab.", wraplength=1000, justify="left", style="RedWarning.TLabel").pack(fill="x", padx=10, pady=(6, 8))
+    ttk.Style().configure("RedWarning.TLabel", foreground="red")
+    ttk.Label(tab, text="Steam achievements will also be unlocked, but they can’t be removed with this editor. It’s meant mainly for the in-game Achievements tab.", wraplength=1000, justify="left", style="RedWarning.TLabel").pack(fill="x", padx=10, pady=(6, 8))
 
     # central area: we'll place a centered frame with a 3-column grid of checkboxes
     body_outer = ttk.Frame(tab)
     body_outer.pack(fill="both", expand=True, padx=10, pady=6)
-
     center_container = ttk.Frame(body_outer)
     center_container.pack(expand=True)
     grid_frame = ttk.Frame(center_container)
@@ -4035,55 +4932,15 @@ def create_achievements_tab(tab, save_path_var, plugin_loaders):
         except Exception as e:
             return messagebox.showerror("Error", f"Failed to load achievements:\n{e}")
 
-
-def build_fallback_for_key(key: str, unlocked: bool = True) -> dict:
-    """
-    Build a conservative fallback achievement state for keys that don't
-    have a preset block. Returns a minimal dict representing an unlocked
-    achievement so saving will mark it completed.
-    """
-    # Minimal safe shape: prefer a simple IntAchievementState-like object
-    try:
-        return {
-            "$type": "IntAchievementState",
-            "isUnlocked": bool(unlocked),
-            "currentValue": 1 if unlocked else 0
-        }
-    except Exception:
-        return {"isUnlocked": bool(unlocked)}
-
-    def _auto_detect_and_load():
-        # 1) try config
+    # fallback builder (use module-level if available)
+    def build_fallback_for_key_local(key: str, unlocked: bool = True) -> dict:
         try:
-            cfg = load_config() or {}
-            cp = cfg.get("common_ssl_path")
-            if cp and os.path.exists(cp):
-                load_achievements_from_file(cp)
-                return
+            # prefer module-level helper if available
+            if "build_fallback_for_key" in globals() and callable(globals().get("build_fallback_for_key")):
+                return globals()["build_fallback_for_key"](key, unlocked)
+            return {"$type": "IntAchievementState", "isUnlocked": bool(unlocked), "currentValue": 1 if unlocked else 0}
         except Exception:
-            pass
-        # 2) try same folder as main save if present
-        try:
-            main = save_path_var.get()
-            if main:
-                d = os.path.dirname(main)
-                if os.path.isdir(d):
-                    # find candidate .cfg/.dat/.json files and inspect for CommonSslSave
-                    for fname in os.listdir(d):
-                        if not fname.lower().endswith((".cfg", ".dat", ".json")):
-                            continue
-                        cand = os.path.join(d, fname)
-                        try:
-                            with open(cand, "r", encoding="utf-8") as f:
-                                txt = f.read()
-                            if '"CommonSslSave"' in txt:
-                                load_achievements_from_file(cand)
-                                return
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-        # nothing found — leave UI empty until user clicks Browse
+            return {"isUnlocked": bool(unlocked)}
 
     # Save function (writes only achievementStates shallow merge; keeps other parts untouched)
     def save_achievements_to_file():
@@ -4161,7 +5018,7 @@ def build_fallback_for_key(key: str, unlocked: bool = True) -> dict:
                     continue
 
                 # otherwise, build a fallback shape (use previous heuristics)
-                fallback = build_fallback_for_key(key, True)
+                fallback = build_fallback_for_key_local(key, True)
                 new_ach[key] = fallback
 
             # Put new_ach into orig_parsed and write back
@@ -4199,13 +5056,26 @@ def build_fallback_for_key(key: str, unlocked: bool = True) -> dict:
         except Exception as e:
             messagebox.showerror("Save error", f"Failed to save achievements:\n{e}")
 
-
-    # Save button
-    ttk.Button(tab, text="Save to file", command=save_achievements_to_file).pack(side="bottom", pady=(10, 12))
+    # Bottom: Save button (centered)
+    bottom = ttk.Frame(tab)
+    bottom.pack(fill="x", padx=12, pady=(6,12))
+    ttk.Button(bottom, text="Save to file", command=save_achievements_to_file).pack(anchor="center")
 
     # Auto-detect & load on creation (if possible)
-    _auto_detect_and_load()
+    try:
+        # prefer config value first
+        cfg = load_config() or {}
+        cp = cfg.get("common_ssl_path")
+        if cp and os.path.exists(cp):
+            load_achievements_from_file(cp)
+        else:
+            # fallback to same-folder scanning if save_path_var provides a main save
+            _ = sync_achievements_from_save(save_path_var.get()) if save_path_var and save_path_var.get() else None
+    except Exception:
+        pass
+
     return
+
 
 def create_trials_tab(tab, save_path_var, plugin_loaders):
     """
@@ -5316,7 +6186,7 @@ def launch_gui():
     global money_var, rank_var, time_preset_var, skip_time_var
     global custom_day_var, custom_night_var, other_season_var
     global FACTOR_RULE_VARS, rule_savers, plugin_loaders
-    global tyre_var, delete_path_on_close_var, dont_remember_path_var
+    global tyre_var, delete_path_on_close_var, dont_remember_path_var, autosave_var
     
     # Create root window first
     root = tk.Tk()
@@ -5344,6 +6214,8 @@ def launch_gui():
     tyre_var = tk.StringVar(root, value="default")
     delete_path_on_close_var = tk.BooleanVar(root, value=False)
     dont_remember_path_var = tk.BooleanVar(root, value=False)
+    autosave_var = tk.BooleanVar(root, value=False)
+    max_autobackups_var = tk.StringVar(root, value="50")
     # Initialize additional variables
     difficulty_var = tk.StringVar(root)
     truck_avail_var = tk.StringVar(root)
@@ -5374,6 +6246,7 @@ def launch_gui():
     try:
         cfg = load_config()
         max_backups_var.set(str(cfg.get("max_backups", "0")))
+        max_autobackups_var.set(str(cfg.get("max_autobackups", "50")))
         make_backup_var.set(cfg.get("make_backup", True))
         full_backup_var.set(cfg.get("full_backup", False))
     except Exception:
@@ -5665,7 +6538,9 @@ def launch_gui():
                 print(f"Plugin failed to update GUI on startup: {e}")
 
     def browse_file():
-        file_path = filedialog.askopenfilename(filetypes=[("SnowRunner Save", "*.cfg *.dat")])
+        file_path = filedialog.askopenfilename(
+            filetypes=[("SnowRunner Save", "*.cfg *.dat")]
+        )
         if not file_path:
             return
 
@@ -5710,56 +6585,103 @@ def launch_gui():
         # If we reached here, file_path is accepted (either original or replaced)
         save_path_var.set(file_path)
 
-        # Call plugin GUI loaders to refresh their values from file
-        for loader in plugin_loaders:
-            try:
-                loader(save_path_var.get())
-            except Exception as e:
-                print(f"Plugin failed to update GUI from file: {e}")
-
         # Persist the selection
         save_path(file_path)
 
-        # Update GUI with parsed values (re-read content to get parsed values)
+        # Call plugin GUI loaders to refresh their values from file
+        for loader in plugin_loaders:
+            try:
+                loader(file_path)
+            except Exception as e:
+                print(f"Plugin failed to update GUI from file: {e}")
+
+        # PRIMARY: use the single source-of-truth refresher if available
+        if "sync_all_rules" in globals():
+            try:
+                print("[DEBUG] browse_file → calling sync_all_rules for:", file_path)
+                sync_all_rules(file_path)
+                # Force the Tk mainloop to process pending variable->widget updates
+                try:
+                    root.update_idletasks()
+                    root.update()
+                except Exception:
+                    # in case 'root' isn't available in this scope, try default_root
+                    try:
+                        tk._default_root.update_idletasks()
+                        tk._default_root.update()
+                    except Exception:
+                        pass
+                return
+            except Exception as e:
+                print(f"sync_all_rules failed: {e}")
+
+        # FALLBACK: manual UI update (keeps previous behavior if sync_all_rules is not defined)
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
             m, r, xp, d, t, s, day, night, tp = get_file_info(content)
 
-            money_var.set(str(m))
-            rank_var.set(str(r))
+            # Money / rank
+            if "money_var" in globals() and money_var is not None:
+                try:
+                    money_var.set(str(m))
+                except Exception:
+                    pass
 
-            # xp already parsed earlier by get_file_info -> use that
+            if "rank_var" in globals() and rank_var is not None:
+                try:
+                    rank_var.set(str(r))
+                except Exception:
+                    pass
+
+            # XP
             try:
-                xp_var.set(str(xp) if xp is not None else "")
+                if "xp_var" in globals() and xp_var is not None:
+                    xp_val = xp if xp is not None else _read_int_key_from_text(content, "experience")
+                    xp_var.set(str(xp_val) if xp_val is not None else "")
             except Exception:
                 try:
                     xp_var.set("")
                 except Exception:
                     pass
 
-            # new: read experience if present — guard against xp_var not being initialized yet
-            xp_val = _read_int_key_from_text(content, "experience")
-            if "xp_var" in globals() and xp_var is not None:
-                try:
-                    xp_var.set(str(xp_val) if xp_val is not None else "")
-                except Exception:
-                    # defensive: ignore UI error (keeps GUI alive)
-                    pass
-            # if xp_var isn't ready yet, sync_all_rules() will update it later
+            # Difficulty / truck availability / price maps (guarded)
+            try:
+                if "difficulty_var" in globals() and difficulty_var is not None:
+                    difficulty_var.set(difficulty_map.get(d, "Normal"))
+            except Exception:
+                pass
 
+            try:
+                if "truck_avail_var" in globals() and truck_avail_var is not None:
+                    truck_avail_var.set(truck_avail_map.get(t, "default"))
+            except Exception:
+                pass
 
-            difficulty_var.set(difficulty_map.get(d, "Normal"))
-            truck_avail_var.set(truck_avail_map.get(t, "default"))
-            truck_price_var.set(truck_price_map.get(tp, "default"))
-            skip_time_var.set(s)
+            try:
+                if "truck_price_var" in globals() and truck_price_var is not None:
+                    truck_price_var.set(truck_price_map.get(tp, "default"))
+            except Exception:
+                pass
 
-            match = next(
-                (k for k, v in time_presets.items()
-                 if abs(day - v[0]) < 0.01 and abs(night - v[1]) < 0.01),
-                "Custom"
-            )
-            time_preset_var.set(match)
+            # Skip time
+            try:
+                if "skip_time_var" in globals() and skip_time_var is not None:
+                    skip_time_var.set(s)
+            except Exception:
+                pass
+
+            # Time preset matching (guarded)
+            try:
+                if day is not None and night is not None and "time_preset_var" in globals() and time_preset_var is not None:
+                    match = next(
+                        (k for k, v in time_presets.items()
+                         if abs(day - v[0]) < 0.01 and abs(night - v[1]) < 0.01),
+                        "Custom"
+                    )
+                    time_preset_var.set(match)
+            except Exception:
+                pass
 
         except Exception:
             # This should be rare because we validated earlier, but handle defensively
@@ -5768,6 +6690,7 @@ def launch_gui():
                 f"Could not load save file after selection:\n{file_path}\n\nThe file appears to be corrupted or incomplete."
             )
             save_path_var.set("")
+            return
 
 
     tab_control = ttk.Notebook(root)
@@ -5777,6 +6700,9 @@ def launch_gui():
     tab_rules = ttk.Frame(tab_control)
     tab_time = ttk.Frame(tab_control)
     tab_control.add(tab_file, text='Save File')
+    tab_backups = ttk.Frame(tab_control)
+    tab_control.add(tab_backups, text='Backups')
+    create_backups_tab(tab_backups, save_path_var)
     tab_control.add(tab_money, text='Money & Rank')
     tab_control.add(tab_missions, text='Missions')
     tab_contests = ttk.Frame(tab_control)
@@ -5797,6 +6723,22 @@ def launch_gui():
     tab_watchtowers = ttk.Frame(tab_control)
     tab_control.add(tab_watchtowers, text="Watchtowers")
     create_watchtowers_tab(tab_watchtowers, save_path_var)
+
+
+    # start autosave monitor if autosave enabled in config
+    try:
+        cfg = load_config()
+        if "autosave" in cfg and cfg.get("autosave"):
+            # ensure autosave_var exists & set it
+            try:
+                autosave_var.set(cfg.get("autosave", True))
+            except:
+                pass
+            # start monitor
+            start_autosave_monitor(lambda: save_path_var.get() if save_path_var is not None else "")
+    except Exception:
+        pass
+
 
     # ---------- Initialize Rules tab UI ----------
     try:
@@ -5881,6 +6823,8 @@ def launch_gui():
         config["make_backup"] = make_backup_var.get()
         config["full_backup"] = full_backup_var.get()
         config["max_backups"] = int(max_backups_var.get())
+        config["max_autobackups"] = int(max_autobackups_var.get())
+        config["autosave"] = bool(autosave_var.get() if autosave_var is not None else False)
         save_config(config)
 
     def save_settings():
@@ -5984,53 +6928,8 @@ def launch_gui():
         foreground="red",
         font=("TkDefaultFont", 9, "bold")
     ).pack(pady=(5, 10))
-    # Restore from config if available
-    try:
-        cfg = load_config()
-        make_backup_var.set(cfg.get("make_backup", True))
-        full_backup_var.set(cfg.get("full_backup", True))
-    except Exception:
-        pass
 
-    ttk.Checkbutton(
-        tab_file,
-        text="Small Backup (only the 1 main save file, ~200kB per backup)",
-        variable=make_backup_var,
-        command=save_settings_silent
-    ).pack(pady=(0, 10))
-
-    ttk.Checkbutton(
-        tab_file,
-        text="Full Backup (entire save folder, ~30MB per backup) Recommended",
-        variable=full_backup_var,
-        command=save_settings_silent
-    ).pack(pady=(0, 10))
-
-    ttk.Button(
-        tab_file,
-        text="Recall Backup",
-        command=lambda: recall_backup(save_path_var.get())
-    ).pack(pady=(5, 10))
-
-    ttk.Label(
-        tab_file,
-        text="⚠️ Full backups are much safer but take much more space. Delete old ones regularly.",
-        wraplength=500,
-        justify="center",
-        foreground="red",
-        font=("TkDefaultFont", 9, "bold")
-    ).pack(pady=(0, 10))
-
-    ttk.Label(tab_file, text="Auto Cleanup (max backups, 0 = unlimited):").pack(pady=(5, 0))
-    ttk.Entry(tab_file, textvariable=max_backups_var).pack(pady=(0, 10))
-
-    ttk.Button(
-        tab_file,
-        text="Save Settings",
-        command=lambda: save_settings_silent() or messagebox.showinfo("Settings", "Settings saved.")
-    ).pack(pady=(0, 10))
-
-
+    
 
     # Footer text at the bottom of the Save File tab
     ttk.Label(
@@ -6297,8 +7196,6 @@ def launch_gui():
             messagebox.showinfo("Success", "Money & Rank updated.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to update money & rank: {e}")
-
-    ttk.Button(tab_money, text="Update Money & Rank", command=update_money_rank_combined).pack(pady=(6,10))
 
     # XP requirements display (single-column, centered, monospace, aligned columns)
     req_frame = ttk.Frame(tab_money)
