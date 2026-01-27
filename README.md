@@ -48,7 +48,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 
 > Here is my SnowRunner Save Editor that I made after losing progress in my 300 hour save specifically in the Quebec map.  
 >  
-> All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 16**, and it *should* work fine for upcoming Seasons 17, 18, etc.  
+> All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 17**, and it *should* work fine for upcoming Seasons 18, 19, etc.  
 >  
 > Also no save editor I found could change **game rules**, **game mode** or **time**, so I added those too.  
 >  
