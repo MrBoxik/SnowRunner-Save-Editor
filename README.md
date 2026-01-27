@@ -38,7 +38,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 - 🌫️ **Fog Tool** — edit Fog of War directly
 - 📊 **Game Stats** viewer & editor
 - 🛡️ **Auto-backup system** (with cleanup & recall)
-- 📦 Supports **all base maps** and **Seasons 1–16** (future-ready for later seasons)
+- 📦 Supports **all base maps** and **Seasons 1–17** (future-ready for later seasons)
 - 📂 Remembers your **last used save file**
 - 🔄 Built-in **update checker**
 
