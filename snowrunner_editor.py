@@ -1,3 +1,7 @@
+# =============================================================================
+# SECTION: Imports & Optional Dependencies
+# Used In: Entire application (core runtime, UI, and utilities)
+# =============================================================================
 from __future__ import annotations
 import sys
 import platform
@@ -17,25 +21,119 @@ import shutil
 import threading
 import subprocess
 import csv
-from typing import List, Dict, Any, Iterator, Optional
+import codecs
+import tempfile
+import ssl
+import gzip
+import urllib.request
+import urllib.error
+from urllib.parse import urljoin, urlparse
+from typing import List, Dict, Any, Iterator, Optional, Set
 import random
-import glob
 import re
 import json
-import importlib.util
 from datetime import datetime
-import requests
-import fnmatch
+
+# Guard optional imports to prevent crashes when dependencies missing
+try:
+    import requests  # type: ignore
+except Exception:
+    requests = None
+
+try:
+    from PIL import Image, ImageDraw, ImageTk  # type: ignore
+except Exception:
+    Image = ImageDraw = ImageTk = None
+
 import webbrowser
-from PIL import Image, ImageDraw, ImageTk
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog, PhotoImage
+from tkinter import ttk, filedialog, messagebox, PhotoImage
 import tkinter.font as tkfont
 
-# Global variables declaration
+# =============================================================================
+# APP VERSION (manual)
+# =============================================================================
+APP_VERSION = 96
+_UPDATE_STATUS = None  # "update", "dev", "none"
+
+# Pillow resampling compatibility (handle both old and new Pillow API)
+if Image is not None:
+    try:
+        RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+    except Exception:
+        RESAMPLE_LANCZOS = getattr(Image, "LANCZOS", getattr(Image, "ANTIALIAS", Image.NEAREST))
+else:
+    RESAMPLE_LANCZOS = None
+
+# Flag to enable/disable image-dependent features
+IMAGE_ENABLED = Image is not None and ImageTk is not None
+
+# -----------------------------------------------------------------------------
+# END SECTION: Imports & Optional Dependencies
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Season Config (edit here)
+# Used In: Missions tab, Objectives/Contests, Game Stats, Watchtowers
+# =============================================================================
+SEASON_REGION_MAP = {
+    1: ("RU_03", "Season 1: Search & Recover (Kola Peninsula)"),
+    2: ("US_04", "Season 2: Explore & Expand (Yukon)"),
+    3: ("US_03", "Season 3: Locate & Deliver (Wisconsin)"),
+    4: ("RU_04", "Season 4: New Frontiers (Amur)"),
+    5: ("RU_05", "Season 5: Build & Dispatch (Don)"),
+    6: ("US_06", "Season 6: Haul & Hustle (Maine)"),
+    7: ("US_07", "Season 7: Compete & Conquer (Tennessee)"),
+    8: ("RU_08", "Season 8: Grand Harvest (Glades)"),
+    9: ("US_09", "Season 9: Renew & Rebuild (Ontario)"),
+    10: ("US_10", "Season 10: Fix & Connect (British Columbia)"),
+    11: ("US_11", "Season 11: Lights & Cameras (Scandinavia)"),
+    12: ("US_12", "Season 12: Public Energy (North Carolina)"),
+    13: ("RU_13", "Season 13: Dig & Drill (Almaty)"),
+    14: ("US_14", "Season 14: Reap & Sow (Austria)"),
+    15: ("US_15", "Season 15: Oil & Dirt (Quebec)"),
+    16: ("US_16", "Season 16: High Voltage (Washington)"),
+    17: ("RU_17", "Season 17: Repair & Rescue (Zurdania)"),
+}
+
+BASE_MAPS = [
+    ("US_01", "Michigan"),
+    ("US_02", "Alaska"),
+    ("RU_02", "Taymyr"),
+]
+
+# --- Derived from season config (do not edit) ---
+SEASON_ENTRIES = sorted(SEASON_REGION_MAP.items(), key=lambda kv: kv[0])
+SEASON_ID_MAP = {season: code for season, (code, _) in SEASON_ENTRIES}
+SEASON_LABELS = [label for _, (_, label) in SEASON_ENTRIES]
+SEASON_CODE_LABELS = [(code, label) for _, (code, label) in SEASON_ENTRIES]
+ALL_REGION_CODE_LABELS = BASE_MAPS + SEASON_CODE_LABELS
+
+def _season_short_name(label: str) -> str:
+    match = re.search(r"\(([^)]+)\)\s*$", label)
+    return match.group(1) if match else label
+
+# Short names (used by tooltips and misc UI)
+REGION_NAME_MAP = {code: name for code, name in BASE_MAPS}
+REGION_NAME_MAP.update({code: _season_short_name(label) for _, (code, label) in SEASON_ENTRIES})
+
+# Full names (used by stats UI)
+REGION_LONG_NAME_MAP = {code: name for code, name in BASE_MAPS}
+REGION_LONG_NAME_MAP.update({code: label for _, (code, label) in SEASON_ENTRIES})
+REGION_LONG_NAME_MAP["TRIALS"] = "Trials"
+
+# -----------------------------------------------------------------------------
+# END SECTION: Season Config
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Global Tk/Editor State (shared UI variables)
+# Used In: launch_gui and all tab builders
+# =============================================================================
 make_backup_var = None
 full_backup_var = None
 max_backups_var = None
+max_autobackups_var = None
 save_path_var = None
 money_var = None
 rank_var = None
@@ -66,16 +164,194 @@ garage_refuel_var = None
 autosave_var = None
 _AUTOSAVE_THREAD = None
 _AUTOSAVE_STOP_EVENT = None
+_TIME_SYNC_GUARD = False
 
-SAVE_FILE = "minesweeper_save.json"
+SAVE_FILE_NAME = "snowrunner_editor_save.json"
+_SAVE_FILE_PATH = None
+
+# -----------------------------------------------------------------------------
+# END SECTION: Global Tk/Editor State
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Local Save-Data Path Helpers
+# Used In: Minesweeper mini-game + app settings persistence
+# =============================================================================
+
+def _ensure_dir(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+def _legacy_save_candidates():
+    candidates = []
+    try:
+        candidates.append(os.path.join(os.getcwd(), SAVE_FILE_NAME))
+    except Exception:
+        pass
+    try:
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), SAVE_FILE_NAME))
+    except Exception:
+        pass
+    # Remove duplicates while preserving order
+    seen = set()
+    unique = []
+    for p in candidates:
+        if p and p not in seen:
+            seen.add(p)
+            unique.append(p)
+    return unique
+
+def _migrate_legacy_save(target_path):
+    if os.path.exists(target_path):
+        return
+    for candidate in _legacy_save_candidates():
+        try:
+            if not candidate:
+                continue
+            if os.path.abspath(candidate) == os.path.abspath(target_path):
+                continue
+            if os.path.isfile(candidate):
+                try:
+                    shutil.copy2(candidate, target_path)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+
+def get_save_file_path():
+    """Return a writable path for Minesweeper progress data."""
+    global _SAVE_FILE_PATH
+    if _SAVE_FILE_PATH:
+        return _SAVE_FILE_PATH
+
+    base_dir = None
+    try:
+        system = platform.system()
+    except Exception:
+        system = None
+
+    if system == "Windows":
+        base_dir = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
+        if base_dir:
+            base_dir = os.path.join(base_dir, "SnowRunnerEditor")
+    elif system == "Darwin":
+        base_dir = os.path.expanduser("~/Library/Application Support/SnowRunnerEditor")
+    else:
+        base_dir = os.getenv("XDG_DATA_HOME")
+        if base_dir:
+            base_dir = os.path.join(base_dir, "snowrunner_editor")
+        else:
+            base_dir = os.path.expanduser("~/.local/share/snowrunner_editor")
+
+    if base_dir and _ensure_dir(base_dir):
+        _SAVE_FILE_PATH = os.path.join(base_dir, SAVE_FILE_NAME)
+        _migrate_legacy_save(_SAVE_FILE_PATH)
+        return _SAVE_FILE_PATH
+
+    # Fallback: current working directory
+    try:
+        _SAVE_FILE_PATH = os.path.join(os.getcwd(), SAVE_FILE_NAME)
+    except Exception:
+        _SAVE_FILE_PATH = SAVE_FILE_NAME
+    return _SAVE_FILE_PATH
+
+# -----------------------------------------------------------------------------
+# END SECTION: Local Save-Data Path Helpers
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Resource Paths & App Icon
+# Used In: launch_gui and all Tk/Toplevel windows
+# =============================================================================
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
     try:
         base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
+    except AttributeError:
+        base_path = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_path, relative_path)
 dropdown_widgets = {}
+def _load_iconphotos_from_ico(ico_path):
+    """Return list of PhotoImage objects loaded from a .ico (best effort)."""
+    try:
+        if not ico_path or not os.path.exists(ico_path):
+            return []
+        if Image is None or ImageTk is None:
+            return []
+        ico_img = Image.open(ico_path)
+        icons = []
+        try:
+            n_frames = getattr(ico_img, "n_frames", 1)
+        except Exception:
+            n_frames = 1
+        if n_frames > 1:
+            for i in range(n_frames):
+                try:
+                    ico_img.seek(i)
+                    icons.append(ImageTk.PhotoImage(ico_img.copy()))
+                except Exception:
+                    pass
+        else:
+            icons.append(ImageTk.PhotoImage(ico_img))
+        return icons
+    except Exception:
+        return []
+def _set_windows_taskbar_icon(root, ico_path) -> bool:
+    """Best-effort: set Windows taskbar icon via WM_SETICON."""
+    try:
+        if platform.system() != "Windows":
+            return False
+        try:
+            import ctypes  # local import for safety
+        except Exception:
+            return False
+        if not ico_path or not os.path.exists(ico_path):
+            return False
+        try:
+            root.update_idletasks()
+        except Exception:
+            pass
+        try:
+            hwnd = root.winfo_id()
+        except Exception:
+            return False
+        if not hwnd:
+            return False
+        user32 = ctypes.windll.user32
+        SM_CXICON = 11
+        SM_CYICON = 12
+        SM_CXSMICON = 49
+        SM_CYSMICON = 50
+        cx = user32.GetSystemMetrics(SM_CXICON)
+        cy = user32.GetSystemMetrics(SM_CYICON)
+        cx_sm = user32.GetSystemMetrics(SM_CXSMICON)
+        cy_sm = user32.GetSystemMetrics(SM_CYSMICON)
+        IMAGE_ICON = 1
+        LR_LOADFROMFILE = 0x00000010
+        hicon_big = user32.LoadImageW(0, ico_path, IMAGE_ICON, cx, cy, LR_LOADFROMFILE)
+        hicon_small = user32.LoadImageW(0, ico_path, IMAGE_ICON, cx_sm, cy_sm, LR_LOADFROMFILE)
+        WM_SETICON = 0x80
+        ICON_SMALL = 0
+        ICON_BIG = 1
+        if hicon_big:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+            try:
+                setattr(root, "_win_icon_big", hicon_big)
+            except Exception:
+                pass
+        if hicon_small:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+            try:
+                setattr(root, "_win_icon_small", hicon_small)
+            except Exception:
+                pass
+        return bool(hicon_big or hicon_small)
+    except Exception:
+        return False
 def set_app_icon(root) -> None:
     """Set cross-platform app icon for the given Tk root.
 
@@ -84,15 +360,30 @@ def set_app_icon(root) -> None:
     """
     try:
         system = platform.system()
-        # Windows: prefer .ico
+        # Windows: prefer .ico and explicitly set taskbar icon
         if system == "Windows":
             ico = resource_path("app_icon.ico")
             if os.path.exists(ico):
+                did_set = False
+                # Try using ImageTk to load multi-size .ico for iconphoto (best results on taskbar)
+                icons = _load_iconphotos_from_ico(ico)
+                if icons:
+                    try:
+                        root.iconphoto(True, *icons)
+                        setattr(root, "_app_icon_images", icons)
+                        did_set = True
+                    except Exception:
+                        pass
+                # Force taskbar icon via WinAPI (covers cases where Tk only sets small icon)
+                if _set_windows_taskbar_icon(root, ico):
+                    did_set = True
                 try:
                     root.iconbitmap(ico)
-                    return
+                    did_set = True
                 except Exception:
                     pass
+                if did_set:
+                    return
 
         # Try PNG via Pillow ImageTk (preferred)
         png = resource_path("app_icon.png")
@@ -130,6 +421,17 @@ def set_app_icon(root) -> None:
                     return
                 except Exception:
                     pass
+        # Non-Windows fallback: if no PNG but ICO exists, try using ICO via Pillow
+        if system != "Windows":
+            ico = resource_path("app_icon.ico")
+            icons = _load_iconphotos_from_ico(ico)
+            if icons:
+                try:
+                    root.iconphoto(True, *icons)
+                    setattr(root, "_app_icon_images", icons)
+                    return
+                except Exception:
+                    pass
     except Exception:
         try:
             print("[set_app_icon] failed:\n", traceback.format_exc())
@@ -153,14 +455,49 @@ except Exception:
     # Non-fatal: if tkinter internals differ, fall back to default behavior
     pass
 
+# -----------------------------------------------------------------------------
+# END SECTION: Resource Paths & App Icon
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Minesweeper Mini-Game (Settings tab)
+# Used In: Settings tab -> "Minesweeper" widget
+# =============================================================================
 def load_progress():
-    if not os.path.exists(SAVE_FILE):
-        return {"level": 1, "title": "", "has_bronze": False, "has_silver": False, "has_gold": False}
-    with open(SAVE_FILE, "r") as f:
-        return json.load(f)
+    default = {"level": 1, "title": "", "has_bronze": False, "has_silver": False, "has_gold": False}
+    cfg = _load_config_safe()
+    prog = cfg.get("minesweeper_progress")
+    if isinstance(prog, dict):
+        return {**default, **prog}
+    # Legacy migration: snowrunner_editor_save.json
+    try:
+        path = get_save_file_path()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                cfg["minesweeper_progress"] = data
+                _save_config_safe(cfg)
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+                return {**default, **data}
+    except Exception:
+        pass
+    return default
+
 def save_progress(data):
-    with open(SAVE_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    try:
+        cfg = _load_config_safe()
+        cfg["minesweeper_progress"] = data
+        if not _save_config_safe(cfg):
+            raise RuntimeError("config save failed")
+    except Exception as e:
+        try:
+            messagebox.showerror("Save Error", f"Could not save Minesweeper progress:\n{e}")
+        except Exception:
+            pass
 LEVELS = {
     1: {"size": 10, "mines": 15, "title": "Master of Just Enough Time on Your Hands"},
     2: {"size": 12, "mines": 25, "title": "Master of Too Much Time on Your Hands"},
@@ -201,6 +538,11 @@ class MinesweeperApp:
             text, color = "", "black"
         self.data["title"] = text
         self.title_label.config(text=text, fg=color)
+        # Persist updated title so config stays in sync
+        try:
+            save_progress(self.data)
+        except Exception:
+            pass
 
     def start_level(self):
         self.size, self.mines = LEVELS[self.level]["size"], LEVELS[self.level]["mines"]
@@ -299,6 +641,15 @@ class MinesweeperApp:
         save_progress(self.data)
         self.start_level()
 MINESWEEPER_AVAILABLE = True
+
+# -----------------------------------------------------------------------------
+# END SECTION: Minesweeper Mini-Game (Settings tab)
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Binary Utilities (Fog Tool)
+# Used In: Fog Tool tab -> FogToolApp (fog file encoding)
+# =============================================================================
 class BitWriter:
     def __init__(self):
         self.cur = 0
@@ -328,44 +679,72 @@ class BitWriter:
             self.cur = 0
             self.bitpos = 0
         return bytes(self.bytes)
+
+# -----------------------------------------------------------------------------
+# END SECTION: Binary Utilities (Fog Tool)
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Save-Path Discovery (Fog Tool + Save File tab)
+# Used In: FogToolApp and launch_gui startup
+# =============================================================================
 def load_editor_last_path():
-    """Load last used save path from SnowRunner Editor (.snowrunner_save_path.txt).
-    .snowrunner_save_path.txt traditionally contains a full path to CompleteSave.cfg,
-    so we return dirname(full_path) (the folder)."""
-    cfg_file = os.path.join(os.path.expanduser('~'), '.snowrunner_save_path.txt')
-    if os.path.exists(cfg_file):
-        try:
-            with open(cfg_file, 'r', encoding='utf-8') as f:
-                full_path = f.read().strip()
-            if full_path:
-                return os.path.dirname(full_path)
-        except Exception:
-            pass
+    """Load last used save path from config and return the folder."""
+    try:
+        full_path = load_last_path()
+        if full_path:
+            return os.path.dirname(full_path)
+    except Exception:
+        pass
     return None
+
 def load_initial_path():
     """Priority:
-      1) .snowrunner_save_path.txt (if exists and points to existing folder)
-      2) last_dir.txt (in tool folder)
+      1) config last_save_path (if exists and points to existing folder)
+      2) config fogtool_last_dir (if exists)
+      3) legacy last_dir.txt (in tool folder)
       3) os.getcwd()
     """
-    # 1) SnowRunner editor path first
+    # 1) SnowRunner editor path first (config-based)
     editor_path = load_editor_last_path()
     if editor_path and os.path.isdir(editor_path):
         return editor_path
 
-    # 2) FogTool last_dir.txt
-    last_dir_file = os.path.join(os.path.dirname(__file__), "last_dir.txt")
+    # 2) FogTool last dir from config
+    try:
+        cfg = _load_config_safe()
+        ld = cfg.get("fogtool_last_dir", "")
+        if ld and os.path.isdir(ld):
+            return ld
+    except Exception:
+        pass
+
+    # 3) Legacy last_dir.txt (migrate if possible)
+    last_dir_file = resource_path("last_dir.txt")
     if os.path.exists(last_dir_file):
         try:
             with open(last_dir_file, "r", encoding="utf-8") as f:
                 ld = f.read().strip()
             if ld and os.path.isdir(ld):
+                _update_config_values({"fogtool_last_dir": ld})
+                try:
+                    os.remove(last_dir_file)
+                except Exception:
+                    pass
                 return ld
-        except:
+        except Exception:
             pass
 
-    # 3) Fallback
+    # 4) Fallback
     return os.getcwd()
+
+# -----------------------------------------------------------------------------
+# END SECTION: Save-Path Discovery (Fog Tool + Save File tab)
+# -----------------------------------------------------------------------------
+# =============================================================================
+# SECTION: Fog Tool (Editor + Automation UI)
+# Used In: Fog Tool tab -> FogToolFrame
+# =============================================================================
 class FogToolApp(ttk.Frame):
     def __init__(self, master=None, initial_save_dir=None):
         # Resolve initial path according to priority
@@ -377,7 +756,7 @@ class FogToolApp(ttk.Frame):
         # last_dir: used for file dialogs; keep in sync with save_dir
         self.last_dir = initial_save_dir
         # file to persist FogTool's last dir
-        self.last_dir_file = os.path.join(os.path.dirname(__file__), "last_dir.txt")
+        self.last_dir_file = resource_path("last_dir.txt")
 
         super().__init__(master)
 
@@ -458,25 +837,15 @@ class FogToolApp(ttk.Frame):
 
     # ---------- Helpers for saving paths ----------
     def _update_last_paths(self, folder_path):
-        """Update both FogTool's last_dir.txt (folder only) and the SnowRunner
-        .snowrunner_save_path.txt (writes folder/CompleteSave.cfg so editor expects full-file entry)."""
-        # Write last_dir.txt (folder only)
+        """Persist FogTool last directory and editor save path into config."""
         try:
-            with open(self.last_dir_file, "w", encoding="utf-8") as f:
-                f.write(folder_path)
-        except Exception:
-            # don't crash if unable to write (permissions, read-only location)
-            pass
-
-        # Write .snowrunner_save_path.txt in user's home; write full path with filename to be compatible with SnowRunner
-        try:
-            editor_cfg = os.path.join(os.path.expanduser("~"), ".snowrunner_save_path.txt")
             # write a representative path to CompleteSave.cfg inside the folder
             example_savefile = os.path.join(folder_path, "CompleteSave.cfg")
-            with open(editor_cfg, "w", encoding="utf-8") as f:
-                f.write(example_savefile)
+            _update_config_values({
+                "fogtool_last_dir": folder_path,
+                "last_save_path": example_savefile
+            })
         except Exception:
-            # fail silently; writing to Program Files may require elevation
             pass
 
     # ---------------- UI BUILD ----------------
@@ -516,6 +885,10 @@ class FogToolApp(ttk.Frame):
         self.canvas.bind("<ButtonPress-3>", self.start_overlay_drag)
         self.canvas.bind("<B3-Motion>", self.do_overlay_drag)
         self.canvas.bind("<ButtonRelease-3>", self.stop_overlay_drag)
+        # macOS often reports secondary click as Button-2
+        self.canvas.bind("<ButtonPress-2>", self.start_overlay_drag)
+        self.canvas.bind("<B2-Motion>", self.do_overlay_drag)
+        self.canvas.bind("<ButtonRelease-2>", self.stop_overlay_drag)
 
         # cross-platform mouse wheel zoom for overlay
         self.canvas.bind("<MouseWheel>", self.overlay_zoom)  # Windows & macOS (delta)
@@ -539,28 +912,7 @@ class FogToolApp(ttk.Frame):
         per_season_chk.pack(side="left", padx=12)
 
         self.season_frame = ttk.Frame(parent)
-        seasons = [
-            ("us_01", "Michigan"),
-            ("us_02", "Alaska"),
-            ("ru_02", "Taymyr"),
-            ("ru_03", "Season 1: Search & Recover (Kola Peninsula)"),
-            ("us_04", "Season 2: Explore & Expand (Yukon)"),
-            ("us_03", "Season 3: Locate & Deliver (Wisconsin)"),
-            ("ru_04", "Season 4: New Frontiers (Amur)"),
-            ("ru_05", "Season 5: Build & Dispatch (Don)"),
-            ("us_06", "Season 6: Haul & Hustle (Maine)"),
-            ("us_07", "Season 7: Compete & Conquer (Tennessee)"),
-            ("ru_08", "Season 8: Grand Harvest (Glades)"),
-            ("us_09", "Season 9: Renew & Rebuild (Ontario)"),
-            ("us_10", "Season 10: Fix & Connect (British Columbia)"),
-            ("us_11", "Season 11: Lights & Cameras (Scandinavia)"),
-            ("us_12", "Season 12: Public Energy (North Carolina)"),
-            ("ru_13", "Season 13: Dig & Drill (Almaty)"),
-            ("us_14", "Season 14: Reap & Sow (Austria)"),
-            ("us_15", "Season 15: Oil & Dirt (Quebec)"),
-            ("us_16", "Season 16: High Voltage (Washington)"),
-            ("ru_17", "Season 17: Repair & Rescue (Zurdania)"),
-        ]
+        seasons = ALL_REGION_CODE_LABELS
         for code, name in seasons:
             v = tk.IntVar(value=0)
             ttk.Checkbutton(self.season_frame, text=name, variable=v).pack(anchor="w")
@@ -576,7 +928,10 @@ class FogToolApp(ttk.Frame):
 
     # ---------------- Info popup ----------------
     def show_info(self):
-        info_text = """Fog Image Tool — Tutorial
+        season_map_lines = [f"- {code} → {name}  " for code, name in ALL_REGION_CODE_LABELS]
+        season_map_text = "\n".join(season_map_lines)
+
+        info_text = f"""Fog Image Tool — Tutorial
 
 Sorry for the wall of text — but this guide should answer most questions :)
 
@@ -661,26 +1016,7 @@ Step 3: Choose action
 
 Season / Map Reference
 -----------------------
-- US_01 → Michigan  
-- US_02 → Alaska  
-- RU_02 → Taymyr  
-- RU_03 → Season 1: Search & Recover (Kola Peninsula)  
-- US_03 → Season 3: Locate & Deliver (Wisconsin)  
-- US_04 → Season 2: Explore & Expand (Yukon)  
-- RU_04 → Season 4: New Frontiers (Amur)  
-- RU_05 → Season 5: Build & Dispatch (Don)  
-- US_06 → Season 6: Haul & Hustle (Maine)  
-- US_07 → Season 7: Compete & Conquer (Tennessee)  
-- RU_08 → Season 8: Grand Harvest (Glades)  
-- US_09 → Season 9: Renew & Rebuild (Ontario)  
-- US_10 → Season 10: Fix & Connect (British Columbia)  
-- US_11 → Season 11: Lights & Cameras (Scandinavia)  
-- US_12 → Season 12: Public Energy (North Carolina)  
-- RU_13 → Season 13: Dig & Drill (Almaty)  
-- US_14 → Season 14: Reap & Sow (Austria)  
-- US_15 → Season 15: Oil & Dirt (Quebec)  
-- US_16 → Season 16: High Voltage (Washington)
-- RU_17 → Season 17: Repair & Rescue (Zurdania)
+{season_map_text}
 """
         win = tk.Toplevel(self)
         win.title("Tutorial / Info")
@@ -714,6 +1050,9 @@ Season / Map Reference
 
     # ---------------- Editor functions ----------------
     def open_cfg(self):
+        if not IMAGE_ENABLED:
+            messagebox.showerror("Missing dependency", "Pillow is required for fog editing.\nRun: pip install Pillow")
+            return
         # Use last_dir for the file dialog
         startdir = self.last_dir if self.last_dir and os.path.isdir(self.last_dir) else os.getcwd()
         path = filedialog.askopenfilename(initialdir=startdir, filetypes=[("CFG/DAT files", "*.cfg *.dat"), ("All", "*.*")])
@@ -787,6 +1126,9 @@ Season / Map Reference
             messagebox.showerror("Error parsing payload", str(e))
 
     def show_preview(self):
+        if not IMAGE_ENABLED:
+            messagebox.showerror("Missing dependency", "Pillow is required for this feature.\nRun: pip install Pillow")
+            return
         if not self.current_image_L:
             return
         cw = self.canvas.winfo_width(); ch = self.canvas.winfo_height()
@@ -809,7 +1151,7 @@ Season / Map Reference
             ow, oh = self.overlay_img.size
             sw = max(1, int(ow * self.overlay_scale * self.scale))
             sh = max(1, int(oh * self.overlay_scale * self.scale))
-            overlay_resized = self.overlay_img.resize((sw, sh), Image.Resampling.LANCZOS).convert("RGBA")
+            overlay_resized = self.overlay_img.resize((sw, sh), RESAMPLE_LANCZOS).convert("RGBA")
             self.overlaytk = ImageTk.PhotoImage(overlay_resized)
             ox = self.offset_x + int(self.overlay_offset[0] * self.scale)
             oy = self.offset_y + int(self.overlay_offset[1] * self.scale)
@@ -1012,6 +1354,9 @@ Season / Map Reference
 
     # ---------------- Overlay functions ----------------
     def load_overlay(self):
+        if not IMAGE_ENABLED:
+            messagebox.showerror("Missing dependency", "Pillow is required for overlays.\nRun: pip install Pillow")
+            return
         startdir = self.last_dir if self.last_dir and os.path.isdir(self.last_dir) else os.getcwd()
         path = filedialog.askopenfilename(initialdir=startdir, filetypes=[("Image files", "*.png;*.jpg;*.jpeg"), ("All", "*.*")])
         if not path:
@@ -1043,6 +1388,9 @@ Season / Map Reference
         Any overlay pixel with alpha < 128 is ignored.
         Color mapping: nearest of 0->1, 128->128, 255->255
         """
+        if not IMAGE_ENABLED:
+            messagebox.showerror("Missing dependency", "Pillow is required for overlays.\nRun: pip install Pillow")
+            return
         if not self.overlay_img or not self.current_image_L:
             return
         base = self.current_image_L.copy()
@@ -1050,7 +1398,7 @@ Season / Map Reference
         ow, oh = self.overlay_img.size
         new_w = max(1, int(ow * self.overlay_scale))
         new_h = max(1, int(oh * self.overlay_scale))
-        overlay_resized = self.overlay_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        overlay_resized = self.overlay_img.resize((new_w, new_h), RESAMPLE_LANCZOS)
         ox, oy = self.overlay_offset
         for y in range(overlay_resized.height):
             ty = y + oy
@@ -1104,15 +1452,29 @@ Season / Map Reference
         # clamp scale to reasonable values
         self.overlay_scale = max(0.05, min(20.0, self.overlay_scale))
         self.show_preview()
-# Global variables initialization 
 
+# -----------------------------------------------------------------------------
+# END SECTION: Fog Tool (Editor + Automation UI)
+# -----------------------------------------------------------------------------
 
+# =============================================================================
+# SECTION: Fog Tool Frame Wrapper
+# Used In: Fog Tool tab -> embeds FogToolApp into a ttk.Frame
+# =============================================================================
 class FogToolFrame(ttk.Frame):
     def __init__(self, parent, initial_save_dir=None):
         super().__init__(parent)
         self.app = FogToolApp(self, initial_save_dir=initial_save_dir)
         self.app.pack(fill="both", expand=True)
 
+# -----------------------------------------------------------------------------
+# END SECTION: Fog Tool Frame Wrapper
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Desktop Path + App Config Helpers
+# Used In: Settings tab (shortcuts + config persistence)
+# =============================================================================
 def get_desktop_path():
     if platform.system() == "Windows":
         # --- existing Windows logic ---
@@ -1150,15 +1512,8 @@ def get_desktop_path():
     else:
         # Linux / macOS → just point to ~/Desktop (safe fallback)
         return os.path.join(os.path.expanduser("~"), "Desktop")
-    
-def set_var(var, val_map, actual_val):
-    for label, value in val_map.items():
-        if value == actual_val:
-            var.set(label)
-            return
-    if actual_val is not None:
-        var.set(f"[unknown: {actual_val}]")
-SAVE_PATH_FILE = os.path.join(os.path.expanduser("~"), ".snowrunner_save_path.txt")
+
+SAVE_PATH_FILE = os.path.join(os.path.expanduser("~"), ".snowrunner_save_path.txt")  # legacy
 CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".snowrunner_editor_config.json")
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -1174,6 +1529,47 @@ def save_config(data):
             json.dump(data, f)
     except Exception as e:
         print("Failed to save config:", e)
+
+def _load_config_safe():
+    try:
+        return load_config() or {}
+    except Exception:
+        return {}
+
+def _save_config_safe(cfg):
+    try:
+        save_config(cfg)
+        return True
+    except Exception:
+        return False
+
+def _update_config_values(values: dict):
+    cfg = _load_config_safe()
+    try:
+        cfg.update(values)
+        _save_config_safe(cfg)
+        return True
+    except Exception:
+        return False
+
+def _delete_config_keys(keys):
+    cfg = _load_config_safe()
+    changed = False
+    for k in keys:
+        if k in cfg:
+            cfg.pop(k, None)
+            changed = True
+    if changed:
+        _save_config_safe(cfg)
+    return changed
+
+# -----------------------------------------------------------------------------
+# END SECTION: Desktop Path + App Config Helpers
+# -----------------------------------------------------------------------------
+# =============================================================================
+# SECTION: Gameplay Constants + Rules Placeholders
+# Used In: Money & Rank tab, Rules tab, sync_all_rules
+# =============================================================================
 RANK_XP_REQUIREMENTS = {
     1: 0, 2: 700, 3: 1700, 4: 2900, 5: 4100, 6: 5400, 7: 6900,
     8: 8500, 9: 10100, 10: 11800, 11: 13700, 12: 15700, 13: 17800,
@@ -1188,6 +1584,14 @@ external_addon_map = {}
 FACTOR_RULE_DEFINITIONS = []
 FACTOR_RULE_VARS = []
 
+# -----------------------------------------------------------------------------
+# END SECTION: Gameplay Constants + Rules Placeholders
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Process Detection + Autosave/Backup Utilities
+# Used In: Settings tab, Backups tab, autosave monitor
+# =============================================================================
 def _is_snowrunner_running():
     """
     Cross-platform check: returns True if any running process name/command line contains 'snowrunner' (case-insensitive).
@@ -1467,7 +1871,7 @@ def make_backup_if_enabled(path):
                 if os.path.abspath(root).startswith(os.path.abspath(backup_dir)):
                     continue  # skip backups of backups
                 for file in files:
-                    if file.endswith((".cfg", ".dat")):
+                    if file.lower().endswith((".cfg", ".dat")):
                         src_path = os.path.join(root, file)
                         rel_path = os.path.relpath(src_path, save_dir)
                         dst_path = os.path.join(full_dir, rel_path)
@@ -1534,63 +1938,34 @@ def make_backup_if_enabled(path):
     except Exception as e:
         print(f"[Backup Error] Failed to create backup: {e}")
         
-def recall_backup(path):
-    try:
-        save_dir = os.path.dirname(path)
-        backup_dir = os.path.join(save_dir, "backup")
-        if not os.path.exists(backup_dir):
-            messagebox.showerror("Recall Backup", "No backups found.")
-            return
+# -----------------------------------------------------------------------------
+# END SECTION: Process Detection + Autosave/Backup Utilities
+# -----------------------------------------------------------------------------
 
-        backups = sorted(os.listdir(backup_dir), reverse=True)
-        if not backups:
-            messagebox.showerror("Recall Backup", "No backups available.")
-            return
-
-        # Create popup window
-        recall_win = tk.Toplevel()
-        recall_win.title("Recall Backup")
-        recall_win.geometry("400x300")
-
-        # Scrollable frame
-        canvas = tk.Canvas(recall_win)
-        scrollbar = ttk.Scrollbar(recall_win, orient="vertical", command=canvas.yview)
-        scroll_frame = ttk.Frame(canvas)
-
-        scroll_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # Create one button per backup
-        def do_restore(choice):
-            chosen_backup = os.path.join(backup_dir, choice)
-            for root, _, files in os.walk(chosen_backup):
-                for file in files:
-                    src_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(src_path, chosen_backup)
-                    dst_path = os.path.join(save_dir, rel_path)
-                    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-                    shutil.copy2(src_path, dst_path)
-
-            messagebox.showinfo("Recall Backup", f"Backup {choice} restored successfully!")
-            recall_win.destroy()
-
-        for backup in backups:
-            ttk.Button(scroll_frame, text=backup, command=lambda b=backup: do_restore(b)).pack(fill="x", pady=2, padx=5)
-
-    except Exception as e:
-        messagebox.showerror("Recall Backup", f"Failed to recall backup: {e}")
+# =============================================================================
+# SECTION: Save-File IO + Version Safety
+# Used In: Save File tab and startup auto-load
+# =============================================================================
 def load_last_path():
-    if os.path.exists(SAVE_PATH_FILE):
-        with open(SAVE_PATH_FILE, "r") as f:
-            return f.read().strip()
+    cfg = _load_config_safe()
+    p = cfg.get("last_save_path", "")
+    if p:
+        return p
+    # Legacy migration from .snowrunner_save_path.txt
+    try:
+        if os.path.exists(SAVE_PATH_FILE):
+            with open(SAVE_PATH_FILE, "r", encoding="utf-8") as f:
+                legacy = f.read().strip()
+            if legacy:
+                cfg["last_save_path"] = legacy
+                _save_config_safe(cfg)
+                try:
+                    os.remove(SAVE_PATH_FILE)
+                except Exception:
+                    pass
+                return legacy
+    except Exception:
+        pass
     return ""
 def safe_load_save(path):
     """Try to load a save file, return content or None with popup error."""
@@ -1706,17 +2081,7 @@ def prompt_save_version_mismatch_and_choose(path, modal=True):
             # reuse the parser you already have
             m, r, xp, d, t, s, day, night, tp = get_file_info(new_content)
             try:
-                if day is not None and night is not None:
-                    custom_day_var.set(round(float(day), 2))
-                    custom_night_var.set(round(float(night), 2))
-                    skip_time_var.set(bool(s))
-
-                    match = next(
-                        (k for k, v in time_presets.items()
-                         if abs(day - v[0]) < 0.01 and abs(night - v[1]) < 0.01),
-                        "Custom"
-                    )
-                    time_preset_var.set(match)
+                _sync_time_ui(day=day, night=night, skip_time=s)
             except Exception as e:
                 print("[WATCH] Failed to refresh Time tab:", e)
 
@@ -1729,22 +2094,12 @@ def prompt_save_version_mismatch_and_choose(path, modal=True):
             except Exception:
                 # non-fatal: warn in console
                 print("Warning: failed to persist save path to config")
-
-            # refresh plugin loaders if any
-            if "plugin_loaders" in globals():
-                for loader in plugin_loaders:
-                    try:
-                        loader(new_path)
-                    except Exception as e:
-                        print(f"Plugin failed to update GUI from file: {e}")
-
-            # refresh all GUI rule values if helper exists
+            # refresh all GUI values if helper exists
             try:
-                if "sync_all_rules" in globals():
-                    try:
-                        globals()["sync_all_rules"](new_path)
-                    except Exception:
-                        pass
+                if "_refresh_all_tabs_from_save" in globals():
+                    globals()["_refresh_all_tabs_from_save"](new_path)
+                elif "sync_all_rules" in globals():
+                    globals()["sync_all_rules"](new_path)
             except Exception:
                 pass
 
@@ -1851,8 +2206,16 @@ def try_autoload_last_save(save_path_var):
 def save_path(path):
     if "dont_remember_path_var" in globals() and dont_remember_path_var.get():
         return
-    with open(SAVE_PATH_FILE, "w") as f:
-        f.write(path)
+    _update_config_values({"last_save_path": path})
+
+# -----------------------------------------------------------------------------
+# END SECTION: Save-File IO + Version Safety
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Save Parsing + Common Extractors
+# Used In: sync_all_rules, Money & Rank tab, Time tab
+# =============================================================================
 def get_file_info(content):
     truck_price = int(re.search(r'"truckPricingFactor"\s*:\s*(\d+)', content).group(1)) if re.search(r'"truckPricingFactor"\s*:\s*(\d+)', content) else 1
 
@@ -1892,6 +2255,91 @@ def get_file_info(content):
     day = search_num("timeSettingsDay")
     night = search_num("timeSettingsNight")
     return money, rank, xp, difficulty, truck_avail, skip_time, day, night, truck_price
+
+# -----------------------------------------------------------------------------
+# END SECTION: Save Parsing + Common Extractors
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Time UI Sync Helpers
+# Used In: sync_all_rules, time preset selection, save reloads
+# =============================================================================
+def _sync_time_ui(day=None, night=None, skip_time=None, preset_name=None):
+    """Update time-related tkinter vars safely without recursion."""
+    global _TIME_SYNC_GUARD
+    _TIME_SYNC_GUARD = True
+    try:
+        # Day/night sliders + entries
+        if "custom_day_var" in globals() and custom_day_var is not None:
+            try:
+                if day is None:
+                    custom_day_var.set(1.0)
+                else:
+                    custom_day_var.set(round(float(day), 2))
+            except Exception:
+                custom_day_var.set(1.0)
+
+        if "custom_night_var" in globals() and custom_night_var is not None:
+            try:
+                if night is None:
+                    custom_night_var.set(1.0)
+                else:
+                    custom_night_var.set(round(float(night), 2))
+            except Exception:
+                custom_night_var.set(1.0)
+
+        # Keep raw stringvars in sync too (if used elsewhere)
+        if "time_day_var" in globals() and time_day_var is not None:
+            try:
+                if day is not None:
+                    time_day_var.set(str(day))
+            except Exception:
+                pass
+        if "time_night_var" in globals() and time_night_var is not None:
+            try:
+                if night is not None:
+                    time_night_var.set(str(night))
+            except Exception:
+                pass
+
+        # Skip-time checkbox
+        if "skip_time_var" in globals() and skip_time_var is not None and skip_time is not None:
+            try:
+                skip_time_var.set(bool(skip_time))
+            except Exception:
+                pass
+
+        # Preset combobox
+        if "time_preset_var" in globals() and time_preset_var is not None:
+            preset_to_set = preset_name
+            if preset_to_set is None and day is not None and night is not None:
+                preset_to_set = "Custom"
+                try:
+                    for preset_name_it, (p_day, p_night) in time_presets.items():
+                        if (
+                            abs(float(day) - float(p_day)) < 0.01
+                            and abs(float(night) - float(p_night)) < 0.01
+                        ):
+                            preset_to_set = preset_name_it
+                            break
+                except Exception:
+                    preset_to_set = "Custom"
+            if preset_to_set is not None:
+                try:
+                    time_preset_var.set(preset_to_set)
+                except Exception:
+                    pass
+    finally:
+        _TIME_SYNC_GUARD = False
+
+# -----------------------------------------------------------------------------
+# END SECTION: Time UI Sync Helpers
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Time Settings (Time tab)
+# Used In: Time tab -> Apply Time Settings
+# =============================================================================
 def modify_time(file_path, time_day, time_night, skip_time):
     with open(file_path, 'r', encoding='utf-8') as file:
         content = file.read()
@@ -1901,48 +2349,15 @@ def modify_time(file_path, time_day, time_night, skip_time):
     with open(file_path, 'w', encoding='utf-8') as out_file:
         out_file.write(content)
     messagebox.showinfo("Success", "Time updated.")
-def update_time_btn():
-    make_backup_if_enabled(save_path_var.get())
-    path = save_path_var.get()
-    if not os.path.exists(path):
-        return messagebox.showerror("Error", "Save file not found.")
 
-    if time_preset_var.get() == "Custom":
-        day = round(custom_day_var.get(), 2)
-        night = round(custom_night_var.get(), 2)
-    else:
-        day, night = time_presets.get(time_preset_var.get(), (1.0, 1.0))
+# -----------------------------------------------------------------------------
+# END SECTION: Time Settings (Time tab)
+# -----------------------------------------------------------------------------
 
-    st = skip_time_var.get()
-    modify_time(path, day, night, st)
-
-    # --- NEW: refresh GUI from disk after writing ---
-    try:
-        if "sync_all_rules" in globals():
-            globals()["sync_all_rules"](path)
-    except Exception:
-        # keep editor alive even if refresh fails
-        pass
-
-SEASON_ID_MAP = {
-    1: "RU_03",  # Season 1: Kola Peninsula
-    2: "US_04",  # Season 2: Yukon
-    3: "US_03",  # Season 3: Wisconsin
-    4: "RU_04",  # Season 4: Amur
-    5: "RU_05",  # Season 5: Don
-    6: "US_06",  # Season 6: Maine
-    7: "US_07",  # Season 7: Tennessee
-    8: "RU_08",  # Season 8: Glades
-    9: "US_09",  # Season 9: Ontario
-    10: "US_10", # Season 10: British Columbia
-    11: "US_11", # Season 11: Scandinavia
-    12: "US_12", # Season 12: North Carolina
-    13: "RU_13", # Season 13: Almaty
-    14: "US_14", # Season 14: Austria
-    15: "US_15", # Season 15: Quebec
-    16: "US_16", # Season 16: Washington
-    17: "RU_17", # Season 17: Zurdania
-}
+# =============================================================================
+# SECTION: Missions Completion (Missions tab)
+# Used In: Missions tab -> Complete Selected Missions
+# =============================================================================
 def complete_seasons_and_maps(file_path, selected_seasons, selected_maps):
     with open(file_path, 'r', encoding='utf-8') as file:
         content = file.read()
@@ -1984,15 +2399,30 @@ def complete_seasons_and_maps(file_path, selected_seasons, selected_maps):
         out_file.write(content)
 
     messagebox.showinfo("Success", "Selected missions marked complete.")
+
+# -----------------------------------------------------------------------------
+# END SECTION: Missions Completion (Missions tab)
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Rules Tab Sync Stubs
+# Used In: Rules tab is currently disabled; kept for compatibility
+# =============================================================================
 def sync_rule_dropdowns(path):
     """Stub: rule dropdown sync disabled because rules tab was removed."""
     return
 def sync_factor_rule_dropdowns(file_path):
     """Stub: factor rule sync disabled because rules tab was removed."""
     return
-def extend_rules_tab(tab, context):
-    """Stub: plugin rule extension point disabled (rules removed)."""
-    return
+
+# -----------------------------------------------------------------------------
+# END SECTION: Rules Tab Sync Stubs
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: JSON Block Parsing + Contest/Mission Helpers
+# Used In: Contests tab, Objectives tab
+# =============================================================================
 def extract_brace_block(s, start_index):
     open_braces = 0
     in_string = False
@@ -2013,6 +2443,27 @@ def extract_brace_block(s, start_index):
                     return s[block_start:i+1], block_start, i+1
         escape = (char == '\\' and not escape)
     raise ValueError("Matching closing brace not found.")
+
+def extract_bracket_block(s, start_index):
+    open_brackets = 0
+    in_string = False
+    escape = False
+    block_start = None
+    for i in range(start_index, len(s)):
+        char = s[i]
+        if char == '"' and not escape:
+            in_string = not in_string
+        if not in_string:
+            if char == '[':
+                if open_brackets == 0:
+                    block_start = i
+                open_brackets += 1
+            elif char == ']':
+                open_brackets -= 1
+                if open_brackets == 0 and block_start is not None:
+                    return s[block_start:i+1], block_start, i+1
+        escape = (char == '\\' and not escape)
+    raise ValueError("Matching closing bracket not found.")
 def update_all_contest_times_blocks(content, new_entries):
     matches = list(re.finditer(r'"contestTimes"\s*:\s*{', content))
     updated_content = content
@@ -2051,14 +2502,8 @@ def mark_discovered_contests_complete(save_path, selected_seasons, selected_maps
         with open(save_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # Prepare mapping from seasons to canonical region codes (adjust if your mapping differs)
-        season_region_map = {
-            1: "RU_03", 2: "US_04", 3: "US_03", 4: "RU_04",
-            5: "RU_05", 6: "US_06", 7: "US_07", 8: "RU_08",
-            9: "US_09", 10: "US_10", 11: "US_11", 12: "US_12",
-            13: "RU_13", 14: "US_14", 15: "US_15", 16: "US_16", 17: "RU_17"
-        }
-        selected_region_codes = [season_region_map[s] for s in selected_seasons if s in season_region_map]
+        # Prepare mapping from seasons to canonical region codes
+        selected_region_codes = [SEASON_ID_MAP[s] for s in selected_seasons if s in SEASON_ID_MAP]
 
         # We'll collect the union of contestTimes entries added while processing save blocks
         global_contest_times_new_entries = {}
@@ -2275,49 +2720,901 @@ def mark_discovered_contests_complete(save_path, selected_seasons, selected_maps
 
     except Exception as e:
         messagebox.showerror("Error", repr(e))
-def run_complete(debug=False):
-    # note: make_backup_if_enabled and season_vars/other_season_var/map_vars must exist in your module/UI
+
+# -----------------------------------------------------------------------------
+# END SECTION: JSON Block Parsing + Contest/Mission Helpers
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Upgrades + Watchtowers Data & Helpers
+# Used In: Upgrades tab, Watchtowers tab
+# =============================================================================
+# Canonical watchtower/upgrade lists (used to fill missing entries safely)
+_UPGRADES_GIVER_UNLOCKS_JSON = """{
+  "level_us_03_02": {
+    "US_03_02_G_SCOUT_FINETUNE": 2,
+    "US_03_02_BOAR_45318_SUS_HI": 2,
+    "US_03_02_PAYSTAR_5600_TS": 2,
+    "US_03_02_G_SPECIAL_FINETUNE": 2
+  },
+  "test_zone_color_summer": {
+    "COLORTEST_UPGRADE": 0
+  },
+  "level_ru_08_02": {
+    "RU_08_02_UPGRADE_GIVER": 2
+  },
+  "test_zone_color_winter": {
+    "test_zone_upgrade": 0
+  },
+  "level_us_04_02": {
+    "US_04_02_UPG_G": 2,
+    "US_04_02_UPG_ANK": 2,
+    "US_04_02_UPG_KOLOB": 2
+  },
+  "level_ru_03_01": {
+    "RU_03_01_UPGRADE_01": 2,
+    "RU_03_01_UPGRADE_03": 2,
+    "RU_03_01_UPGRADE_05": 2,
+    "RU_03_01_UPGRADE_02": 2,
+    "RU_03_01_UPGRADE_04": 2
+  },
+  "level_us_16_02": {
+    "US_16_02_UPG_01": 2,
+    "US_16_02_UPG_02": 2
+  },
+  "level_us_02_03_new": {
+    "US_02_03_UPG_01": 2,
+    "US_02_03_UPG_02": 2,
+    "US_02_03_UPG_05": 2,
+    "US_02_03_UPG_04": 2,
+    "US_02_03_UPG_06": 2,
+    "US_02_03_UPG_07": 2
+  },
+  "level_us_01_02": {
+    "US_01_02_UPGRADE_INTERN_SCOUT_SUSP_HIGH": 2,
+    "US_01_02_UPGRADE_TRUCK_ENG": 2,
+    "US_01_02_UPGRADE_CHEVY_DIFF_LOCK": 2,
+    "US_01_02_UPGRADE_GMC_DIFF_LOCK": 2,
+    "US_01_02_UPGRADE_WHITE_ALLWHEELS": 2,
+    "US_01_02_UPGRADE_WHITE_SUSP_HIGH": 2,
+    "US_01_02_UPGRADE_TRUCK_ENG_4070": 2,
+    "US_01_02_UPGRADE_G_SCOUT_HIGHWAY": 2
+  },
+  "level_ru_13_01": {
+    "RU_13_01_UPGRADE_04": 2,
+    "RU_13_01_UPGRADE_07": 2,
+    "RU_13_01_UPGRADE_05": 2,
+    "RU_13_01_UPGRADE_01": 2,
+    "RU_13_01_UPGRADE_02": 2,
+    "RU_13_01_UPGRADE_03": 2,
+    "RU_13_01_UPGRADE_06": 2
+  },
+  "level_ru_08_01": {
+    "RU_08_01_UPG": 2
+  },
+  "level_ru_08_03": {
+    "RU_08_03_UPGRADE_GIVER_01": 2,
+    "RU_08_03_UPGRADE_GIVER_02": 2
+  },
+  "level_us_12_02": {
+    "US_12_02_UPG_02": 2,
+    "US_12_02_UPG_01": 2
+  },
+  "level_us_02_01": {
+    "US_02_01_UPG_06": 2,
+    "US_02_01_UPG_02": 2,
+    "US_02_01_UPG_01": 2,
+    "US_02_01_UPG_04": 2,
+    "US_02_01_UPG_08": 2,
+    "US_02_01_UPG_05": 2,
+    "US_02_01_UPG_09": 2,
+    "US_02_01_UPG_07": 2
+  },
+  "level_us_06_01": {
+    "US_06_01_UPG_01": 2
+  },
+  "level_us_01_03": {
+    "US_01_03_UPG_3": 2,
+    "US_01_03_UPG_2": 2,
+    "US_01_03_UPG_6": 2,
+    "US_01_03_UPG_4": 2
+  },
+  "level_us_15_02": {
+    "US_15_02_UPG_01": 2,
+    "US_15_02_UPG_02": 2
+  },
+  "level_us_12_03": {
+    "US_12_03_UPGRADE_02": 2,
+    "US_12_03_UPGRADE_01": 2
+  },
+  "level_us_14_01": {
+    "US_14_01_UPG_02": 2,
+    "US_14_01_UPG_01": 2
+  },
+  "level_us_01_01": {
+    "US_01_01_UPGRADE_FLEESTAR_SUSP_HIGHT": 2,
+    "US_01_01_UPGRADE_SCOUT_OLD_ENGINE": 2,
+    "US_01_01_UPGRADE_FLEESTAR_ALLWHEELS": 2,
+    "US_01_01_UPGRADE_TRUCK_OLD_ENGINE": 2,
+    "US_01_01_UPGRADE_GMC_SUSP_HIGHT": 2,
+    "US_01_01_UPGRADE_CK_SUSPENSION": 2,
+    "US_01_01_UPGRADE_G_SCOUT_OFFROAD": 2
+  },
+  "level_ru_03_02": {
+    "RU_03_02_UPG_2": 2,
+    "RU_03_02_UPG_DETECTOR": 2,
+    "RU_03_02_UPG_4": 2,
+    "RU_03_02_UPG_5": 2,
+    "RU_03_02_UPG_3": 2
+  },
+  "level_us_09_02": {
+    "US_09_02_UPG_01": 2,
+    "US_09_02_UPG_02": 2
+  },
+  "level_ru_05_01": {
+    "RU_05_02_UPGRADE_03": 2
+  },
+  "level_ru_02_01_crop": {
+    "RU_02_01_UPGRADE_02": 2,
+    "RU_02_01_UPGRADE_04": 2,
+    "RU_02_01_UPGRADE_07": 2,
+    "RU_02_01_UPGRADE_01": 2,
+    "RU_02_01_UPGRADE_08": 2,
+    "RU_02_01_UPGRADE_06": 2,
+    "RU_02_01_UPGRADE_03": 2
+  },
+  "level_us_03_01": {
+    "US_03_01_UPG_01": 2,
+    "US_03_01_UPG_03": 2,
+    "US_03_01_UPG_02": 2,
+    "US_03_01_UPG_04": 2
+  },
+  "level_us_16_03": {
+    "US_16_03_UPG_01": 2,
+    "US_16_03_UPG_02": 2
+  },
+  "level_ru_08_04": {
+    "RU_08_04_UPGRADE_02": 2
+  },
+  "level_ru_17_01": {
+    "RU_17_01_UPG_02": 2,
+    "RU_17_01_UPG_01": 2
+  },
+  "level_us_14_02": {
+    "US_14_02_UPG_02": 2,
+    "US_14_02_UPG_01": 2
+  },
+  "level_us_01_04_new": {
+    "US_01_04_UPG_1": 2,
+    "US_01_04_UPG_3": 2
+  },
+  "level_us_04_01": {
+    "US_04_01_UPG_03": 2,
+    "US_04_01_UPG_01": 2,
+    "US_04_01_UPG_02": 2
+  },
+  "level_us_12_04": {
+    "US_12_04_UPG_02": 2,
+    "US_12_04_UPG_01": 2
+  },
+  "level_us_16_01": {
+    "US_16_01_UPG_01": 2,
+    "US_16_01_UPG_02": 2
+  },
+  "level_us_10_02": {
+    "US_10_02_UPG_01": 2
+  },
+  "level_ru_05_02": {
+    "RU_05_02_UPGRADE_01": 2
+  },
+  "level_ru_17_02": {
+    "RU_17_02_UPGRADE_01": 2,
+    "RU_17_02_UPGRADE_02": 2
+  },
+  "level_us_06_02": {
+    "US_06_02_UPG_01": 2,
+    "US_06_02_UPG_03": 2,
+    "US_06_02_UPG_02": 2,
+    "US_06_02_UPG_04": 2
+  },
+  "level_us_02_04_new": {
+    "US_02_04_UPG_3": 2,
+    "US_02_04_UPG_2": 2,
+    "US_02_04_UPG_1": 2,
+    "US_02_04_UPG_5": 2
+  },
+  "level_us_10_01": {
+    "US_10_01_UPG_02": 2,
+    "US_10_01_UPG_01": 2
+  },
+  "level_us_02_02_new": {
+    "US_02_02_UPG_01": 2,
+    "US_02_02_UPG_05": 2,
+    "US_02_02_UPG_06": 2,
+    "US_02_02_UPG_02": 2,
+    "US_02_02_UPG_04": 2
+  },
+  "level_ru_04_03": {
+    "RU_04_03_UPGRADE_01": 2
+  },
+  "level_ru_02_02": {
+    "RU_02_02_UPGRADE_06": 2,
+    "RU_02_02_UPGRADE_09": 2,
+    "RU_02_02_UPGRADE_01": 2,
+    "RU_02_02_UPGRADE_04": 2,
+    "RU_02_02_UPGRADE_05": 2,
+    "RU_02_02_UPGRADE_03": 2,
+    "RU_02_02_UPGRADE_02": 2,
+    "RU_02_02_UPGRADE_08": 2
+  },
+  "level_ru_04_01": {
+    "RU_04_01_KHAN_UPG": 2
+  },
+  "level_us_15_01": {
+    "US_15_01_UPG_02": 2,
+    "US_15_01_UPG_01": 2
+  },
+  "level_ru_02_03": {
+    "RU_02_03_UPGRADE8": 2,
+    "RU_02_03_UPGRADE1": 2,
+    "RU_02_03_UPGRADE7": 2,
+    "RU_02_03_UPGRADE4": 2,
+    "RU_02_03_UPGRADE6": 2,
+    "RU_02_03_UPGRADE5": 2
+  },
+  "level_ru_04_02": {
+    "RU_04_02_UPGRADE_01": 2
+  },
+  "level_ru_02_04": {
+    "RU_02_04_UPGRADE_03": 2,
+    "RU_02_04_UPGRADE_01": 2,
+    "RU_02_04_UPGRADE_02": 2
+  },
+  "level_us_11_01": {
+    "US_11_01_UPG_01": 2
+  },
+  "level_us_07_01": {
+    "US_07_01_UPGRADE_02": 2,
+    "US_07_01_UPGRADE_04": 2,
+    "US_07_01_UPGRADE_01": 2,
+    "US_07_01_UPGRADE_03": 2
+  },
+  "level_ru_04_04": {
+    "RU_04_04_UPG_01": 2,
+    "RU_04_04_UPG_02": 2
+  },
+  "level_us_11_02": {
+    "US_11_02_ADDON": 2
+  },
+  "level_us_12_01": {
+    "US_12_01_UPGRADE": 2
+  },
+  "level_us_09_01": {
+    "US_09_01_UPG_02": 2,
+    "US_09_01_UPG_01": 2
+  }
+}"""
+UPGRADES_GIVER_UNLOCKS = json.loads(_UPGRADES_GIVER_UNLOCKS_JSON)
+
+_WATCHPOINTS_UNLOCKS_JSON = """{
+  "level_ru_03_01": {
+    "RU_03_01_WATCHPOINT_0": true,
+    "RU_03_01_WATCHPOINT_1": true,
+    "RU_03_01_WATCHPOINT_2": true
+  },
+  "level_us_16_02": {
+    "US_16_02_WATCHPOINT_04": true,
+    "US_16_02_WATCHPOINT_03": true,
+    "US_16_02_WATCHPOINT_01": true,
+    "US_16_02_WATCHPOINT_02": true
+  },
+  "level_us_02_03_new": {
+    "US_02_03_WP_03": true,
+    "US_02_03_WP_01": true,
+    "US_02_03_WP_05": true,
+    "US_02_03_WP_04": true,
+    "US_02_03_WP_02": true
+  },
+  "level_us_01_02": {
+    "US_01_02_W7": true,
+    "US_01_02_W1": true,
+    "US_01_02_W4": true,
+    "US_01_02_W2": true,
+    "US_01_02_W3": true,
+    "US_01_02_W5": true
+  },
+  "level_ru_13_01": {
+    "RU_13_01_WATCHPOINT_01": true,
+    "RU_13_01_WATCHPOINT_02": true,
+    "RU_13_01_WATCHPOINT_04": true,
+    "RU_13_01_WATCHPOINT_03": true
+  },
+  "level_ru_08_01": {
+    "RU_08_01_WATCHPOINT_1": true,
+    "RU_08_01_WATCHPOINT_2": true,
+    "RU_08_01_WATCHPOINT_3": true,
+    "RU_08_01_WATCHPOINT_4": true
+  },
+  "level_ru_08_03": {
+    "WATCHPOINT_01": true,
+    "WATCHPOINT_02": true
+  },
+  "level_us_12_02": {
+    "US_12_02_WATCHPOINT_02": true,
+    "US_12_02_WATCHPOINT_03": true,
+    "US_12_02_WATCHPOINT_01": true,
+    "US_12_02_WATCHPOINT_04": true,
+    "US_12_02_WATCHPOINT_05": true
+  },
+  "level_us_02_01": {
+    "US_02_01_WP_04": true,
+    "US_02_01_WP_03": true,
+    "US_02_01_WP_01": true,
+    "US_02_01_WP_02": true
+  },
+  "level_us_06_01": {
+    "US_06_01_WT_02": true,
+    "US_06_01_WT_04": true,
+    "US_06_01_WT_01": true,
+    "US_06_01_WT_03": true
+  },
+  "level_us_01_03": {
+    "US_01_03_W6": true,
+    "US_01_03_W5": true,
+    "US_01_03_W8": true,
+    "US_01_03_W3": true,
+    "US_01_03_W1": true,
+    "US_01_03_W2": true,
+    "US_01_03_W7": true,
+    "US_01_03_W4": true
+  },
+  "level_ru_05_01": {
+    "RU_05_01_TOWER": true,
+    "WATCHPOINT": true
+  },
+  "level_ru_02_01_crop": {
+    "WATCHPOINT_HILL_EAST": true,
+    "WATCHPOINT_CHURCH_NORTH": true,
+    "WATCHPOINT_HILL_SOUTH": true,
+    "WATCHPOINT_SWAMP_EAST": true,
+    "WATCHPOINT_HILL_SOUTHWEST": true,
+    "WATCHPOINT_CLIFFSIDE_WEST": true
+  },
+  "level_ru_04_03": {
+    "WATCHPOINT_SE": true,
+    "WATCHPOINT_C": true,
+    "WATCHPOINT_W": true
+  },
+  "level_ru_02_02": {
+    "RU_02_02_W1": true,
+    "RU_02_02_W3": true,
+    "RU_02_02_W2": true
+  },
+  "level_us_15_02": {
+    "US_15_02_WATCHPOINT_03": true,
+    "US_15_02_WATCHPOINT_01": true,
+    "US_15_02_WATCHPOINT_02": true,
+    "US_15_02_WATCHPOINT_04": true
+  },
+  "level_us_12_03": {
+    "US_12_03_WATCHPOINT_02": true,
+    "US_12_03_WATCHPOINT_03": true,
+    "US_12_03_WATCHPOINT_01": true
+  },
+  "level_us_14_01": {
+    "US_14_01_WATCHPOINT_03": true,
+    "US_14_01_WATCHPOINT_02": true,
+    "US_14_01_WATCHPOINT_01": true,
+    "US_14_01_WATCHPOINT_04": true
+  },
+  "level_us_01_01": {
+    "US_01_01_W5": true,
+    "US_01_01_W1": true,
+    "US_01_01_W6": true,
+    "US_01_01_W3": true,
+    "US_01_01_W7": true,
+    "US_01_01_W9": true,
+    "US_01_01_W4": true,
+    "US_01_01_W8": true
+  },
+  "level_ru_03_02": {
+    "RU_03_02_WATCHTOWER_1": true,
+    "RU_03_02_WATCHTOWER_2": true,
+    "RU_03_02_WATCHTOWER_4": true
+  },
+  "level_us_09_02": {
+    "US_09_02_WATCHPOINT_03": true,
+    "US_09_02_WATCHPOINT_02": true,
+    "US_09_02_WATCHPOINT_01": true
+  },
+  "level_us_03_01": {
+    "US_03_01_WP_01": true,
+    "US_03_01_WP_03": true,
+    "US_03_01_WP_02": true
+  },
+  "level_us_16_03": {
+    "US_16_03_WATCHPOINT_03": true,
+    "US_16_03_WATCHPOINT_02": true,
+    "US_16_03_WATCHPOINT_01": true,
+    "US_16_03_WATCHPOINT_04": true
+  },
+  "level_ru_08_04": {
+    "WATCHPOINT_01": true,
+    "WATCHPOINT_02": true,
+    "WATCHPOINT_03": true
+  },
+  "level_ru_17_01": {
+    "RU_17_01_WATCHTOWER_05": true,
+    "RU_17_01_WATCHTOWER_04": true,
+    "RU_17_01_WATCHTOWER_03": true,
+    "RU_17_01_WATCHTOWER_02": true,
+    "RU_17_01_WATCHTOWER_01": true
+  },
+  "level_us_14_02": {
+    "US_14_02_WATCHPOINT_01": true,
+    "US_14_02_WATCHPOINT_03": true,
+    "US_14_02_WATCHPOINT_02": true
+  },
+  "level_us_01_04_new": {
+    "US_01_04_W3": true,
+    "US_01_04_W1": true,
+    "US_01_04_W2": true,
+    "US_01_04_W4": true
+  },
+  "level_us_04_01": {
+    "US_04_01_WT_04": true,
+    "US_04_01_WT_01": true,
+    "US_04_01_WT_03": true,
+    "US_04_01_WT_02": true
+  },
+  "level_us_12_04": {
+    "US_12_04_WATCHPOINT_04": true,
+    "US_12_04_WATCHPOINT_03": true,
+    "US_12_04_WATCHPOINT_02": true,
+    "US_12_04_WATCHPOINT_01": true
+  },
+  "level_us_16_01": {
+    "US_16_01_WATCHTOWER_01": true,
+    "US_16_01_WATCHTOWER_05": true,
+    "US_16_01_WATCHTOWER_04": true,
+    "US_16_01_WATCHTOWER_03": true,
+    "US_16_01_WATCHTOWER_02": true
+  },
+  "level_us_10_02": {
+    "US_10_02_WP_07": true,
+    "US_10_02_WP_01": true,
+    "US_10_02_WP_02": true,
+    "US_10_02_WP_06": true,
+    "US_10_02_WP_05": true,
+    "US_10_02_WP_04": true,
+    "US_10_02_WP_03": true
+  },
+  "level_ru_05_02": {
+    "WATCHPOINT": true
+  },
+  "level_ru_17_02": {
+    "RU_17_02_WATCHPOINT_05": true,
+    "RU_17_02_WATCHPOINT_04": true,
+    "RU_17_02_WATCHPOINT_03": true,
+    "RU_17_02_WATCHPOINT_02": true,
+    "RU_17_02_WATCHPOINT_01": true
+  },
+  "level_ru_08_02": {
+    "WATCHPOINT_01": true,
+    "WATCHPOINT_02": true,
+    "WATCHPOINT_03": true
+  },
+  "level_us_04_02": {
+    "US_04_02_W1": true,
+    "US_04_02_W4": true,
+    "US_04_02_W3": true,
+    "US_04_02_W5": true,
+    "US_04_02_W7": true,
+    "US_04_02_W2": true,
+    "US_04_02_W6": true
+  },
+  "level_us_06_02": {
+    "US_06_02_W2": true,
+    "US_06_02_W3": true,
+    "US_06_02_BIG_WATCHTOWER": true
+  },
+  "level_us_02_04_new": {
+    "US_02_04_W3": true,
+    "US_02_04_W1": true,
+    "US_02_04_W2": true,
+    "US_02_04_W4": true
+  },
+  "level_us_10_01": {
+    "US_10_01_WP_03": true,
+    "US_10_01_WP_06": true,
+    "US_10_01_WP_08": true,
+    "US_10_01_WP_04": true,
+    "US_10_01_WP_15": true,
+    "US_10_01_WP_14": true,
+    "US_10_01_WP_02": true,
+    "US_10_01_WP_11": true,
+    "US_10_01_WP_07": true,
+    "US_10_01_WP_13": true,
+    "US_10_01_WP_05": true,
+    "US_10_01_WP_12": true,
+    "US_10_01_WP_01": true,
+    "US_10_01_WP_10": true,
+    "US_10_01_WP_09": true
+  },
+  "level_us_02_02_new": {
+    "US_02_02_WP_03": true,
+    "US_02_02_WP_02": true,
+    "US_02_02_WP_01": true
+  },
+  "level_ru_04_01": {
+    "RU_04_01_WT_04": true,
+    "RU_04_01_WT_03": true,
+    "RU_04_01_WT_02": true,
+    "RU_04_01_WT_01": true
+  },
+  "level_us_15_01": {
+    "US_15_01_WATCHTOWER_02": true,
+    "US_15_01_WATCHTOWER_04": true,
+    "US_15_01_WATCHTOWER_01": true,
+    "US_15_01_WATCHTOWER_03": true
+  },
+  "level_ru_02_03": {
+    "RU_02_03_WATCHPOINT_3": true,
+    "RU_02_03_WATCHPOINT_1": true,
+    "RU_02_03_WATCHPOINT_2": true
+  },
+  "level_ru_04_02": {
+    "RU_04_02_WATCHTOWER_05": true,
+    "RU_04_02_WATCHTOWER_04": true,
+    "RU_04_02_WATCHTOWER_03": true,
+    "RU_04_02_WATCHTOWER_02": true,
+    "RU_04_02_WATCHTOWER_01": true
+  },
+  "level_us_03_02": {
+    "US_03_02_W5": true,
+    "US_03_02_W1": true,
+    "US_03_02_W3": true,
+    "US_03_02_W2": true,
+    "US_03_02_W4": true
+  },
+  "level_ru_02_04": {
+    "WATCHPOINT_SHORE_SOUTH": true,
+    "WATCHPOINT_MINES_NORTH": true,
+    "WATCHPOINT_FARM_NORTH": true,
+    "WATCHPOINT_MOUNTAIN_SOUTH": true
+  },
+  "level_us_11_01": {
+    "US_11_01_WATCHPOINT_04": true,
+    "US_11_01_WATCHPOINT_01": true,
+    "US_11_01_WATCHPOINT_02": true,
+    "US_11_01_WATCHPOINT_03": true
+  },
+  "level_us_07_01": {
+    "US_07_01_WATCHTOWER_01": true,
+    "US_07_01_WATCHTOWER_02": true,
+    "US_07_01_WATCHTOWER_04": true,
+    "US_07_01_WATCHTOWER_03": true
+  },
+  "level_ru_04_04": {
+    "RU_04_04_WTR_01": true,
+    "RU_04_04_WTR_04": true,
+    "RU_04_04_WTR_03": true,
+    "RU_04_04_WTR_02": true
+  },
+  "level_us_11_02": {
+    "US_11_02_WATCHTOWER_01_RECOVERY": true,
+    "US_11_02_WATCHTOWER_03": true,
+    "US_11_02_WATCHTOWER_02_RECOVERY": true
+  },
+  "level_us_12_01": {
+    "US_12_01_WATCHPOINT_04": true,
+    "US_12_01_WATCHPOINT_03": true,
+    "US_12_01_WATCHPOINT_02": true,
+    "US_12_01_WATCHPOINT_01": true
+  },
+  "level_us_09_01": {
+    "US_09_01_WATCHPOINT_02": true,
+    "US_09_01_WATCHPOINT_01": true,
+    "US_09_01_WATCHPOINT_03": true
+  }
+}"""
+WATCHPOINTS_UNLOCKS = json.loads(_WATCHPOINTS_UNLOCKS_JSON)
+
+# Canonical discovered trucks list (used to fill missing entries safely)
+_DISCOVERED_TRUCKS_DEFAULTS_JSON = """{
+  "test_zone_color_summer": {"current": 0, "all": 0},
+  "level_ru_08_02": {"current": 0, "all": 1},
+  "level_us_16_02": {"current": 0, "all": 0},
+  "level_ru_02_02": {"current": 0, "all": 0},
+  "level_trial_04_02": {"current": 0, "all": 1},
+  "test_programmers_sandbox": {"current": 0, "all": 0},
+  "level_trial_03_02": {"current": 0, "all": 3},
+  "level_trial_03_01": {"current": 0, "all": 2},
+  "test_farming": {"current": 0, "all": 0},
+  "level_ru_03_01": {"current": 0, "all": 1},
+  "level_ru_08_03": {"current": 0, "all": 0},
+  "level_us_01_02": {"current": 0, "all": 2},
+  "us_11_test_objectives": {"current": 0, "all": 0},
+  "level_trial_03_03": {"current": 0, "all": 2},
+  "level_us_12_02": {"current": 0, "all": 0},
+  "level_us_test_polygon": {"current": 0, "all": 2},
+  "level_ru_05_02": {"current": 0, "all": 0},
+  "level_us_04_01": {"current": 0, "all": 1},
+  "level_us_02_01": {"current": 0, "all": 1},
+  "level_us_02_04_new": {"current": 0, "all": 1},
+  "level_us_07_01": {"current": 0, "all": 0},
+  "level_us_14_02": {"current": 0, "all": 0},
+  "test_zone_color_winter": {"current": 0, "all": 0},
+  "level_trial_02_02": {"current": 0, "all": 1},
+  "level_us_14_01": {"current": 0, "all": 0},
+  "level_ru_02_03": {"current": 0, "all": 1},
+  "level_ru_17_01": {"current": 0, "all": 0},
+  "level_us_10_01": {"current": 0, "all": 1},
+  "level_us_09_02": {"current": 0, "all": 3},
+  "level_ru_05_01": {"current": 0, "all": 0},
+  "level_trial_04_01": {"current": 0, "all": 1},
+  "level_tutorial_objectives": {"current": 0, "all": 0},
+  "level_us_11_01": {"current": 0, "all": 0},
+  "level_trial_01_01": {"current": 0, "all": 1},
+  "level_us_15_01": {"current": 0, "all": 0},
+  "level_ru_02_01_crop": {"current": 0, "all": 0},
+  "level_ru_04_04": {"current": 0, "all": 0},
+  "level_tutorial_upgrades": {"current": 0, "all": 0},
+  "level_trial_02_01": {"current": 0, "all": 5},
+  "level_ru_03_02": {"current": 0, "all": 1},
+  "level_ru_08_04": {"current": 0, "all": 0},
+  "level_us_02_03_new": {"current": 0, "all": 0},
+  "level_us_03_01": {"current": 0, "all": 1},
+  "level_trial_01_02": {"current": 0, "all": 4},
+  "level_us_01_03": {"current": 0, "all": 0},
+  "level_us_12_03": {"current": 0, "all": 0},
+  "level_us_16_01": {"current": 0, "all": 0},
+  "level_us_12_01": {"current": 0, "all": 1},
+  "level_us_12_04": {"current": 0, "all": 0},
+  "level_us_10_02": {"current": 0, "all": 1},
+  "level_ru_17_02": {"current": 0, "all": 0},
+  "level_ru_02_04": {"current": 0, "all": 0},
+  "level_us_01_01": {"current": 0, "all": 5},
+  "level_us_04_02": {"current": 0, "all": 1},
+  "level_us_06_01": {"current": 0, "all": 0},
+  "level_us_03_02": {"current": 0, "all": 1},
+  "level_us_02_02_new": {"current": 0, "all": 0},
+  "level_tutorial_track": {"current": 0, "all": 0},
+  "level_us_06_02": {"current": 0, "all": 0},
+  "level_us_16_03": {"current": 0, "all": 0},
+  "level_ru_04_01": {"current": 0, "all": 0},
+  "level_ru_04_02": {"current": 0, "all": 0},
+  "level_ru_04_03": {"current": 0, "all": 0},
+  "level_us_15_02": {"current": 0, "all": 0},
+  "level_trial_05_01": {"current": 0, "all": 6},
+  "level_ru_08_01": {"current": 0, "all": 3},
+  "level_ru_test_polygon": {"current": 0, "all": 2},
+  "level_us_01_04_new": {"current": 0, "all": 1},
+  "level_ru_13_01": {"current": 0, "all": 0},
+  "level_us_11_02": {"current": 0, "all": 1},
+  "level_us_09_01": {"current": 0, "all": 1}
+}"""
+DISCOVERED_TRUCKS_DEFAULTS = json.loads(_DISCOVERED_TRUCKS_DEFAULTS_JSON)
+
+# Known regions + visited levels defaults
+KNOWN_REGIONS_DEFAULTS = [
+    "us_01","us_02","ru_02","us_14","ru_13","us_12","us_11","us_10","us_09","ru_08",
+    "us_07","us_06","ru_05","ru_04","us_03","us_04","ru_03","ru_17","us_16","us_15"
+]
+
+VISITED_LEVELS_DEFAULTS = [
+    "level_ru_02_01_crop","level_ru_02_02","level_ru_02_03","level_ru_02_04",
+    "level_ru_03_01","level_ru_03_02","level_ru_04_01","level_ru_04_02",
+    "level_ru_04_03","level_ru_04_04","level_ru_05_01","level_ru_05_02",
+    "level_ru_08_01","level_ru_08_02","level_ru_08_03","level_ru_08_04",
+    "level_ru_13_01","level_ru_17_01","level_ru_17_02",
+    "level_us_01_01","level_us_01_02","level_us_01_03","level_us_01_04_new",
+    "level_us_02_01","level_us_02_02_new","level_us_02_03_new","level_us_02_04_new",
+    "level_us_03_01","level_us_03_02","level_us_04_01","level_us_04_02",
+    "level_us_06_01","level_us_06_02","level_us_07_01",
+    "level_us_09_01","level_us_09_02","level_us_10_01","level_us_10_02",
+    "level_us_11_01","level_us_11_02","level_us_12_01","level_us_12_02",
+    "level_us_12_03","level_us_12_04","level_us_14_01","level_us_14_02",
+    "level_us_15_01","level_us_15_02","level_us_16_01","level_us_16_02","level_us_16_03"
+]
+
+# Garage status defaults (0=no garage, 1=garage locked, 2=garage unlocked)
+LEVEL_GARAGE_STATUSES_DEFAULTS = {
+    "level_us_12_02": 1,
+    "level_ru_03_01": 2,
+    "level_ru_04_01": 2,
+    "level_ru_08_03": 1,
+    "level_us_04_01": 2,
+    "level_us_03_01": 2,
+    "level_ru_05_01": 2,
+    "level_us_02_01": 2,
+    "level_ru_02_04": 0,
+    "level_us_01_02": 1,
+    "level_us_11_02": 0,
+    "level_us_14_01": 2,
+    "level_ru_03_02": 1,
+    "level_us_09_02": 0,
+    "level_ru_02_01_crop": 0,
+    "level_ru_02_02": 2,
+    "level_ru_17_01": 2,
+    "level_us_01_01": 2,
+    "level_ru_08_04": 1,
+    "level_us_15_01": 2,
+    "level_us_02_03_new": 1,
+    "level_us_01_03": 0,
+    "level_us_12_03": 1,
+    "level_us_14_02": 0,
+    "level_us_16_01": 0,
+    "level_ru_08_02": 0,
+    "level_us_16_03": 0,
+    "level_ru_05_02": 0,
+    "level_us_12_04": 0,
+    "level_us_10_01": 2,
+    "level_ru_17_02": 0,
+    "level_us_06_01": 2,
+    "level_us_02_02_new": 0,
+    "level_us_04_02": 1,
+    "level_us_16_02": 2,
+    "level_us_10_02": 1,
+    "level_us_01_04_new": 0,
+    "level_us_06_02": 0,
+    "level_ru_04_04": 1,
+    "level_us_02_04_new": 0,
+    "level_ru_02_03": 1,
+    "level_ru_04_02": 1,
+    "level_us_03_02": 1,
+    "level_us_15_02": 0,
+    "level_us_11_01": 2,
+    "level_ru_04_03": 0,
+    "level_ru_08_01": 2,
+    "level_us_07_01": 2,
+    "level_ru_13_01": 2,
+    "level_us_12_01": 2,
+    "level_us_09_01": 2
+}
+
+REGION_LEVELS = {}
+for _lvl in VISITED_LEVELS_DEFAULTS:
     try:
-        make_backup_if_enabled(save_path_var.get())
+        m = re.match(r'^level_([a-z]{2}_\d{2})', _lvl)
+        if m:
+            code = m.group(1).upper()
+            REGION_LEVELS.setdefault(code, []).append(_lvl)
     except Exception:
-        # ignore if backup helper not present
         pass
 
-    save_file = save_path_var.get()
-    if not save_file or not os.path.exists(save_file):
-        messagebox.showerror("Error", "Save file not found.")
-        return
-
-    # collect seasons
-    selected_seasons = [i for i, var in season_vars if getattr(var, "get", lambda: 0)() == 1]
-    if other_season_var.get().isdigit():
-        try:
-            selected_seasons.append(int(other_season_var.get()))
-        except Exception:
-            pass
-
-    # collect maps (map_vars is expected to be list of (code, IntVar) tuples)
-    selected_maps = []
-    for item in map_vars:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            code, var = item[0], item[1]
+def _ensure_upgrades_defaults(upgrades_data):
+    added = 0
+    for map_key, upgrades in UPGRADES_GIVER_UNLOCKS.items():
+        existing = upgrades_data.get(map_key)
+        if not isinstance(existing, dict):
             try:
-                if getattr(var, "get", lambda: 0)() == 1:
-                    selected_maps.append(code)
+                existing = dict(existing) if existing is not None else {}
             except Exception:
-                # fallback if var.get() returns True/False
-                try:
-                    if var.get():
-                        selected_maps.append(code)
-                except Exception:
-                    pass
+                existing = {}
+            upgrades_data[map_key] = existing
+        for upgrade_key in upgrades.keys():
+            if upgrade_key not in existing:
+                existing[upgrade_key] = 0
+                added += 1
+    return added
 
-    if debug:
-        print(f"[DEBUG] run_complete -> save_file: {save_file}")
-        print(f"[DEBUG] run_complete -> seasons: {selected_seasons}")
-        print(f"[DEBUG] run_complete -> maps: {selected_maps}")
+def _ensure_watchpoints_defaults(wp_data):
+    added = 0
+    data = wp_data.get("data")
+    if not isinstance(data, dict):
+        data = {}
+        wp_data["data"] = data
+    for map_key, towers in WATCHPOINTS_UNLOCKS.items():
+        existing = data.get(map_key)
+        if not isinstance(existing, dict):
+            try:
+                existing = dict(existing) if existing is not None else {}
+            except Exception:
+                existing = {}
+            data[map_key] = existing
+        for tower_key in towers.keys():
+            if tower_key not in existing:
+                existing[tower_key] = False
+                added += 1
+    return added
 
-    mark_discovered_contests_complete(save_file, selected_seasons, selected_maps, debug=debug)
+def _ensure_discovered_trucks_defaults(dt_data):
+    added = 0
+    if not isinstance(dt_data, dict):
+        dt_data = {}
+    for map_key, vals in DISCOVERED_TRUCKS_DEFAULTS.items():
+        existing = dt_data.get(map_key)
+        if not isinstance(existing, dict):
+            dt_data[map_key] = {"current": vals.get("current", 0), "all": vals.get("all", 0)}
+            added += 1
+            continue
+        if "current" not in existing:
+            existing["current"] = vals.get("current", 0)
+            added += 1
+        if "all" not in existing:
+            existing["all"] = vals.get("all", 0)
+            added += 1
+    return added, dt_data
+
+def _set_current_to_all(entry):
+    try:
+        all_val = entry.get("all", 0)
+        if isinstance(all_val, bool):
+            all_val = int(all_val)
+        elif not isinstance(all_val, (int, float)):
+            try:
+                all_val = int(str(all_val).strip())
+            except Exception:
+                all_val = 0
+    except Exception:
+        all_val = 0
+    entry["all"] = all_val
+    entry["current"] = all_val
+
+def _ensure_level_garage_statuses_defaults(lg_data):
+    added = 0
+    if not isinstance(lg_data, dict):
+        lg_data = {}
+    for level_id, status in LEVEL_GARAGE_STATUSES_DEFAULTS.items():
+        if level_id not in lg_data:
+            lg_data[level_id] = status
+            added += 1
+    return added, lg_data
+
+def _build_garage_data_entry():
+    return {
+        "slotsDatas": {
+            "garage_interior_slot_1": {
+                "garageSlotZoneId": "garage_interior_slot_1",
+                "truckDesc": None
+            },
+            "garage_interior_slot_2": {
+                "garageSlotZoneId": "garage_interior_slot_2",
+                "truckDesc": None
+            },
+            "garage_interior_slot_3": {
+                "garageSlotZoneId": "garage_interior_slot_3",
+                "truckDesc": None
+            },
+            "garage_interior_slot_4": {
+                "garageSlotZoneId": "garage_interior_slot_4",
+                "truckDesc": None
+            },
+            "garage_interior_slot_5": {
+                "garageSlotZoneId": "garage_interior_slot_5",
+                "truckDesc": None
+            },
+            "garage_interior_slot_6": {
+                "garageSlotZoneId": "garage_interior_slot_6",
+                "truckDesc": None
+            }
+        },
+        "selectedSlot": "garage_interior_slot_1"
+    }
+
+def _make_upgradable_garage_key(level_id: str) -> str:
+    try:
+        suffix = level_id.replace("level_", "").upper()
+    except Exception:
+        suffix = str(level_id).upper()
+    return f"{level_id} || {suffix}_GARAGE_ENTRANCE"
+
+def _normalize_feature_states(entry):
+    fs = entry.get("featureStates")
+    if not isinstance(fs, list):
+        fs = []
+    # ensure at least 4 entries; keep any extra entries intact
+    fs = list(fs)
+    while len(fs) < 4:
+        fs.append(False)
+    # ensure bools
+    fs = [bool(x) for x in fs]
+    entry["featureStates"] = fs
+    if "isUpgradable" not in entry:
+        entry["isUpgradable"] = True
+    return entry
+
 def unlock_watchtowers(save_path, selected_regions):
     make_backup_if_enabled(save_path)
     try:
@@ -2330,9 +3627,16 @@ def unlock_watchtowers(save_path, selected_regions):
 
         block, start, end = extract_brace_block(content, match.end() - 1)
         wp_data = json.loads(block)
+        added = _ensure_watchpoints_defaults(wp_data)
         updated = 0
 
-        for map_key, towers in wp_data["data"].items():
+        data = wp_data.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+
+        for map_key, towers in data.items():
+            if not isinstance(towers, dict):
+                continue
             for code in selected_regions:
                 if f"level_{code.lower()}" in map_key.lower():
                     for tower_key, val in towers.items():
@@ -2346,11 +3650,268 @@ def unlock_watchtowers(save_path, selected_regions):
         with open(save_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        messagebox.showinfo("Success", f"Unlocked {updated} watchtowers.")
+        msg = f"Unlocked {updated} watchtowers."
+        if added:
+            msg += f" Added {added} missing entries."
+        messagebox.showinfo("Success", msg)
     except Exception as e:
         messagebox.showerror("Error", str(e))
+
+def unlock_garages(save_path, selected_regions, upgrade_all=False):
+    make_backup_if_enabled(save_path)
+    try:
+        with open(save_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Locate SslValue block (main save data)
+        ssl_match = re.search(r'"SslValue"\s*:\s*{', content)
+        if not ssl_match:
+            return messagebox.showerror("Error", "SslValue block not found in save file.")
+
+        ssl_block, ssl_start, ssl_end = extract_brace_block(content, ssl_match.end() - 1)
+        try:
+            ssl_data = json.loads(ssl_block)
+        except Exception as e:
+            return messagebox.showerror("Error", f"Failed to parse SslValue:\n{e}")
+
+        # levelGarageStatuses
+        lg_data = ssl_data.get("levelGarageStatuses", {})
+        added_defaults, lg_data = _ensure_level_garage_statuses_defaults(lg_data)
+
+        # determine selected levels from region codes
+        selected_levels = []
+        for code in selected_regions:
+            for lvl in REGION_LEVELS.get(code, []):
+                selected_levels.append(lvl)
+
+        updated = 0
+        for lvl in selected_levels:
+            if lvl in lg_data and lg_data.get(lvl) == 1:
+                lg_data[lvl] = 2
+                updated += 1
+
+        ssl_data["levelGarageStatuses"] = lg_data
+
+        # garagesData
+        gd_data = ssl_data.get("garagesData", {})
+        if not isinstance(gd_data, dict):
+            gd_data = {}
+
+        added_garage_data = 0
+        for lvl in selected_levels:
+            if lg_data.get(lvl) == 2 and lvl not in gd_data:
+                gd_data[lvl] = _build_garage_data_entry()
+                added_garage_data += 1
+
+        ssl_data["garagesData"] = gd_data
+
+        # upgradableGarages (optional)
+        upgraded_entries = 0
+        added_upgradable = 0
+        if upgrade_all:
+            ug_data = ssl_data.get("upgradableGarages", {})
+            if not isinstance(ug_data, dict):
+                ug_data = {}
+            for lvl in selected_levels:
+                if lg_data.get(lvl) != 2:
+                    continue
+                # find existing entry for this level
+                found_key = None
+                for k, v in ug_data.items():
+                    try:
+                        if isinstance(k, str) and lvl.lower() in k.lower():
+                            found_key = k
+                            break
+                        if isinstance(v, dict):
+                            zg = v.get("zoneGlobalId")
+                            if isinstance(zg, str) and lvl.lower() in zg.lower():
+                                found_key = k
+                                break
+                    except Exception:
+                        continue
+                key = found_key or _make_upgradable_garage_key(lvl)
+                entry = ug_data.get(key)
+                if not isinstance(entry, dict):
+                    entry = {"zoneGlobalId": key, "featureStates": [False, False, False, False], "isUpgradable": True}
+                    ug_data[key] = entry
+                    if found_key is None:
+                        added_upgradable += 1
+                if not entry.get("zoneGlobalId"):
+                    entry["zoneGlobalId"] = key
+                entry = _normalize_feature_states(entry)
+                # flip all to true (preserve any extra length)
+                fs = entry.get("featureStates") if isinstance(entry.get("featureStates"), list) else []
+                entry["featureStates"] = [True for _ in fs]
+                entry["isUpgradable"] = True
+                ug_data[key] = entry
+                upgraded_entries += 1
+            ssl_data["upgradableGarages"] = ug_data
+
+        new_block = json.dumps(ssl_data, separators=(",", ":"))
+        content = content[:ssl_start] + new_block + content[ssl_end:]
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        msg = f"Unlocked {updated} garages."
+        if added_defaults:
+            msg += f" Added {added_defaults} missing levelGarageStatuses entries."
+        if added_garage_data:
+            msg += f" Added {added_garage_data} garage data entries."
+        if upgrade_all:
+            msg += f" Upgraded {upgraded_entries} garages."
+            if added_upgradable:
+                msg += f" Added {added_upgradable} upgradable garage entries."
+        messagebox.showinfo("Success", msg)
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+
+def unlock_discoveries(save_path, selected_regions):
+    make_backup_if_enabled(save_path)
+    try:
+        with open(save_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Only modify discoveredTrucks under persistentProfileData
+        pp_match = re.search(r'"persistentProfileData"\s*:\s*{', content)
+        if not pp_match:
+            return messagebox.showerror("Error", "persistentProfileData not found in save file.")
+
+        pp_block, pp_start, pp_end = extract_brace_block(content, pp_match.end() - 1)
+
+        dt_match = re.search(r'"discoveredTrucks"\s*:\s*{', pp_block)
+        if dt_match:
+            dt_block, dt_start, dt_end = extract_brace_block(pp_block, dt_match.end() - 1)
+            try:
+                dt_data = json.loads(dt_block)
+            except Exception:
+                dt_data = {}
+        else:
+            dt_data = {}
+            dt_start = dt_end = None
+
+        added, dt_data = _ensure_discovered_trucks_defaults(dt_data)
+        updated = 0
+
+        if not isinstance(dt_data, dict):
+            dt_data = {}
+
+        for map_key, entry in dt_data.items():
+            if not isinstance(entry, dict):
+                entry = {"current": 0, "all": 0}
+                dt_data[map_key] = entry
+            map_key_low = map_key.lower()
+            for code in selected_regions:
+                if code.lower() in map_key_low:
+                    _set_current_to_all(entry)
+                    updated += 1
+                    break
+
+        new_block = json.dumps(dt_data, separators=(",", ":"))
+        if dt_start is not None and dt_end is not None:
+            pp_block = pp_block[:dt_start] + new_block + pp_block[dt_end:]
+        else:
+            # Insert discoveredTrucks inside persistentProfileData
+            pp_block = _set_key_in_text(pp_block, "discoveredTrucks", new_block)
+
+        content = content[:pp_start] + pp_block + content[pp_end:]
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        msg = f"Updated {updated} discovery entries."
+        if added:
+            msg += f" Added {added} missing entries."
+        messagebox.showinfo("Success", msg)
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+
+def unlock_levels(save_path, selected_regions):
+    make_backup_if_enabled(save_path)
+    try:
+        with open(save_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # --- persistentProfileData.knownRegions (only this block) ---
+        pp_match = re.search(r'"persistentProfileData"\s*:\s*{', content)
+        if not pp_match:
+            return messagebox.showerror("Error", "persistentProfileData not found in save file.")
+
+        pp_block, pp_start, pp_end = extract_brace_block(content, pp_match.end() - 1)
+        kr_match = re.search(r'"knownRegions"\s*:\s*\[', pp_block)
+        if kr_match:
+            kr_block, kr_start, kr_end = extract_bracket_block(pp_block, kr_match.end() - 1)
+            try:
+                known_regions = json.loads(kr_block)
+            except Exception:
+                known_regions = []
+        else:
+            known_regions = []
+            kr_start = kr_end = None
+
+        added_selected_kr = 0
+        for code in selected_regions:
+            key = code.lower()
+            if key not in known_regions:
+                known_regions.append(key)
+                added_selected_kr += 1
+
+        new_known = json.dumps(known_regions, separators=(",", ":"))
+        if kr_start is not None and kr_end is not None:
+            pp_block = pp_block[:kr_start] + new_known + pp_block[kr_end:]
+        else:
+            pp_block = _set_key_in_text(pp_block, "knownRegions", new_known)
+
+        content = content[:pp_start] + pp_block + content[pp_end:]
+
+        # --- visitedLevels (top-level, only one) ---
+        vl_match = re.search(r'"visitedLevels"\s*:\s*\[', content)
+        if vl_match:
+            vl_block, vl_start, vl_end = extract_bracket_block(content, vl_match.end() - 1)
+            try:
+                visited_levels = json.loads(vl_block)
+            except Exception:
+                visited_levels = []
+        else:
+            visited_levels = []
+            vl_start = vl_end = None
+
+        added_selected_vl = 0
+        for code in selected_regions:
+            for lvl in REGION_LEVELS.get(code, []):
+                if lvl not in visited_levels:
+                    visited_levels.append(lvl)
+                    added_selected_vl += 1
+
+        new_visited = json.dumps(visited_levels, separators=(",", ":"))
+        if vl_start is not None and vl_end is not None:
+            content = content[:vl_start] + new_visited + content[vl_end:]
+        else:
+            content = _set_key_in_text(content, "visitedLevels", new_visited)
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        msg = (
+            f"Known regions added: {added_selected_kr}. "
+            f"Visited levels added: {added_selected_vl}."
+        )
+        messagebox.showinfo("Success", msg)
+    except Exception as e:
+        messagebox.showerror("Error", str(e))
+
+# -----------------------------------------------------------------------------
+# END SECTION: Upgrades + Watchtowers Data & Helpers
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Objectives+ Data, Logging, and Virtualized UI
+# Used In: Objectives+ tab (large datasets + virtualized list rendering)
+# =============================================================================
 _pd = None  # placeholder for pandas when loaded
 DEBUG: bool = True
+# Reduce log spam from high-frequency Objectives+ scrolling unless explicitly enabled.
+DEBUG_OBJECTIVES_SCROLL: bool = False
 _APP_START: Optional[float] = None
 def _now_ms() -> float:
     global _APP_START
@@ -2359,6 +3920,8 @@ def _now_ms() -> float:
     return (time.perf_counter() - _APP_START) * 1000.0
 STRIPE_A = "#e0e0e0"
 STRIPE_B = "#f8f8f8"
+# Always keep Objectives+ virtualized (pool) to avoid huge widget trees.
+OBJECTIVES_VIRTUAL_THRESHOLD: int = 0
 def log(msg: str) -> None:
     if not DEBUG:
         return
@@ -2372,12 +3935,8 @@ def log(msg: str) -> None:
         except Exception:
             pass
 def default_parquet_path() -> str:
-    base = os.path.dirname(__file__)
+    base = os.path.dirname(resource_path(""))
     return os.path.join(base, "maprunner_data.parquet")
-REGION_NAME_MAP = {
-    "US_01": "Michigan", "US_02": "Alaska", "RU_02": "Taymyr",
-    "RU_03": "Kola Peninsula", "US_03": "Wisconsin", "US_04": "Yukon",
-}
 def extract_json_block_by_key(s: str, key: str):
     m = re.search(rf'"{re.escape(key)}"\s*:\s*{{', s)
     if not m:
@@ -2422,11 +3981,6 @@ def _read_finished_missions(save_path: str) -> Set[str]:
         return {k for k, v in obj_states.items() if isinstance(v, dict) and v.get("isFinished")}
     except Exception:
         return set()
-def _write_toggle_contest(save_path: str, key: str, checked: bool):
-    log(f"[ACTION] toggle contest {key} -> {checked} (save: {save_path})")
-def _write_toggle_mission(save_path: str, key: str, checked: bool):
-    log(f"[ACTION] toggle mission {key} -> {checked} (save: {save_path})")
-
 #----------csv loader------------   
 class SimpleFrame:
     """Tiny DataFrame-like adapter for a list-of-dicts (rows)."""
@@ -2451,32 +4005,1457 @@ class SimpleFrame:
     def get_column(self, col: str) -> List[Any]:
         return [r.get(col) for r in self._rows]
 
-def _load_parquet_safe(parquet_path: Optional[str] = None):
-    """
-    CSV-only loader. Looks for the CSV with the same base name as the default
-    parquet path (maprunner_data.csv), reads it with the csv module and returns
-    SimpleFrame. Returns None on failure (consistent with original behavior).
-    """
-    # Keep your existing default path helper; just swap extension to .csv
-    if parquet_path is None:
+# =============================================================================
+# SECTION: Objectives+ CSV Builder (Maprunner)
+# Used In: Objectives+ loader (auto-refresh CSV when online)
+# =============================================================================
+_MR_URL = "https://www.maprunner.info/michigan/black-river?loc=_CL_1"
+_MR_TIMEOUT_SECONDS = 20
+_MR_CANONICAL_NAMES = {"data": "data.js", "desc": "desc.js"}
+_MR_IN_MEM_FILES: Dict[str, bytes] = {}
+_MR_IN_MEM_META: Dict[str, Dict[str, Any]] = {}
+_MR_CHUNK_MAX = 80
+_MR_ENGLISH_TARGET = 20000
+_MR_DATA_SIGNATURE = "const _=JSON.parse('[{\"name\":\"RU_02_01_SERVHUB_GAS\""
+_MR_DESC_SIGNATURE = "const t={UI_TRUCK_TYPE_HEAVY_DUTY:{t:0,b:{t:2,i:[{t:3}],s:\"HEAVY DUTY\""
+_MR_DEBUG = False
+
+# Language preference helpers (favor English when multiple locales exist)
+_MR_ENGLISH_WORDS = {
+    "the", "and", "to", "of", "in", "on", "for", "with", "from", "at", "by",
+    "you", "your", "we", "our", "deliver", "find", "task", "contract", "contest",
+    "lost", "trailer", "truck", "cargo", "repair", "bridge", "road", "house",
+    "watchtower", "explore", "exploration", "mission"
+}
+_MR_DIACRITICS = set("ąćęłńóśźżĄĆĘŁŃÓŚŹŻàáâäãåæçèéêëìíîïñòóôöõøùúûüýÿßčďěňřšťůž")
+
+def _mr_text_english_score(s: Any) -> float:
+    try:
+        if s is None:
+            return -999.0
+        if not isinstance(s, str):
+            s = str(s)
+    except Exception:
+        return -999.0
+    if not s:
+        return -999.0
+    score = 0.0
+    # Penalize typical mojibake markers
+    bad_markers = ("Ã", "Â", "�")
+    for bm in bad_markers:
+        if bm in s:
+            score -= 4.0 * s.count(bm)
+    # Prefer mostly-ASCII letters (English tends to be ASCII)
+    letters = sum(ch.isalpha() for ch in s)
+    ascii_letters = sum((ch.isascii() and ch.isalpha()) for ch in s)
+    if letters:
+        score += (ascii_letters / letters) * 4.0
+    # Penalize diacritics commonly used in non-English locales
+    diac = sum(1 for ch in s if ch in _MR_DIACRITICS)
+    score -= diac * 0.4
+    # Common English word boosts
+    lower = s.lower()
+    for w in _MR_ENGLISH_WORDS:
+        if w in lower:
+            score += 0.6
+    # Penalize ID-like strings
+    if re.fullmatch(r"[A-Z0-9_]+", s):
+        score -= 2.0
+    return score
+
+def _mr_log(msg: str) -> None:
+    return
+
+def _mr_log_exc(context: str) -> None:
+    return
+
+# Build region list from the editor's season config so it stays in sync.
+_MR_REGION_LIST = BASE_MAPS + [(code, REGION_NAME_MAP.get(code, code)) for code, _ in SEASON_CODE_LABELS]
+_MR_REGION_ORDER = [r for r, _ in _MR_REGION_LIST]
+_MR_REGION_LOOKUP = dict(_MR_REGION_LIST)
+_MR_CATEGORY_PRIORITY = ["_CONTRACTS", "_TASKS", "_CONTESTS"]
+_MR_TYPE_PRIORITY = ["truckDelivery", "cargoDelivery", "exploration"]
+_MR_ALLOWED_CATEGORIES = set(_MR_CATEGORY_PRIORITY)
+
+def _mr_store_in_memory(name: str, data: bytes, url: Optional[str] = None) -> None:
+    if not name or data is None:
+        return
+    _MR_IN_MEM_FILES[name] = data
+    if url:
+        _MR_IN_MEM_META[name] = {"url": url}
+
+def _mr_get_file_bytes_or_mem(name: str) -> Optional[bytes]:
+    if name in _MR_IN_MEM_FILES:
+        return _MR_IN_MEM_FILES[name]
+    try:
+        if os.path.exists(name) and os.path.isfile(name):
+            with open(name, "rb") as f:
+                return f.read()
+    except Exception:
+        pass
+    try:
+        base = os.path.basename(name)
+        if base in _MR_IN_MEM_FILES:
+            return _MR_IN_MEM_FILES[base]
+        if os.path.exists(base) and os.path.isfile(base):
+            with open(base, "rb") as f:
+                return f.read()
+    except Exception:
+        pass
+    return None
+
+def _mr_extract_js_string_literal(text: str, start_idx: int) -> Optional[str]:
+    """Extract a JS string literal starting at the given quote index."""
+    if start_idx >= len(text):
+        return None
+    quote = text[start_idx]
+    if quote not in ("'", '"'):
+        return None
+    k = start_idx + 1
+    escaped = False
+    out = []
+    while k < len(text):
+        ch = text[k]
+        if escaped:
+            out.append(ch)
+            escaped = False
+            k += 1
+            continue
+        if ch == "\\":
+            escaped = True
+            k += 1
+            continue
+        if ch == quote:
+            return "".join(out)
+        out.append(ch)
+        k += 1
+    return None
+
+def _mr_parse_localization_from_desc_text(txt: str) -> Dict[str, str]:
+    """Parse localization entries from MapRunner desc.js text."""
+    result: Dict[str, str] = {}
+    if not txt:
+        return result
+    if not isinstance(txt, str):
         try:
-            parquet_path = default_parquet_path()
+            txt = _mr_decode_bytes_to_text(txt) or ""
         except Exception:
-            parquet_path = os.path.join(os.path.dirname(__file__), "maprunner_data.parquet")
+            try:
+                txt = txt.decode("utf-8", errors="replace")
+            except Exception:
+                txt = str(txt)
+    if not txt:
+        return result
 
-    csv_path = os.path.splitext(parquet_path)[0] + ".csv"
+    # Fast-path: if there's no localization marker, skip heavy parsing.
+    if ("s:\"" not in txt) and ("s:'" not in txt) and ("s :" not in txt):
+        return result
+
+    # Regex pass: capture KEY:{...s:"..."} with quoted or bare keys.
+    pattern = re.compile(
+        r'(?:\"([^\"]+)\"|([A-Za-z0-9_\\-]+))\s*:\s*\{.*?s\s*:\s*(?:\"((?:\\.|[^\"\\])*)\"|\'((?:\\.|[^\'\\])*)\')',
+        re.DOTALL
+    )
+    for match in pattern.finditer(txt):
+        key = match.group(1) or match.group(2)
+        val = match.group(3) or match.group(4) or ""
+        if not key:
+            continue
+        try:
+            val = codecs.decode(val.replace(r"\/", "/"), "unicode_escape")
+        except Exception:
+            pass
+        result[key] = (val or "").strip()
+
+    # If regex didn't capture enough, fall back to a fast windowed scan.
+    if len(result) < 200:
+        key_re = re.compile(r'([A-Za-z0-9_\\-]+)\s*:\s*\{')
+        for m in key_re.finditer(txt):
+            key = m.group(1)
+            if not key or key in result:
+                continue
+            start = m.end()
+            window_end = min(len(txt), start + 600)
+            segment = txt[start:window_end]
+            sm = re.search(r's\s*:\s*(\"|\')', segment)
+            if not sm:
+                continue
+            quote_idx = start + sm.start(1)
+            val = _mr_extract_js_string_literal(txt, quote_idx)
+            if val is None:
+                continue
+            try:
+                val = codecs.decode(val.replace(r"\/", "/"), "unicode_escape")
+            except Exception:
+                pass
+            result[key] = (val or "").strip()
+
+    return result
+
+def _mr_decode_bytes_to_text(bs: Optional[bytes]) -> Optional[str]:
+    if bs is None:
+        return None
+    if isinstance(bs, str):
+        return bs
+    # Detect compressed payloads by magic bytes (in case headers are missing)
+    try:
+        if bs[:2] == b"\x1f\x8b":
+            try:
+                bs = gzip.decompress(bs)
+            except Exception:
+                pass
+        elif bs[:2] in (b"\x78\x01", b"\x78\x9c", b"\x78\xda"):
+            try:
+                bs = zlib.decompress(bs)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        return bs.decode("utf-8")
+    except Exception:
+        pass
+    try:
+        import chardet  # type: ignore
+        det = chardet.detect(bs)
+        enc = det.get("encoding") or "utf-8"
+        return bs.decode(enc, errors="replace")
+    except Exception:
+        pass
+    try:
+        import brotli  # type: ignore
+        try:
+            out = brotli.decompress(bs)
+            return out.decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    for enc in ("utf-8", "latin-1", "windows-1252", "iso-8859-1"):
+        try:
+            return bs.decode(enc, errors="replace")
+        except Exception:
+            continue
+    try:
+        return str(bs)
+    except Exception:
+        return None
+
+def _mr_http_get(url: str, timeout: int = 15, range_bytes: Optional[tuple] = None):
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Referer": "https://www.maprunner.info/",
+        "Origin": "https://www.maprunner.info",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    if range_bytes is not None:
+        try:
+            start, end = range_bytes
+            headers["Range"] = f"bytes={int(start)}-{int(end)}"
+        except Exception:
+            pass
+    req = urllib.request.Request(url, headers=headers)
+    def _open_with_ctx(ctx=None):
+        if ctx is None:
+            return urllib.request.urlopen(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+    try:
+        with _open_with_ctx() as resp:
+            data = resp.read()
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+        enc = (headers.get("content-encoding") or "").lower()
+        if enc == "gzip":
+            try:
+                data = gzip.decompress(data)
+            except Exception:
+                pass
+        elif enc == "deflate":
+            try:
+                data = zlib.decompress(data)
+            except Exception:
+                pass
+        elif enc == "br":
+            try:
+                import brotli  # type: ignore
+                data = brotli.decompress(data)
+            except Exception:
+                pass
+        return data, headers
+    except Exception as e:
+        # Retry with certifi if SSL verification fails (common in frozen apps)
+        if isinstance(e, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(e):
+            try:
+                import certifi  # type: ignore
+                ctx = ssl.create_default_context(cafile=certifi.where())
+                with _open_with_ctx(ctx) as resp:
+                    data = resp.read()
+                    headers = {k.lower(): v for k, v in resp.headers.items()}
+                enc = (headers.get("content-encoding") or "").lower()
+                if enc == "gzip":
+                    try:
+                        data = gzip.decompress(data)
+                    except Exception:
+                        pass
+                elif enc == "deflate":
+                    try:
+                        data = zlib.decompress(data)
+                    except Exception:
+                        pass
+                elif enc == "br":
+                    try:
+                        import brotli  # type: ignore
+                        data = brotli.decompress(data)
+                    except Exception:
+                        pass
+                return data, headers
+            except Exception:
+                pass
+            # Last resort: unverified TLS (best-effort to avoid total failure)
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with _open_with_ctx(ctx) as resp:
+                    data = resp.read()
+                    headers = {k.lower(): v for k, v in resp.headers.items()}
+                enc = (headers.get("content-encoding") or "").lower()
+                if enc == "gzip":
+                    try:
+                        data = gzip.decompress(data)
+                    except Exception:
+                        pass
+                elif enc == "deflate":
+                    try:
+                        data = zlib.decompress(data)
+                    except Exception:
+                        pass
+                elif enc == "br":
+                    try:
+                        import brotli  # type: ignore
+                        data = brotli.decompress(data)
+                    except Exception:
+                        pass
+                return data, headers
+            except Exception:
+                pass
+        if _MR_DEBUG:
+            try:
+                _mr_log(f"_mr_http_get failed for {url}: {e}")
+            except Exception:
+                pass
+        raise
+
+def _mr_looks_like_js_response(headers: Dict[str, str], url: str) -> bool:
+    ctype = (headers.get("content-type") or "").lower()
+    return ("javascript" in ctype) or ("/mr/" in url) or url.endswith(".js")
+
+def _mr_probe_js_head(url: str, max_bytes: int = 16384) -> str:
+    """Fetch a small prefix of a JS file to detect its signature."""
+    try:
+        data, headers = _mr_http_get(url, timeout=15, range_bytes=(0, max_bytes - 1))
+        txt = _mr_decode_bytes_to_text(data) or ""
+        return txt
+    except Exception:
+        return ""
+
+def _mr_head_has_data_signature(head: str) -> bool:
+    if not head:
+        return False
+    h = head.lstrip()
+    if h.startswith(_MR_DATA_SIGNATURE):
+        return True
+    return ("const _=JSON.parse" in h) and ("RU_02_01_SERVHUB_GAS" in h)
+
+def _mr_head_has_desc_signature(head: str) -> bool:
+    if not head:
+        return False
+    h = head.lstrip()
+    if h.startswith(_MR_DESC_SIGNATURE):
+        return True
+    return ("const t={" in h) and ("UI_TRUCK_TYPE_HEAVY_DUTY" in h) and ("HEAVY DUTY" in h)
+
+def _mr_find_precise_js_from_urls(urls: List[str], head_bytes: int = 65536) -> Dict[str, bool]:
+    """Scan URLs by head signature to find the data/desc JS regardless of filename."""
+    found = {"data": False, "desc": False}
+    for url in urls:
+        head = _mr_probe_js_head(url, max_bytes=head_bytes)
+        if not head:
+            continue
+        if (not found["data"]) and _mr_head_has_data_signature(head):
+            try:
+                data, headers = _mr_http_get(url, timeout=20)
+                _mr_store_in_memory(_MR_CANONICAL_NAMES["data"], data, url)
+                found["data"] = True
+                if _MR_DEBUG:
+                    _mr_log(f"precise_js: data={os.path.basename(urlparse(url).path)} url={url}")
+            except Exception:
+                pass
+        if (not found["desc"]) and _mr_head_has_desc_signature(head):
+            try:
+                data, headers = _mr_http_get(url, timeout=20)
+                _mr_store_in_memory(_MR_CANONICAL_NAMES["desc"], data, url)
+                found["desc"] = True
+                if _MR_DEBUG:
+                    _mr_log(f"precise_js: desc={os.path.basename(urlparse(url).path)} url={url}")
+            except Exception:
+                pass
+        if found["data"] and found["desc"]:
+            break
+    return found
+
+def _mr_score_data_js(text: str) -> int:
+    if not text:
+        return 0
+    tl = text.lower()
+    if "json.parse" not in tl:
+        return 0
+    score = 0
+    if '"category"' in tl:
+        score += 10
+    if '"objectives"' in tl:
+        score += 8
+    if '"rewards"' in tl:
+        score += 8
+    if '"key"' in tl:
+        score += 10
+    if "_contracts" in tl or "_tasks" in tl or "_contests" in tl:
+        score += 12
+    if '"truckdelivery"' in tl or '"cargodelivery"' in tl or '"exploration"' in tl:
+        score += 6
+    score += min(len(text) // 5000, 20)
+    score += min(tl.count('"category"'), 30)
+    score += min(tl.count('"key"'), 30)
+    return score
+
+def _mr_score_desc_js(text: str) -> int:
+    if not text:
+        return 0
+    # Require localization-style entries (s:"...") to avoid false positives
+    if not re.search(r'\bs\s*:\s*(?:"|\')', text):
+        return 0
+    score = 0
+    if "UI_" in text:
+        score += min(text.count("UI_"), 50)
+    if re.search(r'\bs\s*:\s*(?:"|\')', text):
+        score += 10
+    if "_NAME" in text or "_DESC" in text:
+        score += 6
+    score += min(len(text) // 5000, 20)
+    return score
+
+def _mr_choose_best_js_roles() -> None:
+    best_data = (0, None, False)
+    best_desc = (0, None, False)
+    for name, bs in _MR_IN_MEM_FILES.items():
+        if not name.lower().endswith(".js"):
+            continue
+        text = _mr_decode_bytes_to_text(bs)
+        if not text:
+            continue
+        data_score = _mr_score_data_js(text)
+        desc_score = _mr_score_desc_js(text)
+        meta_url = _MR_IN_MEM_META.get(name, {}).get("url", "")
+        is_mr = ("maprunner.info" in meta_url) or ("/mr/" in meta_url)
+        if is_mr:
+            data_score += 3
+            desc_score += 3
+        else:
+            # Strongly downrank non-MapRunner JS (ads, analytics)
+            data_score = max(0, data_score - 50)
+            desc_score = max(0, desc_score - 50)
+        if data_score > best_data[0]:
+            best_data = (data_score, name, is_mr)
+        if desc_score > best_desc[0]:
+            best_desc = (desc_score, name, is_mr)
+    if best_data[1]:
+        _mr_store_in_memory(_MR_CANONICAL_NAMES["data"], _MR_IN_MEM_FILES[best_data[1]])
+        if _MR_DEBUG:
+            try:
+                _mr_log(f"choose_best: data={best_data[1]} score={best_data[0]} url={_MR_IN_MEM_META.get(best_data[1],{}).get('url','')}")
+            except Exception:
+                pass
+    # Prefer desc from MapRunner domain; if not, fall back to the data file
+    desc_name = None
+    if best_desc[1] and best_desc[2]:
+        desc_name = best_desc[1]
+    elif best_data[1]:
+        desc_name = best_data[1]
+    if desc_name:
+        _mr_store_in_memory(_MR_CANONICAL_NAMES["desc"], _MR_IN_MEM_FILES[desc_name])
+        if _MR_DEBUG:
+            try:
+                _mr_log(f"choose_best: desc={desc_name} score={best_desc[0]} url={_MR_IN_MEM_META.get(desc_name,{}).get('url','')}")
+            except Exception:
+                pass
+
+def _mr_expand_chunks_from_bundle() -> None:
+    """
+    If we only have the main bundle, try downloading its dynamic chunks directly
+    (from the same CDN base) and rescore to find the data/desc JS.
+    """
+    if _MR_DEBUG:
+        _mr_log("expand_chunks: start")
+    # Pick a bundle that actually contains chunk references.
+    primary = None
+    primary_url = None
+    chunk_names: List[str] = []
+    max_chunks = 0
+    try:
+        for name, bs in _MR_IN_MEM_FILES.items():
+            url = _MR_IN_MEM_META.get(name, {}).get("url", "")
+            if "/mr/" not in url or not name.lower().endswith(".js"):
+                continue
+            try:
+                text = _mr_decode_bytes_to_text(bs) or ""
+            except Exception:
+                continue
+            names = sorted(set(re.findall(r'\./([A-Za-z0-9_-]+\.js)', text)))
+            if len(names) > max_chunks:
+                max_chunks = len(names)
+                primary = name
+                primary_url = url
+                chunk_names = names
+    except Exception:
+        pass
+
+    if not primary or not primary_url or not chunk_names:
+        if _MR_DEBUG:
+            _mr_log("expand_chunks: no chunk names found")
+        return
+
+    base_url = primary_url.rsplit("/", 1)[0] + "/"
+    if _MR_DEBUG:
+        _mr_log(f"expand_chunks: primary={primary} chunks={len(chunk_names)} base={base_url}")
+        _mr_log(f"expand_chunks: first_chunks={chunk_names[:8]}")
+
+    # First, try precise signature-based detection using chunk URLs.
+    try:
+        urls = [base_url + ch for ch in chunk_names]
+        sig_found = _mr_find_precise_js_from_urls(urls, head_bytes=65536)
+        if _MR_DEBUG:
+            _mr_log(f"expand_chunks: precise_found data={sig_found.get('data')} desc={sig_found.get('desc')}")
+    except Exception:
+        sig_found = {"data": False, "desc": False}
+
+    # Probe all chunks lightly to find localization candidates.
+    loc_candidates: List[str] = []
+    data_candidates: List[str] = []
+    desc_candidates: List[str] = []
+    for ch in chunk_names:
+        url = base_url + ch
+        head = _mr_probe_js_head(url)
+        if not head:
+            continue
+        if ("JSON.parse" in head) and ("const" in head):
+            data_candidates.append(ch)
+        if ("_DESC_DESC" in head) or ("_DESC\"" in head) or ("_DESC'" in head):
+            desc_candidates.append(ch)
+        if ("s:\"" in head) or ("s:'" in head) or ("const t=" in head) or ("const t={" in head):
+            loc_candidates.append(ch)
+        # Limit probe list to a reasonable size
+        if len(loc_candidates) >= 120 and len(data_candidates) >= 3:
+            break
+
+    # Download chunks; aim to capture enough English localization coverage.
+    best_data_score = 0
+    best_desc_score = 0
+    english_entries = 0
+    english_chunks = 0
+    downloaded = 0
+    ok = 0
+    fail = 0
+
+    # Prioritize localization + description candidates (likely contain strings)
+    download_queue = desc_candidates + loc_candidates + [ch for ch in chunk_names if ch not in loc_candidates and ch not in desc_candidates]
+    for i, ch in enumerate(download_queue):
+        if ch in _MR_IN_MEM_FILES:
+            continue
+        if _MR_CHUNK_MAX > 0 and downloaded >= _MR_CHUNK_MAX:
+            break
+        url = base_url + ch
+        try:
+            data, headers = _mr_http_get(url, timeout=20)
+            _mr_store_in_memory(ch, data, url)
+            ok += 1
+            downloaded += 1
+            # quick score to allow early exit
+            txt = _mr_decode_bytes_to_text(data)
+            if txt:
+                ds = _mr_score_data_js(txt)
+                cs = _mr_score_desc_js(txt)
+                # Prefer MapRunner domain; URLs here are all /mr/
+                best_data_score = max(best_data_score, ds)
+                best_desc_score = max(best_desc_score, cs)
+                if cs >= 10 and ("s:\"" in txt or "s:'" in txt):
+                    try:
+                        parsed = _mr_parse_localization_from_desc_text(txt)
+                        if parsed:
+                            sample_vals = list(parsed.values())[:120]
+                            if sample_vals:
+                                avg = sum(_mr_text_english_score(v) for v in sample_vals) / max(1, len(sample_vals))
+                            else:
+                                avg = -999.0
+                            if avg >= 1.0:
+                                english_chunks += 1
+                                english_entries += len(parsed)
+                                if _MR_DEBUG:
+                                    _mr_log(f"expand_chunks: english_chunk={ch} entries={len(parsed)} avg={avg:.2f}")
+                    except Exception:
+                        pass
+                if _MR_DEBUG and (ds >= 10 or cs >= 10):
+                    _mr_log(f"expand_chunks: {ch} ds={ds} cs={cs}")
+                if english_chunks >= 2 and english_entries >= _MR_ENGLISH_TARGET:
+                    break
+        except Exception:
+            fail += 1
+            continue
+
+    # Re-select best roles from the expanded set
+    if _MR_DEBUG:
+        _mr_log(f"expand_chunks: downloaded ok={ok} fail={fail} english_chunks={english_chunks} english_entries={english_entries}")
+    _mr_choose_best_js_roles()
+
+def _mr_identify_js_role(text: str) -> Optional[str]:
+    if not text:
+        return None
+    data_score = _mr_score_data_js(text)
+    desc_score = _mr_score_desc_js(text)
+    if data_score >= 15 and data_score >= desc_score:
+        return "data"
+    if desc_score >= 10 and desc_score > data_score:
+        return "desc"
+    return None
+
+def _mr_fallback_download_candidates_to_mem(page_url: str, html: str) -> List[str]:
+    found_roles: List[str] = []
+    candidates: List[str] = []
+    for match in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
+        src = match.group(1)
+        abs_url = urljoin(page_url, src)
+        if "/mr/" in abs_url or abs_url.endswith(".js") or "cdn" in abs_url:
+            candidates.append(abs_url)
+
+    # Also include modulepreload/prefetch/preload links (Nuxt/Vite often use these for JS chunks)
+    for match in re.finditer(r'<link[^>]+rel=["\'](?:modulepreload|prefetch|preload)["\'][^>]+href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
+        href = match.group(1)
+        abs_url = urljoin(page_url, href)
+        if "/mr/" in abs_url or abs_url.endswith(".js") or "cdn" in abs_url:
+            candidates.append(abs_url)
+
+    candidates = sorted(set(candidates), key=lambda u: ("/mr/" not in u, u))
+
+    for abs_url in candidates:
+        try:
+            data, headers = _mr_http_get(abs_url, timeout=15)
+            if not _mr_looks_like_js_response(headers, abs_url):
+                continue
+            txt = _mr_decode_bytes_to_text(data)
+            role = _mr_identify_js_role(txt or "")
+            filename = os.path.basename(urlparse(abs_url).path) or None
+            if role:
+                canon = _MR_CANONICAL_NAMES[role]
+                if filename:
+                    _mr_store_in_memory(filename, data, abs_url)
+                _mr_store_in_memory(canon, data, abs_url)
+                if canon not in found_roles:
+                    found_roles.append(canon)
+            else:
+                if filename:
+                    _mr_store_in_memory(filename, data, abs_url)
+        except Exception:
+            continue
+    return found_roles
+
+def _mr_try_direct_js_endpoints() -> bool:
+    """
+    Try known static JS endpoints directly (works without Playwright).
+    Returns True if both data.js and desc.js were captured.
+    """
+    endpoints = [
+        ("data", "https://www.maprunner.info/mr/data.js"),
+        ("desc", "https://www.maprunner.info/mr/desc.js"),
+    ]
+    for role, url in endpoints:
+        try:
+            data, headers = _mr_http_get(url, timeout=15)
+            if not _mr_looks_like_js_response(headers, url):
+                continue
+            txt = _mr_decode_bytes_to_text(data) or ""
+            identified = _mr_identify_js_role(txt)
+            if identified == role:
+                _mr_store_in_memory(_MR_CANONICAL_NAMES[role], data, url)
+        except Exception:
+            continue
+    return ("data.js" in _MR_IN_MEM_FILES) and ("desc.js" in _MR_IN_MEM_FILES)
+
+def _mr_download_js_step() -> None:
+    _MR_IN_MEM_FILES.clear()
+    _MR_IN_MEM_META.clear()
+    found = set()
+
+    # Fast-path: try known endpoints directly (no Playwright needed)
+    try:
+        if _MR_DEBUG:
+            _mr_log("download_js_step: trying direct endpoints")
+        if _mr_try_direct_js_endpoints():
+            if _MR_DEBUG:
+                _mr_log("download_js_step: direct endpoints success")
+            return
+    except Exception:
+        if _MR_DEBUG:
+            _mr_log_exc("download_js_step: direct endpoints failed")
+        pass
+
+    # Use HTML+urllib fallback (no Playwright dependency).
+    try:
+        data, _ = _mr_http_get(_MR_URL, timeout=15)
+        html = _mr_decode_bytes_to_text(data) or ""
+        _mr_fallback_download_candidates_to_mem(_MR_URL, html)
+        _mr_choose_best_js_roles()
+        _mr_expand_chunks_from_bundle()
+        if _MR_DEBUG:
+            _mr_log(f"download_js_step: fallback html ok; mem_files={list(_MR_IN_MEM_FILES.keys())[:6]}")
+        return
+    except Exception:
+        if _MR_DEBUG:
+            _mr_log_exc("download_js_step: fallback html failed")
+        return
+
+def _mr_choose_first_available(candidates: List[str]) -> Optional[str]:
+    for name in candidates:
+        if _mr_get_file_bytes_or_mem(name) is not None:
+            return name
+    return candidates[0] if candidates else None
+
+def _mr_collect_localization(desc_js_file: Optional[str]) -> Dict[str, str]:
+    """
+    Build a localization dictionary by parsing one or more JS files that contain
+    localization strings (s:"..."). This merges results across multiple chunks.
+    """
+    merged: Dict[str, str] = {}
+    seen_files: Set[str] = set()
+
+    def _merge_value(key: str, val: str) -> None:
+        if key not in merged:
+            merged[key] = val
+            return
+        old = merged.get(key, "")
+        # Prefer the value that looks more English / less mojibake
+        new_score = _mr_text_english_score(val)
+        old_score = _mr_text_english_score(old)
+        if new_score > old_score + 0.2:
+            merged[key] = val
+
+    def _add_from_text(txt: Optional[str]) -> None:
+        if not txt:
+            return
+        # quick filter to avoid heavy parsing for unrelated files
+        if ("s:\"") not in txt and ("s:'") not in txt and ("s :") not in txt:
+            return
+        parsed = _mr_parse_localization_from_desc_text(txt)
+        if parsed:
+            for k, v in parsed.items():
+                _merge_value(k, v)
+
+    # First try the chosen desc file (if any)
+    if desc_js_file:
+        try:
+            txt = _mr_decode_bytes_to_text(_mr_get_file_bytes_or_mem(desc_js_file))
+            _add_from_text(txt)
+            if desc_js_file:
+                seen_files.add(desc_js_file)
+        except Exception:
+            pass
+
+    # Then scan other in-memory JS files likely to contain localization.
+    for name, bs in list(_MR_IN_MEM_FILES.items()):
+        if name in seen_files:
+            continue
+        if not name.lower().endswith(".js"):
+            continue
+        try:
+            txt = _mr_decode_bytes_to_text(bs)
+        except Exception:
+            txt = None
+        if not txt:
+            continue
+        if ("EXP_" not in txt) and ("_DESC_DESC" not in txt) and ("_NAME" not in txt and "_DESC" not in txt):
+            # Skip chunks unlikely to contain localization
+            continue
+        _add_from_text(txt)
+        seen_files.add(name)
+        # stop early if we already have a large localization table
+        if len(merged) >= 12000:
+            break
+
+    if _MR_DEBUG:
+        try:
+            _mr_log(f"collect_localization: files={len(seen_files)} entries={len(merged)}")
+        except Exception:
+            pass
+    return merged
+
+def _write_csv_atomic(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
+    if not rows:
+        return
+    out_dir = os.path.dirname(path) or "."
+    tmp_path = None
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        with tempfile.NamedTemporaryFile("w", delete=False, dir=out_dir, encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+            tmp_path = f.name
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+def _to_int(value, default=0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+def _mr_build_csv(out_path: str) -> bool:
+    """
+    Attempt to download + parse MapRunner data and write a fresh CSV.
+    Returns True on success, False on failure.
+    """
+    try:
+        if _MR_DEBUG:
+            _mr_log("build_csv: start")
+        _mr_download_js_step()
+        region_order = _MR_REGION_ORDER
+        category_priority = _MR_CATEGORY_PRIORITY
+        type_priority = _MR_TYPE_PRIORITY
+        region_lookup = _MR_REGION_LOOKUP
+
+        input_file = _mr_choose_first_available([_MR_CANONICAL_NAMES["data"], "data.js"])
+        desc_js_file = _mr_choose_first_available([_MR_CANONICAL_NAMES["desc"], "desc.js"])
+        if _MR_DEBUG:
+            _mr_log(f"build_csv: input_file={input_file} desc_file={desc_js_file} mem_files={list(_MR_IN_MEM_FILES.keys())[:6]}")
+
+        def clean_text(s):
+            if s is None:
+                return ""
+            if not isinstance(s, str):
+                try:
+                    s = s.decode("utf-8", errors="replace")
+                except Exception:
+                    s = str(s)
+            candidates = [s]
+            # Only attempt unicode_escape if the string contains escapes
+            if "\\" in s:
+                try:
+                    cand = bytes(s, "utf-8").decode("unicode_escape")
+                    candidates.append(cand)
+                except Exception:
+                    pass
+            try:
+                candidates.append(s.encode("latin-1", errors="replace").decode("utf-8", errors="replace"))
+            except Exception:
+                pass
+            try:
+                candidates.append(s.encode("utf-8", errors="replace").decode("latin-1", errors="replace"))
+            except Exception:
+                pass
+            try:
+                if "\\" in s:
+                    cand = bytes(s, "utf-8").decode("unicode_escape").encode("latin-1", errors="replace").decode("utf-8", errors="replace")
+                    candidates.append(cand)
+            except Exception:
+                pass
+            def score(x):
+                if not x:
+                    return 999999
+                return x.count("�") + x.count("Ã") + x.count("Â") + x.count("\ufffd")
+            best = min(candidates, key=score)
+            return best.strip()
+
+        def _collect_desc_text_blobs(current_desc: Optional[str]) -> List[str]:
+            blobs: List[str] = []
+            seen: Set[str] = set()
+            if current_desc:
+                try:
+                    txt = _mr_decode_bytes_to_text(_mr_get_file_bytes_or_mem(current_desc))
+                    if txt:
+                        blobs.append(txt)
+                        seen.add(current_desc)
+                except Exception:
+                    pass
+            for name, bs in list(_MR_IN_MEM_FILES.items()):
+                if name in seen:
+                    continue
+                if not name.lower().endswith(".js"):
+                    continue
+                try:
+                    txt = _mr_decode_bytes_to_text(bs)
+                except Exception:
+                    txt = None
+                if not txt:
+                    continue
+                if ("EXP_" not in txt) and ("_DESC_DESC" not in txt) and ("_NAME" not in txt and "_DESC" not in txt):
+                    continue
+                if ("s:\"") not in txt and ("s:'") not in txt and ("s :") not in txt:
+                    continue
+                blobs.append(txt)
+                seen.add(name)
+                if len(blobs) >= 8:
+                    break
+            return blobs
+
+        localization = _mr_collect_localization(desc_js_file)
+        desc_text_blobs = _collect_desc_text_blobs(desc_js_file)
+
+        # If localization is missing, try to expand chunks and re-select desc file.
+        if (not localization or len(localization) < 200):
+            try:
+                _mr_expand_chunks_from_bundle()
+                _mr_choose_best_js_roles()
+                desc_js_file = _mr_choose_first_available([_MR_CANONICAL_NAMES["desc"], "desc.js"])
+                localization = _mr_collect_localization(desc_js_file)
+                desc_text_blobs = _collect_desc_text_blobs(desc_js_file)
+            except Exception:
+                pass
+        if _MR_DEBUG:
+            try:
+                _mr_log(f"build_csv: localization size={len(localization) if localization else 0}")
+            except Exception:
+                pass
+
+        _lazy_desc_cache: Dict[str, Optional[str]] = {}
+
+        def lazy_desc_lookup(tok: str) -> Optional[str]:
+            if not tok or not desc_text_blobs:
+                return None
+            if tok in _lazy_desc_cache:
+                return _lazy_desc_cache[tok]
+            # Try both bare and quoted keys across multiple blobs
+            patterns = [f'{tok}:{{', f'"{tok}":{{', f"'{tok}':{{"]
+            for blob in desc_text_blobs:
+                idx = -1
+                for pat in patterns:
+                    idx = blob.find(pat)
+                    if idx != -1:
+                        break
+                if idx == -1:
+                    continue
+                window = blob[idx: idx + 600]
+                m = re.search(r's\\s*:\\s*(\"|\\\')', window)
+                if not m:
+                    continue
+                quote_idx = idx + m.start(1)
+                val = _mr_extract_js_string_literal(blob, quote_idx)
+                if val is None:
+                    continue
+                try:
+                    val = codecs.decode(val.replace(r"\\/", "/"), "unicode_escape")
+                except Exception:
+                    pass
+                val = clean_text(val)
+                _lazy_desc_cache[tok] = val
+                return val
+            _lazy_desc_cache[tok] = None
+            return None
+
+        def translate_token(tok):
+            if not tok:
+                return ""
+            # Build lookup candidates (MapRunner often prefixes EXP_)
+            candidates = [tok]
+            if tok.startswith("EXP_"):
+                candidates.append(tok[4:])
+            else:
+                candidates.append("EXP_" + tok)
+            if tok.startswith("UI_") and not tok.startswith("EXP_UI_"):
+                candidates.append("EXP_" + tok)
+            for candidate in (tok, tok.upper(), tok.lower()):
+                if candidate not in candidates:
+                    candidates.append(candidate)
+            if localization:
+                for candidate in candidates:
+                    if candidate in localization:
+                        return clean_text(localization[candidate])
+                stripped = tok.replace("UI_", "").replace("_NAME", "").replace("_DESC", "")
+                if stripped in localization:
+                    return clean_text(localization[stripped])
+                if "EXP_" + stripped in localization:
+                    return clean_text(localization["EXP_" + stripped])
+            # If still not found, try lazy lookup across blobs
+            for candidate in candidates:
+                fallback = lazy_desc_lookup(candidate)
+                if fallback:
+                    return fallback
+            return clean_text(tok)
+
+        def collect_types(obj):
+            types = set()
+            if isinstance(obj, dict):
+                t = obj.get("type")
+                if isinstance(t, str) and t.strip():
+                    types.add(t.strip())
+                for v in obj.values():
+                    types.update(collect_types(v))
+            elif isinstance(obj, list):
+                for item in obj:
+                    types.update(collect_types(item))
+            return types
+
+        def pretty_cargo_name(raw_name):
+            if not raw_name:
+                return "Unknown"
+            s = raw_name.replace("UI_CARGO_", "").replace("_NAME", "").replace("Cargo", "")
+            s = s.replace("_", " ").strip()
+            return " ".join([p.capitalize() for p in s.split()])
+
+        def collect_cargo(obj):
+            cargos = []
+            if isinstance(obj, dict):
+                if "cargo" in obj and isinstance(obj["cargo"], list):
+                    for c in obj["cargo"]:
+                        if isinstance(c, dict):
+                            count = str(c.get("count", "") or "")
+                            name = c.get("name") or c.get("key") or "Unknown"
+                            name = pretty_cargo_name(name)
+                            cargos.append(f"{count}× {name}" if count and count != "-1" else name)
+                for v in obj.values():
+                    cargos.extend(collect_cargo(v))
+            elif isinstance(obj, list):
+                for v in obj:
+                    cargos.extend(collect_cargo(v))
+            return cargos
+
+        def humanize_key(k):
+            parts = k.split("_")
+            return " ".join([p.capitalize() for p in parts if p])
+
+        def extract_js_parse_string(txt):
+            idx = txt.find("JSON.parse")
+            if idx == -1:
+                return None
+            i = txt.find("(", idx)
+            if i == -1:
+                return None
+            j = i + 1
+            while j < len(txt) and txt[j].isspace():
+                j += 1
+            if j >= len(txt) or txt[j] not in ("'", '"'):
+                return None
+            quote = txt[j]
+            start = j + 1
+            k = start
+            escaped = False
+            while k < len(txt):
+                ch = txt[k]
+                if escaped:
+                    escaped = False
+                    k += 1
+                    continue
+                if ch == "\\":
+                    escaped = True
+                    k += 1
+                    continue
+                if ch == quote:
+                    return txt[start:k]
+                k += 1
+            return None
+
+        def unescape_js_string(s):
+            if s is None:
+                return ""
+            try:
+                normalized = s.replace(r'\/', '/')
+                return codecs.decode(normalized, "unicode_escape")
+            except Exception:
+                return s
+
+        def load_embedded_json(filename):
+            def _extract_js_string_literal(txt, start_idx):
+                if start_idx >= len(txt):
+                    return None
+                quote = txt[start_idx]
+                if quote not in ("'", '"', "`"):
+                    return None
+                k = start_idx + 1
+                escaped = False
+                out = []
+                while k < len(txt):
+                    ch = txt[k]
+                    if escaped:
+                        out.append(ch)
+                        escaped = False
+                        k += 1
+                        continue
+                    if ch == "\\":
+                        escaped = True
+                        k += 1
+                        continue
+                    if quote == "`" and ch == "$" and k + 1 < len(txt) and txt[k + 1] == "{":
+                        # Template literal with interpolation not supported
+                        return None
+                    if ch == quote:
+                        return "".join(out)
+                    out.append(ch)
+                    k += 1
+                return None
+
+            def _extract_largest_string(txt, min_len=100000):
+                best = None
+                best_len = 0
+                i = 0
+                n = len(txt)
+                while i < n:
+                    ch = txt[i]
+                    if ch not in ("'", '"', "`"):
+                        i += 1
+                        continue
+                    quote = ch
+                    i += 1
+                    escaped = False
+                    start = i
+                    has_interp = False
+                    while i < n:
+                        c = txt[i]
+                        if escaped:
+                            escaped = False
+                            i += 1
+                            continue
+                        if c == "\\":
+                            escaped = True
+                            i += 1
+                            continue
+                        if quote == "`" and c == "$" and i + 1 < n and txt[i + 1] == "{":
+                            has_interp = True
+                        if c == quote:
+                            s = txt[start:i]
+                            if not has_interp:
+                                slen = len(s)
+                                if slen > best_len and slen >= min_len:
+                                    best_len = slen
+                                    best = s
+                            i += 1
+                            break
+                        i += 1
+                    else:
+                        break
+                return best
+
+            def _find_json_parse_payload(txt):
+                pos = 0
+                while True:
+                    idx = txt.find("JSON.parse", pos)
+                    if idx == -1:
+                        return None
+                    i = txt.find("(", idx)
+                    if i == -1:
+                        return None
+                    j = i + 1
+                    while j < len(txt) and txt[j].isspace():
+                        j += 1
+                    if j >= len(txt):
+                        return None
+                    # JSON.parse(VAR_NAME) -> resolve variable
+                    m = re.match(r'([A-Za-z_$][\\w$]*)', txt[j:])
+                    if m:
+                        varname = m.group(1)
+                        # look for const/let/var assignment
+                        assign_patterns = [
+                            rf'(?:const|let|var)\\s+{re.escape(varname)}\\s*=\\s*',
+                            rf'{re.escape(varname)}\\s*=\\s*',
+                        ]
+                        for pat in assign_patterns:
+                            am = re.search(pat, txt)
+                            if am:
+                                k = am.end()
+                                while k < len(txt) and txt[k].isspace():
+                                    k += 1
+                                if k < len(txt):
+                                    if txt.startswith("atob", k):
+                                        j2 = txt.find("(", k)
+                                        if j2 != -1:
+                                            j3 = j2 + 1
+                                            while j3 < len(txt) and txt[j3].isspace():
+                                                j3 += 1
+                                            s = _extract_js_string_literal(txt, j3)
+                                            if s is not None:
+                                                try:
+                                                    import base64
+                                                    raw = base64.b64decode(s)
+                                                    decoded = _mr_decode_bytes_to_text(raw) or ""
+                                                    return decoded
+                                                except Exception:
+                                                    pass
+                                    if txt[k] in ("'", '"', "`"):
+                                        s = _extract_js_string_literal(txt, k)
+                                        if s is not None:
+                                            return s
+                        pos = idx + 10
+                        continue
+                    # JSON.parse(atob("..."))
+                    if txt.startswith("atob", j):
+                        j2 = txt.find("(", j)
+                        if j2 == -1:
+                            pos = idx + 10
+                            continue
+                        j3 = j2 + 1
+                        while j3 < len(txt) and txt[j3].isspace():
+                            j3 += 1
+                        s = _extract_js_string_literal(txt, j3)
+                        if s is None:
+                            pos = idx + 10
+                            continue
+                        try:
+                            import base64
+                            raw = base64.b64decode(s)
+                            decoded = _mr_decode_bytes_to_text(raw) or ""
+                            return decoded
+                        except Exception:
+                            pos = idx + 10
+                            continue
+                    # JSON.parse("...") / JSON.parse('...') / JSON.parse(`...`)
+                    if txt[j] in ("'", '"', "`"):
+                        s = _extract_js_string_literal(txt, j)
+                        if s is not None:
+                            return s
+                    pos = idx + 10
+
+            bs = _mr_get_file_bytes_or_mem(filename)
+            if bs is None:
+                return None
+            txt = _mr_decode_bytes_to_text(bs)
+            if _MR_DEBUG:
+                try:
+                    head = bs[:8]
+                    head_hex = "".join([f"{b:02x}" for b in head])
+                    _mr_log(f"load_embedded_json: {filename} bytes={len(bs)} head={head_hex} has_JSON_parse={bool(txt and ('JSON.parse' in txt))}")
+                except Exception:
+                    pass
+            if not txt:
+                return None
+            embedded = _find_json_parse_payload(txt)
+            if embedded is None:
+                embedded = extract_js_parse_string(txt)
+            if embedded is None:
+                # Fallback: try largest string literal in the file
+                try:
+                    candidate = _extract_largest_string(txt)
+                    if candidate:
+                        if _MR_DEBUG:
+                            _mr_log(f"load_embedded_json: largest string len={len(candidate)}")
+                        embedded = candidate
+                except Exception:
+                    pass
+            if embedded is None:
+                return None
+            json_text = unescape_js_string(embedded)
+            try:
+                return json.loads(json_text)
+            except Exception:
+                try:
+                    repaired = clean_text(json_text)
+                    return json.loads(repaired)
+                except Exception:
+                    try:
+                        embedded_bytes = embedded.encode("utf-8", errors="replace")
+                        candidate = embedded_bytes.decode("latin-1", errors="replace")
+                        candidate = unescape_js_string(candidate)
+                        return json.loads(candidate)
+                    except Exception:
+                        return None
+
+        # Try multiple candidates if the primary data file fails
+        data = load_embedded_json(input_file) if input_file else None
+        if not data:
+            if _MR_DEBUG:
+                _mr_log("build_csv: primary load_embedded_json failed; trying candidates")
+            # Rank candidates by data score
+            candidates = []
+            try:
+                for name, bs in _MR_IN_MEM_FILES.items():
+                    if not name.lower().endswith(".js"):
+                        continue
+                    txt = _mr_decode_bytes_to_text(bs) or ""
+                    ds = _mr_score_data_js(txt)
+                    if ds > 0:
+                        candidates.append((ds, name))
+                candidates.sort(reverse=True)
+            except Exception:
+                candidates = []
+            for _, name in candidates:
+                if name == input_file:
+                    continue
+                data = load_embedded_json(name)
+                if data:
+                    if _MR_DEBUG:
+                        _mr_log(f"build_csv: data loaded from candidate {name}")
+                    break
+        if not data:
+            if _MR_DEBUG:
+                _mr_log("build_csv: load_embedded_json failed (no data)")
+            return False
+
+        rows = []
+        wanted_columns = [
+            "key", "displayName", "category", "region", "region_name", "type",
+            "cargo_needed", "experience", "money", "descriptionText", "Source"
+        ]
+
+        def walk(o):
+            if isinstance(o, dict):
+                if "category" in o and "key" in o:
+                    key = o["key"].upper()
+                    region = "_".join(key.split("_")[:2]) if "_" in key else ""
+                    if o.get("category") in _MR_ALLOWED_CATEGORIES and region in region_lookup:
+                        exp = money = None
+                        if isinstance(o.get("rewards"), list):
+                            for r in o["rewards"]:
+                                if isinstance(r, dict):
+                                    exp = r.get("experience", exp)
+                                    money = r.get("money", money)
+                        types = collect_types(o.get("objectives", []))
+                        cargos = collect_cargo(o.get("objectives", []))
+                        if "truckDelivery" in types:
+                            type_str = "truckDelivery"
+                        elif cargos:
+                            type_str = "cargoDelivery"
+                        else:
+                            type_str = "exploration"
+                        cargo_str = "; ".join(cargos) if cargos else None
+
+                        name_field = o.get("name") or ""
+                        if name_field and not name_field.startswith("UI_"):
+                            display = translate_token(name_field) if localization else clean_text(name_field)
+                        else:
+                            if localization and name_field:
+                                display = translate_token(name_field)
+                            elif localization:
+                                display = translate_token(key)
+                            else:
+                                display = clean_text(humanize_key(key))
+
+                        raw_desc = o.get("subtitle") or o.get("description") or o.get("descriptionText") or ""
+                        description_text = translate_token(raw_desc) if raw_desc else ""
+                        description_text = clean_text(description_text)
+
+                        source = (o.get("category") or "").lstrip("_")
+
+                        rows.append({
+                            "key": key,
+                            "displayName": clean_text(display),
+                            "category": o.get("category"),
+                            "region": region,
+                            "region_name": region_lookup.get(region, ""),
+                            "type": type_str,
+                            "cargo_needed": cargo_str,
+                            "experience": exp,
+                            "money": money,
+                            "descriptionText": description_text,
+                            "Source": source,
+                        })
+            for v in (o.values() if isinstance(o, dict) else (o if isinstance(o, list) else [])):
+                walk(v)
+
+        walk(data)
+        if not rows:
+            if _MR_DEBUG:
+                _mr_log("build_csv: no rows produced")
+            return False
+
+        seen = set()
+        unique_rows = []
+        for row in rows:
+            k = row.get("key")
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            unique_rows.append(row)
+
+        region_map = {r: i for i, r in enumerate(region_order)}
+        category_map = {cat: i for i, cat in enumerate(category_priority)}
+        type_map = {t: i for i, t in enumerate(type_priority)}
+
+        num_re = re.compile(r'(\d+)')
+        def numeric_groups_from_key(k, max_groups=4):
+            nums = num_re.findall(k)
+            nums = [int(x) for x in nums]
+            pad = [99999] * max_groups
+            return (nums + pad)[:max_groups]
+
+        def sort_key(r):
+            nums = numeric_groups_from_key(r.get("key", ""))
+            money_num = _to_int(r.get("money"))
+            exp_num = _to_int(r.get("experience"))
+            return (
+                region_map.get(r.get("region"), 9999),
+                nums[0], nums[1], nums[2], nums[3],
+                category_map.get(r.get("category"), 9999),
+                type_map.get(r.get("type"), 9999),
+                -money_num,
+                -exp_num,
+                r.get("displayName") or "",
+            )
+
+        rows_sorted = sorted(unique_rows, key=sort_key)
+        _write_csv_atomic(out_path, rows_sorted, wanted_columns)
+        if _MR_DEBUG:
+            try:
+                if rows_sorted:
+                    r0 = rows_sorted[0]
+                    _mr_log(f"build_csv: sample0 key={r0.get('key')} displayName={r0.get('displayName')} region={r0.get('region')}")
+                # Log a known key if present
+                needle = "US_01_02_LOST_TRAILER_TSK"
+                for r in rows_sorted:
+                    if r.get("key") == needle:
+                        _mr_log(f"build_csv: sample {needle} displayName={r.get('displayName')} desc={str(r.get('descriptionText'))[:80]}")
+                        break
+            except Exception:
+                pass
+        if _MR_DEBUG:
+            _mr_log(f"build_csv: success rows={len(rows_sorted)} out={out_path}")
+        return True
+    except Exception as e:
+        log(f"Maprunner CSV build failed: {e}")
+        _mr_log_exc("build_csv: exception")
+        return False
+
+def _objectives_cache_csv_path() -> str:
+    try:
+        cfg_dir = os.path.dirname(CONFIG_FILE)
+    except Exception:
+        try:
+            cfg_dir = os.path.expanduser("~")
+        except Exception:
+            cfg_dir = ""
+    if not cfg_dir:
+        cfg_dir = os.getcwd()
+    return os.path.join(cfg_dir, ".snowrunner_editor_maprunner_data.csv")
+
+def _load_csv_to_simpleframe(csv_path: str) -> Optional[SimpleFrame]:
+    if not csv_path:
+        return None
     log(f"Starting CSV load: {csv_path}")
-
     if not os.path.exists(csv_path):
         log(f"CSV file not found: {csv_path}")
         return None
-
     try:
         rows: List[Dict[str, Any]] = []
         with open(csv_path, "r", encoding="utf-8", newline="") as fh:
             reader = csv.DictReader(fh)
             for r in reader:
-                # normalize column names to lowercase and trim whitespace
                 normalized = {str(k).strip().lower(): (v if v != "" else None) for k, v in r.items()}
                 rows.append(normalized)
         log(f"CSV read complete: {len(rows)} rows")
@@ -2484,6 +5463,52 @@ def _load_parquet_safe(parquet_path: Optional[str] = None):
     except Exception as e:
         log(f"Failed to read CSV: {e}")
         return None
+
+def _load_parquet_safe(parquet_path: Optional[str] = None, allow_build: bool = True):
+    """
+    CSV loader with fallback chain.
+    Order:
+      1) If allow_build, attempt to build fresh CSV into cache (online).
+      2) Load cached CSV from last successful build.
+      3) Load bundled CSV next to the app (if present).
+      4) If none work, return None (no crash).
+    """
+    if parquet_path is None:
+        try:
+            parquet_path = default_parquet_path()
+        except Exception:
+            parquet_path = resource_path("maprunner_data.parquet")
+
+    cache_csv = _objectives_cache_csv_path()
+    bundled_csv = resource_path("maprunner_data.csv")
+    inferred_csv = os.path.splitext(parquet_path)[0] + ".csv"
+
+    # Attempt online refresh into cache (best-effort)
+    if allow_build:
+        try:
+            built = _mr_build_csv(cache_csv)
+            if built:
+                log(f"Fresh Objectives+ CSV built: {cache_csv}")
+        except Exception:
+            pass
+
+    # Fallback chain (cache -> inferred -> bundled)
+    candidates = []
+    for p in (cache_csv, inferred_csv, bundled_csv):
+        if p and p not in candidates:
+            candidates.append(p)
+
+    for path in candidates:
+        df = _load_csv_to_simpleframe(path)
+        if df is not None:
+            return df
+
+    log("Objectives+ CSV load failed: no usable CSV found.")
+    return None
+
+# ---------------------------------------------------------------------------
+# END SECTION: Objectives+ CSV Builder (Maprunner)
+# ---------------------------------------------------------------------------
 # --- end CSV-only loader ---
 
 
@@ -2516,16 +5541,36 @@ class VirtualObjectivesFast:
 
         # Virtualization config
         self.row_height = 30
-        self.buffer_rows = 1
+        # extra rows reduce redraw artifacts during fast scroll
+        self.buffer_rows = 4
         self.pool = []
         self.pool_size = 0
         self.pool_initialized = False
+        self._virtualize = True
+        # Full-list (non-virtual) UI state
+        self._full_frame = None
+        self._full_window_id = None
+        self._full_rows = []
+        # Scroll optimization
+        self._scrolling = False
+        self._scroll_idle_after = None
+        self._needs_full_refresh = False
 
         # UI state variables (create after tkinter import)
         self.search_var = tk.StringVar()
         self.type_var = tk.StringVar()
         self.region_var = tk.StringVar()
         self.category_var = tk.StringVar()
+
+        # Status / refresh UI
+        self.status_var = tk.StringVar(value="")
+        self.status_label = None
+        self._loading_anim_id = None
+        self._loading_phase = 0
+        self._loading_base = ""
+        self._loading_active = False
+        self._status_clear_after = None
+        self._refresh_inflight = False
 
         # Tooltip placeholders
         self._tip = None
@@ -2536,6 +5581,9 @@ class VirtualObjectivesFast:
 
         # last visible index for logging scroll changes
         self._last_first_visible = -1
+
+        # guard to prevent programmatic checkbox updates from firing change handlers
+        self._suppress_trace = False
 
         # type map
         self._type_label_to_internal = {"": "", "Task": "TASK", "Contract": "CONTRACT", "Contest": "CONTEST"}
@@ -2606,6 +5654,267 @@ class VirtualObjectivesFast:
         ev.wait()
         return result.get('v', default)
 
+    def _event_in_objectives(self, event) -> bool:
+        """Return True if the mousewheel event originated inside this Objectives+ frame."""
+        try:
+            if self.frame is None or not self.frame.winfo_ismapped():
+                return False
+        except Exception:
+            # if mapping info isn't available, fall back to widget ancestry check
+            pass
+        try:
+            w = getattr(event, "widget", None)
+        except Exception:
+            w = None
+        while w is not None:
+            if w == self.frame:
+                return True
+            try:
+                w = w.master
+            except Exception:
+                break
+        return False
+
+    def _set_cb_var(self, pool_entry, value: bool):
+        """Set checkbox variable without triggering trace callbacks."""
+        try:
+            self._suppress_trace = True
+            pool_entry["cb_var"].set(bool(value))
+        finally:
+            self._suppress_trace = False
+
+    def _init_full_list_ui(self):
+        if self._full_frame is not None:
+            return
+        try:
+            self._full_frame = tk.Frame(self.canvas, bg=STRIPE_B)
+            self._full_window_id = self.canvas.create_window(
+                (0, 0), window=self._full_frame, anchor="nw"
+            )
+            # keep scrollregion in sync with content size
+            self._full_frame.bind(
+                "<Configure>",
+                lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            )
+        except Exception:
+            self._full_frame = None
+            self._full_window_id = None
+
+    def _tooltip_text_for_item(self, item: Dict[str, Any]) -> str:
+        category_type = item.get("categoryType") or item.get("category") or ""
+        cargo_info = item.get("cargo", "")
+        tip = (
+            f"Name: {item.get('displayName','')}\n"
+            f"Type: {item.get('type','').title()}\n"
+            f"Category: {category_type}\n"
+            f"Region: {REGION_NAME_MAP.get(item.get('region'), item.get('region_name') or item.get('region') or '')}\n"
+            f"Money: {item.get('money','')}\nXP: {item.get('xp','')}\n"
+        )
+        if category_type == "cargoDelivery":
+            tip += f"Cargo: {cargo_info}\n"
+        desc = item.get("desc", "")
+        if desc:
+            tip += f"\n{desc}"
+        return tip
+
+    def _show_tooltip_for_item(self, item: Dict[str, Any], event):
+        tip = self._tooltip_text_for_item(item)
+        if self._tip is None or not tk.Toplevel.winfo_exists(self._tip):
+            self._tip = tk.Toplevel(self.parent)
+            self._tip.wm_overrideredirect(True)
+            self._tip_label = tk.Label(
+                self._tip,
+                text=tip,
+                justify="left",
+                background="#fefecd",
+                relief="solid",
+                borderwidth=1,
+                wraplength=400
+            )
+            self._tip_label.pack(ipadx=4, ipady=3)
+        else:
+            self._tip_label.config(text=tip)
+        try:
+            x = event.x_root + 10
+            y = event.y_root + 10
+            self._tip.wm_geometry(f"+{x}+{y}")
+            self._tip.deiconify()
+        except Exception:
+            pass
+
+    def _clear_full_rows(self):
+        for r in self._full_rows:
+            try:
+                r["frame"].destroy()
+            except Exception:
+                pass
+        self._full_rows = []
+
+    def _render_full_list(self):
+        if self._full_frame is None:
+            self._init_full_list_ui()
+        if self._full_frame is None:
+            return
+        self._clear_full_rows()
+
+        for row_idx, real_idx in enumerate(self.filtered):
+            item = self.items[real_idx]
+            item_id = item.get("id")
+            color = STRIPE_A if (row_idx % 2 == 0) else STRIPE_B
+
+            f = tk.Frame(self._full_frame, height=self.row_height, bg=color, bd=0, highlightthickness=0)
+            f.pack(fill="x")
+            f.pack_propagate(False)
+
+            with self._lock:
+                if item_id in self.selected_changes and item_id not in self.session_locked:
+                    val = bool(self.selected_changes[item_id])
+                else:
+                    val = bool(item_id in self.original_checked)
+
+            cb_var = tk.BooleanVar(value=val)
+            style_name = "RowA.TCheckbutton" if color == STRIPE_A else "RowB.TCheckbutton"
+            cb = ttk.Checkbutton(f, variable=cb_var, style=style_name)
+            cb.pack(side="left", padx=6)
+
+            lbl = tk.Label(f, text=item.get("displayName", ""), anchor="w", bg=color, bd=0, highlightthickness=0)
+            lbl.pack(side="left", fill="x", expand=True, padx=(6, 6))
+
+            info = tk.Label(f, text="i", width=2, relief="ridge", bg=color, bd=1, highlightthickness=0)
+            info.pack(side="right", padx=6)
+
+            def _on_toggle(iid=item_id, var=cb_var):
+                with self._lock:
+                    self.selected_changes[iid] = bool(var.get())
+                log(f"Toggle -> id={iid} checked={self.selected_changes[iid]}")
+
+            if item_id in getattr(self, "session_locked", set()):
+                try:
+                    cb.configure(state="disabled")
+                except Exception:
+                    pass
+            else:
+                try:
+                    cb.configure(command=_on_toggle)
+                except Exception:
+                    pass
+
+            info.bind("<Enter>", lambda e, it=item: self._show_tooltip_for_item(it, e))
+            info.bind("<Leave>", lambda e: self._hide_tooltip())
+
+            self._full_rows.append({"frame": f, "cb": cb, "cb_var": cb_var, "item_id": item_id})
+
+        # ensure scrollregion is updated
+        try:
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        except Exception:
+            pass
+
+    # ---------------- status / refresh helpers ----------------
+    def _set_status(self, text: str) -> None:
+        try:
+            self.status_var.set(text)
+        except Exception:
+            pass
+
+    def _set_status_temp(self, text: str, ms: int = 2000) -> None:
+        self._set_status(text)
+        try:
+            if self._status_clear_after is not None and hasattr(self.parent, "after_cancel"):
+                try:
+                    self.parent.after_cancel(self._status_clear_after)
+                except Exception:
+                    pass
+            if hasattr(self.parent, "after"):
+                self._status_clear_after = self.parent.after(ms, lambda: self._set_status(""))
+        except Exception:
+            pass
+
+    def _set_loading_base(self, base_text: str) -> None:
+        self._loading_base = base_text
+        if self._loading_active:
+            dots = "." * (self._loading_phase % 4)
+            self._set_status(f"{self._loading_base}{dots}")
+
+    def _start_loading_animation(self, base_text: str) -> None:
+        self._loading_active = True
+        self._loading_phase = 0
+        self._loading_base = base_text
+        try:
+            if self._loading_anim_id is not None and hasattr(self.parent, "after_cancel"):
+                try:
+                    self.parent.after_cancel(self._loading_anim_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._tick_loading()
+
+    def _tick_loading(self) -> None:
+        if not self._loading_active:
+            return
+        dots = "." * (self._loading_phase % 4)
+        self._set_status(f"{self._loading_base}{dots}")
+        self._loading_phase += 1
+        try:
+            if hasattr(self.parent, "after"):
+                self._loading_anim_id = self.parent.after(400, self._tick_loading)
+        except Exception:
+            pass
+
+    def _stop_loading_animation(self, final_text: Optional[str] = None) -> None:
+        self._loading_active = False
+        try:
+            if self._loading_anim_id is not None and hasattr(self.parent, "after_cancel"):
+                try:
+                    self.parent.after_cancel(self._loading_anim_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self._loading_anim_id = None
+        if final_text is not None:
+            self._set_status(final_text)
+
+    def refresh_data_async(self) -> None:
+        if self._refresh_inflight:
+            return
+        self._refresh_inflight = True
+        base_text = "Fetching newer data" if self.items else "Fetching data"
+        self._start_loading_animation(base_text)
+        cache_csv = _objectives_cache_csv_path()
+
+        def worker():
+            built = False
+            try:
+                built = _mr_build_csv(cache_csv)
+            except Exception:
+                built = False
+
+            def finish():
+                self._refresh_inflight = False
+                self._stop_loading_animation()
+                if built or not self.items:
+                    # reload from cache/bundled without blocking
+                    self.load_data_thread(allow_build=False, preserve_changes=True, keep_existing_items=True)
+                if built:
+                    self._set_status_temp("Updated to latest data", 2000)
+                else:
+                    if self.items:
+                        self._set_status_temp("Update failed — using cached data", 3000)
+                    else:
+                        self._set_status_temp("No data available (offline)", 3000)
+
+            try:
+                if hasattr(self.parent, "after"):
+                    self.parent.after(0, finish)
+                else:
+                    finish()
+            except Exception:
+                finish()
+
+        threading.Thread(target=worker, daemon=True).start()
+
     # ---------------- UI builder ----------------
     def build_ui(self):
         # Build the actual UI. This must be called from main thread and after this object is instantiated.
@@ -2636,10 +5945,10 @@ class VirtualObjectivesFast:
 
         ttk.Button(self.topbar, text="Reload Save", command=self.reload_checked_from_save).pack(side="right", padx=4)
 
-        holder = tk.Frame(self.frame)
+        holder = tk.Frame(self.frame, bg=STRIPE_B)
         holder.pack(fill="both", expand=True, padx=6, pady=(0,6))
 
-        self.canvas = tk.Canvas(holder, highlightthickness=0)
+        self.canvas = tk.Canvas(holder, highlightthickness=0, bg=STRIPE_B, bd=0)
         vsb = ttk.Scrollbar(holder, orient="vertical", command=self._on_scrollbar)
         self.canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
@@ -2648,7 +5957,17 @@ class VirtualObjectivesFast:
         # capture sizes
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
-        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        # Mousewheel: bind globally but ignore events outside this tab
+        try:
+            self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+            # Linux/X11 wheel events
+            self.canvas.bind_all("<Button-4>", self._on_mousewheel, add="+")
+            self.canvas.bind_all("<Button-5>", self._on_mousewheel, add="+")
+        except Exception:
+            try:
+                self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+            except Exception:
+                pass
         
         bottom = ttk.Frame(self.frame)
         bottom.pack(side="bottom", fill="x", padx=6, pady=6)
@@ -2686,6 +6005,18 @@ class VirtualObjectivesFast:
         )
         read_btn.pack(side="left", padx=(0, 8))
 
+        # Status centered between left warning and right action buttons
+        self.status_label = ttk.Label(
+            bottom,
+            textvariable=self.status_var,
+            foreground="red",
+            width=36,
+            anchor="center",
+            justify="center",
+            font=("TkFixedFont", 9)
+        )
+        self.status_label.pack(side="left", padx=(8, 8), expand=True, fill="x")
+
         ttk.Button(bottom, text="Check filtered", command=self.check_filtered).pack(side="right", padx=4)
         ttk.Button(bottom, text="Uncheck filtered", command=self.uncheck_filtered).pack(side="right", padx=4)
         ttk.Button(bottom, text="Apply Changes", command=self.apply_changes_thread).pack(side="right")
@@ -2700,17 +6031,75 @@ class VirtualObjectivesFast:
             self.canvas_height = event.height
             changed = True
         if changed and self.items:
-            log(f"Canvas resized -> width={self.canvas_width}, height={self.canvas_height}")
-            self._ensure_pool()
+            if DEBUG and DEBUG_OBJECTIVES_SCROLL:
+                log(f"Canvas resized -> width={self.canvas_width}, height={self.canvas_height}")
+            if self._virtualize:
+                self._ensure_pool()
+            else:
+                try:
+                    if self._full_window_id is not None:
+                        self.canvas.itemconfig(self._full_window_id, width=self.canvas_width)
+                except Exception:
+                    pass
 
     def _on_mousewheel(self, event):
-        delta = int(-1*(event.delta/120))
-        self.canvas.yview_scroll(delta, "units")
-        self._update_visible_rows()
+        # Ignore wheel events that aren't over this Objectives+ tab
+        if not self._event_in_objectives(event):
+            return
+        try:
+            delta = 0
+            if hasattr(event, "delta") and event.delta:
+                # Windows / MacOS
+                delta = int(-1 * (event.delta / 120))
+                if delta == 0:
+                    delta = -1 if event.delta < 0 else 1
+            elif hasattr(event, "num"):
+                # Linux / X11
+                if event.num == 4:
+                    delta = -1
+                elif event.num == 5:
+                    delta = 1
+            if delta == 0:
+                return
+            self.canvas.yview_scroll(delta, "units")
+            self._schedule_scroll_update()
+        except Exception:
+            # fail silently on unexpected event shapes
+            return
 
     def _on_scrollbar(self, *args):
         self.canvas.yview(*args)
-        self._update_visible_rows()
+        self._schedule_scroll_update()
+
+    def _schedule_scroll_update(self):
+        """Lightweight updates while scrolling; full refresh after idle."""
+        # Light update immediately
+        try:
+            self._scrolling = True
+            self._update_visible_rows(light=True)
+        except Exception:
+            pass
+        # Debounce full refresh
+        try:
+            if self._scroll_idle_after is not None and hasattr(self.parent, "after_cancel"):
+                try:
+                    self.parent.after_cancel(self._scroll_idle_after)
+                except Exception:
+                    pass
+            if hasattr(self.parent, "after"):
+                self._scroll_idle_after = self.parent.after(80, self._on_scroll_idle)
+        except Exception:
+            pass
+
+    def _on_scroll_idle(self):
+        self._scrolling = False
+        try:
+            # Force a full refresh to sync checkbox states and commands
+            self._update_visible_rows(light=False, force_full=True)
+            self._refresh_visible_checkbox_vars(force=True)
+            self._needs_full_refresh = False
+        except Exception:
+            pass
 
     def _watch_save_var(self):
         try:
@@ -2731,13 +6120,16 @@ class VirtualObjectivesFast:
             pass
 
     def _ensure_pool(self):
+        if not self._virtualize:
+            return
         visible_rows = max(1, int(self.canvas_height / self.row_height))
         desired_pool = min(len(self.filtered), visible_rows + self.buffer_rows)
         if desired_pool == 0:
             desired_pool = min(10, max(1, visible_rows + self.buffer_rows))
 
         if not self.pool_initialized or desired_pool != self.pool_size:
-            log(f"Creating/resizing pool: old={self.pool_size}, new={desired_pool} (filtered={len(self.filtered)})")
+            if DEBUG and DEBUG_OBJECTIVES_SCROLL:
+                log(f"Creating/resizing pool: old={self.pool_size}, new={desired_pool} (filtered={len(self.filtered)})")
             for p in self.pool:
                 try:
                     self.canvas.delete(p["window_id"])
@@ -2747,16 +6139,16 @@ class VirtualObjectivesFast:
 
             self.pool_size = desired_pool
             for i in range(self.pool_size):
-                f = tk.Frame(self.canvas, height=self.row_height, bg=STRIPE_A)
+                f = tk.Frame(self.canvas, height=self.row_height, bg=STRIPE_A, bd=0, highlightthickness=0, relief="flat")
                 f.pack_propagate(False)
 
                 cb_var = tk.BooleanVar(value=False)
                 cb = ttk.Checkbutton(f, variable=cb_var, style="RowA.TCheckbutton")
                 cb.pack(side="left", padx=6)
 
-                lbl = tk.Label(f, text="", anchor="w", bg=STRIPE_A)
+                lbl = tk.Label(f, text="", anchor="w", bg=STRIPE_A, bd=0, highlightthickness=0)
                 lbl.pack(side="left", fill="x", expand=True, padx=(6,6))
-                info = tk.Label(f, text="i", width=2, relief="ridge", bg=STRIPE_A)
+                info = tk.Label(f, text="i", width=2, relief="ridge", bg=STRIPE_A, bd=1, highlightthickness=0)
                 info.pack(side="right", padx=6)
 
                 def enter(e, pool_index=i):
@@ -2767,7 +6159,13 @@ class VirtualObjectivesFast:
                 info.bind("<Enter>", enter)
                 info.bind("<Leave>", leave)
 
-                window_id = self.canvas.create_window((0, 0), window=f, anchor="nw", width=self.canvas_width)
+                window_id = self.canvas.create_window(
+                    (0, 0),
+                    window=f,
+                    anchor="nw",
+                    width=self.canvas_width,
+                    height=self.row_height
+                )
 
                 p = {
                     "frame": f,
@@ -2786,7 +6184,9 @@ class VirtualObjectivesFast:
         self.canvas.configure(scrollregion=(0, 0, self.canvas_width, max(total_h, self.canvas_height)))
         self._update_visible_rows()
 
-    def _update_visible_rows(self):
+    def _update_visible_rows(self, light: bool = False, force_full: bool = False):
+        if not self._virtualize:
+            return
         if not self.pool_initialized or not self.filtered:
             if self.pool_initialized:
                 for p in self.pool:
@@ -2801,7 +6201,8 @@ class VirtualObjectivesFast:
         visible_rows_count = max(1, int(self.canvas_height / self.row_height))
         if first_visible != self._last_first_visible:
             self._last_first_visible = first_visible
-            log(f"Viewport first_visible={first_visible} visible_rows={visible_rows_count} (filtered_total={len(self.filtered)})")
+            if DEBUG and DEBUG_OBJECTIVES_SCROLL:
+                log(f"Viewport first_visible={first_visible} visible_rows={visible_rows_count} (filtered_total={len(self.filtered)})")
 
         for pool_pos, p in enumerate(self.pool):
             item_idx = first_visible + pool_pos
@@ -2811,21 +6212,22 @@ class VirtualObjectivesFast:
                 except Exception:
                     pass
                 p["item_index"] = None
-                try:
-                    if "_trace_ids" in p:
-                        for tid in p["_trace_ids"]:
+                if not light:
+                    try:
+                        if "_trace_ids" in p:
+                            for tid in p["_trace_ids"]:
+                                try:
+                                    p["cb_var"].trace_remove("write", tid)
+                                except Exception:
+                                    pass
+                            p["_trace_ids"] = []
+                        if p.get("cb"):
                             try:
-                                p["cb_var"].trace_remove("write", tid)
+                                p["cb"].configure(command=lambda: None)
                             except Exception:
                                 pass
-                        p["_trace_ids"] = []
-                    if p.get("cb"):
-                        try:
-                            p["cb"].configure(command=lambda: None)
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
                 continue
 
             try:
@@ -2836,11 +6238,11 @@ class VirtualObjectivesFast:
             y = item_idx * self.row_height
             try:
                 self.canvas.coords(p["window_id"], 0, y)
-                self.canvas.itemconfig(p["window_id"], width=self.canvas_width)
+                self.canvas.itemconfig(p["window_id"], width=self.canvas_width, height=self.row_height)
             except Exception:
                 pass
 
-            if p.get("item_index") != item_idx:
+            if force_full or p.get("item_index") != item_idx:
                 real_idx = self.filtered[item_idx]
                 item = self.items[real_idx]
                 item_id = item.get("id")
@@ -2850,104 +6252,35 @@ class VirtualObjectivesFast:
                 except Exception:
                     pass
 
-                with self._lock:
-                    if item_id in self.selected_changes and item_id not in getattr(self, "session_locked", set()):
-                        val = bool(self.selected_changes[item_id])
-                    else:
-                        val = bool(item_id in self.original_checked)
+                # Only update checkbox state/handlers when not in light (scrolling) mode
+                if not light:
+                    with self._lock:
+                        if item_id in self.selected_changes and item_id not in getattr(self, "session_locked", set()):
+                            val = bool(self.selected_changes[item_id])
+                        else:
+                            val = bool(item_id in self.original_checked)
 
-                try:
-                    p["cb_var"].set(val)
-                except Exception:
-                    pass
-
-                try:
-                    if "_trace_ids" in p:
-                        for tid in p["_trace_ids"]:
-                            try:
-                                p["cb_var"].trace_remove("write", tid)
-                            except Exception:
-                                pass
-                        p["_trace_ids"] = []
                     try:
-                        p["cb"].configure(command=lambda: None)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-                try:
-                    cb_widget = p.get("cb")
-                    if item_id in getattr(self, "session_locked", set()):
+                        if "_trace_ids" in p:
+                            for tid in p["_trace_ids"]:
+                                try:
+                                    p["cb_var"].trace_remove("write", tid)
+                                except Exception:
+                                    pass
+                            p["_trace_ids"] = []
                         try:
-                            if hasattr(cb_widget, "state"):
-                                cb_widget.state(("disabled",))
-                            else:
-                                cb_widget.configure(state="disabled")
-                        except Exception:
-                            try:
-                                cb_widget.configure(state="disabled")
-                            except Exception:
-                                pass
-                        try:
-                            cb_widget.configure(command=lambda: None)
+                            p["cb"].configure(command=lambda: None)
                         except Exception:
                             pass
-                    else:
-                        def on_toggle(iid=item_id, var=p["cb_var"]):
-                            with self._lock:
-                                self.selected_changes[iid] = bool(var.get())
-                            log(f"Toggle -> id={iid} checked={self.selected_changes[iid]}")
-                        try:
-                            cb_widget.configure(command=on_toggle)
-                        except Exception:
-                            try:
-                                def _trace(*a, var=p["cb_var"], iid=item_id):
-                                    with self._lock:
-                                        self.selected_changes[iid] = bool(var.get())
-                                    log(f"Toggle(trace) -> id={iid} checked={self.selected_changes[iid]}")
-                                tid = p["cb_var"].trace_add("write", _trace)
-                                if "_trace_ids" not in p:
-                                    p["_trace_ids"] = []
-                                p["_trace_ids"].append(tid)
-                            except Exception:
-                                pass
-                        try:
-                            if hasattr(cb_widget, "state"):
-                                cb_widget.state(("!disabled",))
-                            else:
-                                cb_widget.configure(state="normal")
-                        except Exception:
-                            try:
-                                cb_widget.configure(state="normal")
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-                p["item_index"] = item_idx
-                p["frame"]._tip_payload = item
-
-                color = STRIPE_A if (item_idx % 2 == 0) else STRIPE_B
-                try:
-                    p["frame"].config(bg=color)
-                    p["label"].config(bg=color)
-                    p["info"].config(bg=color)
-                    style_name = "RowA.TCheckbutton" if color == STRIPE_A else "RowB.TCheckbutton"
-                    try:
-                        p["cb"].configure(style=style_name)
                     except Exception:
                         pass
                     try:
-                        p["cb"].config(background=color)
+                        self._set_cb_var(p, val)
                     except Exception:
                         pass
-                except Exception:
-                    pass
 
-                try:
-                    cb_widget = p.get("cb")
-                    if cb_widget:
+                    try:
+                        cb_widget = p.get("cb")
                         if item_id in getattr(self, "session_locked", set()):
                             try:
                                 if hasattr(cb_widget, "state"):
@@ -2959,7 +6292,31 @@ class VirtualObjectivesFast:
                                     cb_widget.configure(state="disabled")
                                 except Exception:
                                     pass
+                            try:
+                                cb_widget.configure(command=lambda: None)
+                            except Exception:
+                                pass
                         else:
+                            def on_toggle(iid=item_id, var=p["cb_var"]):
+                                with self._lock:
+                                    self.selected_changes[iid] = bool(var.get())
+                                log(f"Toggle -> id={iid} checked={self.selected_changes[iid]}")
+                            try:
+                                cb_widget.configure(command=on_toggle)
+                            except Exception:
+                                try:
+                                    def _trace(*a, var=p["cb_var"], iid=item_id):
+                                        if getattr(self, "_suppress_trace", False):
+                                            return
+                                        with self._lock:
+                                            self.selected_changes[iid] = bool(var.get())
+                                        log(f"Toggle(trace) -> id={iid} checked={self.selected_changes[iid]}")
+                                    tid = p["cb_var"].trace_add("write", _trace)
+                                    if "_trace_ids" not in p:
+                                        p["_trace_ids"] = []
+                                    p["_trace_ids"].append(tid)
+                                except Exception:
+                                    pass
                             try:
                                 if hasattr(cb_widget, "state"):
                                     cb_widget.state(("!disabled",))
@@ -2970,20 +6327,98 @@ class VirtualObjectivesFast:
                                     cb_widget.configure(state="normal")
                                 except Exception:
                                     pass
-                        try:
-                            cb_widget.update_idletasks()
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
+
+                p["item_index"] = item_idx
+                p["frame"]._tip_payload = item
+
+                color = STRIPE_A if (item_idx % 2 == 0) else STRIPE_B
+                try:
+                    p["frame"].config(bg=color)
+                    p["label"].config(bg=color)
+                    p["info"].config(bg=color)
+                    # ttk or tk checkbutton: try both style and tk colors
+                    style_name = "RowA.TCheckbutton" if color == STRIPE_A else "RowB.TCheckbutton"
+                    try:
+                        p["cb"].configure(style=style_name)
+                    except Exception:
+                        pass
+                    try:
+                        p["cb"].config(background=color, bg=color, activebackground=color, selectcolor=color)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
-                if DEBUG:
+                if not light:
+                    try:
+                        cb_widget = p.get("cb")
+                        if cb_widget:
+                            if item_id in getattr(self, "session_locked", set()):
+                                try:
+                                    if hasattr(cb_widget, "state"):
+                                        cb_widget.state(("disabled",))
+                                    else:
+                                        cb_widget.configure(state="disabled")
+                                except Exception:
+                                    try:
+                                        cb_widget.configure(state="disabled")
+                                    except Exception:
+                                        pass
+                            else:
+                                try:
+                                    if hasattr(cb_widget, "state"):
+                                        cb_widget.state(("!disabled",))
+                                    else:
+                                        cb_widget.configure(state="normal")
+                                except Exception:
+                                    try:
+                                        cb_widget.configure(state="normal")
+                                    except Exception:
+                                        pass
+                            try:
+                                cb_widget.update_idletasks()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                if DEBUG and DEBUG_OBJECTIVES_SCROLL:
                     log(f"Assigned pool_pos={pool_pos} -> item_idx={item_idx} (real_idx={real_idx}) id={item['id']} name={item.get('displayName')}")
-                if item_idx >= len(self.filtered) - (visible_rows_count + 2):
-                    log(f"Near end of filtered list (pos {item_idx} / {len(self.filtered)})")
+                    if item_idx >= len(self.filtered) - (visible_rows_count + 2):
+                        log(f"Near end of filtered list (pos {item_idx} / {len(self.filtered)})")
+
+        if light:
+            self._needs_full_refresh = True
 
     # ---------------- refresh visible checkbox vars ----------------
     def _refresh_visible_checkbox_vars(self, force=False):
+        if not self._virtualize:
+            # Update all rows in full list mode
+            for r in self._full_rows:
+                item_id = r.get("item_id")
+                if not item_id:
+                    continue
+                with self._lock:
+                    if item_id in self.selected_changes and item_id not in self.session_locked:
+                        val = self.selected_changes[item_id]
+                    else:
+                        val = (item_id in self.original_checked)
+                try:
+                    r["cb_var"].set(bool(val))
+                except Exception:
+                    pass
+                try:
+                    cb_widget = r.get("cb")
+                    if cb_widget:
+                        if item_id in self.session_locked:
+                            cb_widget.configure(state="disabled")
+                        else:
+                            cb_widget.configure(state="normal")
+                except Exception:
+                    pass
+            return
         if not self.pool_initialized:
             return
         updated = 0
@@ -3004,7 +6439,7 @@ class VirtualObjectivesFast:
                     val = (item_id in self.original_checked)
 
                 if force or bool(p["cb_var"].get()) != bool(val):
-                    p["cb_var"].set(bool(val))
+                    self._set_cb_var(p, bool(val))
                     updated += 1
 
                 try:
@@ -3039,35 +6474,7 @@ class VirtualObjectivesFast:
             return
         real_idx = self.filtered[item_idx]
         item = self.items[real_idx]
-        category_type = item.get("categoryType") or item.get("category") or ""
-        cargo_info = item.get("cargo", "")
-        tip = (
-            f"Name: {item.get('displayName','')}\n"
-            f"Type: {item.get('type','').title()}\n"
-            f"Category: {category_type}\n"
-            f"Region: {REGION_NAME_MAP.get(item.get('region'), item.get('region_name') or item.get('region') or '')}\n"
-            f"Money: {item.get('money','')}\nXP: {item.get('xp','')}\n"
-        )
-        if category_type == "cargoDelivery":
-            tip += f"Cargo: {cargo_info}\n"
-        desc = item.get("desc", "")
-        if desc:
-            tip += f"\n{desc}"
-
-        if self._tip is None or not tk.Toplevel.winfo_exists(self._tip):
-            self._tip = tk.Toplevel(self.parent)
-            self._tip.wm_overrideredirect(True)
-            self._tip_label = tk.Label(self._tip, text=tip, justify="left", background="#fefecd", relief="solid", borderwidth=1, wraplength=400)
-            self._tip_label.pack(ipadx=4, ipady=3)
-        else:
-            self._tip_label.config(text=tip)
-        try:
-            x = event.x_root + 10
-            y = event.y_root + 10
-            self._tip.wm_geometry(f"+{x}+{y}")
-            self._tip.deiconify()
-        except Exception:
-            pass
+        self._show_tooltip_for_item(item, event)
 
     def _hide_tooltip(self):
         if self._tip is not None and tk.Toplevel.winfo_exists(self._tip):
@@ -3077,17 +6484,19 @@ class VirtualObjectivesFast:
                 pass
 
     # ---------------- data loading & filtering ----------------
-    def load_data_thread(self):
-        self.items = []
-        self.filtered = []
-        self.original_checked = set()
-        self.session_locked = set()
-        self.selected_changes = {}
+    def load_data_thread(self, allow_build: bool = True, preserve_changes: bool = False, keep_existing_items: bool = False):
+        if not keep_existing_items:
+            self.items = []
+            self.filtered = []
+            self.original_checked = set()
+            self.session_locked = set()
+        if not preserve_changes:
+            self.selected_changes = {}
 
         def worker():
             log("Worker: starting data processing thread")
             tstart = time.perf_counter()
-            df = _load_parquet_safe()
+            df = _load_parquet_safe(allow_build=allow_build)
             if df is None or (hasattr(df, "empty") and df.empty):
                 log("No data in parquet or failed to read.")
                 return
@@ -3153,6 +6562,23 @@ class VirtualObjectivesFast:
                 self.items = all_items
                 self.original_checked = pre
                 self.session_locked = set(pre)
+                if preserve_changes:
+                    try:
+                        valid_ids = {it.get("id") for it in all_items if it.get("id")}
+                        with self._lock:
+                            self.selected_changes = {k: v for k, v in self.selected_changes.items() if k in valid_ids}
+                    except Exception:
+                        pass
+                else:
+                    with self._lock:
+                        self.selected_changes = {}
+                # Decide whether to virtualize based on item count
+                try:
+                    self._virtualize = len(all_items) > OBJECTIVES_VIRTUAL_THRESHOLD
+                except Exception:
+                    self._virtualize = True
+                if not self._virtualize:
+                    self._init_full_list_ui()
 
                 regs = sorted({
                     REGION_NAME_MAP.get(it.get("region"), it.get("region_name") or it.get("region") or "")
@@ -3161,6 +6587,12 @@ class VirtualObjectivesFast:
                 for child in (self.topbar.winfo_children() if self.topbar else []):
                     if isinstance(child, ttk.Combobox) and child.cget("width") == 20:
                         child.config(values=[""] + [r for r in regs if r])
+                try:
+                    if self._loading_active and self.items:
+                        if self._loading_base.lower().startswith("fetching data"):
+                            self._set_loading_base("Fetching newer data")
+                except Exception:
+                    pass
                 log(f"Scheduling finish: items={len(self.items)} original_checked={len(self.original_checked)})")
                 self.apply_filters()
             try:
@@ -3199,18 +6631,21 @@ class VirtualObjectivesFast:
         self.filtered = results
         log(f"Filtering result count: {len(self.filtered)})")
 
-        if self.pool_initialized:
-            for p in self.pool:
-                p["item_index"] = None
+        if self._virtualize:
+            if self.pool_initialized:
+                for p in self.pool:
+                    p["item_index"] = None
 
-        total_h = len(self.filtered) * self.row_height
-        if self.canvas:
-            try:
-                self.canvas.configure(scrollregion=(0, 0, self.canvas_width, max(total_h, self.canvas_height)))
-            except Exception:
-                pass
-        self._ensure_pool()
-        self._refresh_visible_checkbox_vars()
+            total_h = len(self.filtered) * self.row_height
+            if self.canvas:
+                try:
+                    self.canvas.configure(scrollregion=(0, 0, self.canvas_width, max(total_h, self.canvas_height)))
+                except Exception:
+                    pass
+            self._ensure_pool()
+            self._refresh_visible_checkbox_vars()
+        else:
+            self._render_full_list()
 
     # ---------------- bulk check/uncheck ----------------
     def check_filtered(self):
@@ -3458,105 +6893,22 @@ class VirtualObjectivesFast:
         log(f"Reloaded save: original_checked={len(self.original_checked)}")
         self._refresh_visible_checkbox_vars(force=True)
         self._update_visible_rows()
+        if not self._virtualize:
+            # refresh full list to reflect locked/checked states
+            try:
+                self._render_full_list()
+            except Exception:
+                pass
 
-def _decode_save_timestamp_hex(hex_str):
-    try:
-        # accept either a '0x...' string or a plain integer
-        if isinstance(hex_str, str) and hex_str.lower().startswith("0x"):
-            v = int(hex_str, 16)
-        else:
-            v = int(hex_str)
-    except Exception:
-        return ""
+# -----------------------------------------------------------------------------
+# END SECTION: Objectives+ Data, Logging, and Virtualized UI
+# -----------------------------------------------------------------------------
 
-    try:
-        # Decide whether value is milliseconds or seconds
-        if v >= 10**12:
-            ts = v / 1000.0       # milliseconds -> seconds float
-        elif v >= 10**10:
-            ts = float(v)         # seconds
-        else:
-            # small/unexpected value — fall back to numeric representation
-            return str(v)
-
-        # Use local time (datetime.fromtimestamp) and format as requested:
-        dt = datetime.fromtimestamp(ts)
-        # Format: day.month. space year space HH:MM:SS  (24-hour)
-        return dt.strftime("%d.%m. %Y %H:%M:%S")
-
-    except Exception:
-        # If conversion fails, return the numeric for debugging
-        return str(v)
-
-    
-def extract_save_timestamp_from_file(path):
-    try:
-        raw = open(path, "rb").read()
-    except Exception:
-        return (None, "")
-
-    # ----- 1) Search decoded-as-latin1 (preserves bytes) for quoted or unquoted patterns -----
-    txt = raw.decode("latin1")  # avoids drops; keeps 1:1 byte->codepoint mapping
-    # try quoted "timestamp":"0x..."
-    m = re.search(r'"saveTime"\s*:\s*\{\s*"timestamp"\s*:\s*"(0x[0-9A-Fa-f]{8,20})"', txt)
-    if m:
-        hx = m.group(1)
-        return (hx, _decode_save_timestamp_hex(hx))
-    # try unquoted "timestamp":0x...
-    m = re.search(r'"saveTime"\s*:\s*\{\s*"timestamp"\s*:\s*(0x[0-9A-Fa-f]{8,20})', txt)
-    if m:
-        hx = m.group(1)
-        return (hx, _decode_save_timestamp_hex(hx))
-
-    # ----- 2) If not found, try to find inside zlib-compressed blocks -----
-    # common zlib stream starts with 0x78
-    for off in (i for i, b in enumerate(raw) if b == 0x78):
-        try:
-            dec = zlib.decompress(raw[off:])
-            if not dec:
-                continue
-            s = dec.decode("utf-8", errors="ignore")
-            m = re.search(r'"saveTime"\s*:\s*\{\s*"timestamp"\s*:\s*"(0x[0-9A-Fa-f]{8,20})"', s)
-            if m:
-                hx = m.group(1)
-                return (hx, _decode_save_timestamp_hex(hx))
-            m = re.search(r'"saveTime"\s*:\s*\{\s*"timestamp"\s*:\s*(0x[0-9A-Fa-f]{8,20})', s)
-            if m:
-                hx = m.group(1)
-                return (hx, _decode_save_timestamp_hex(hx))
-        except Exception:
-            # if decompression fails, just continue
-            continue
-
-    # ----- 3) Fallback: find any 0x... hex and pick the one that makes sense (year 1970-2100) -----
-    hexes = re.findall(r'0x[0-9A-Fa-f]{8,20}', txt)
-    if not hexes:
-        # also attempt on raw bytes as hex string (latin1 already used)
-        hexes = re.findall(r'0x[0-9A-Fa-f]{8,20}', raw.hex())
-    best = None
-    for hx in hexes:
-        try:
-            v = int(hx, 16)
-            # try milliseconds -> dt
-            if v >= 10**12:
-                dt = datetime.datetime.fromtimestamp(v/1000.0)
-            elif v >= 10**10:
-                dt = datetime.datetime.fromtimestamp(v)
-            else:
-                continue
-            if 1970 <= dt.year <= 2100:
-                # pick the first plausible one (you can prefer newest by comparing dt)
-                best = (hx, dt.strftime("%Y-%m-%d %H:%M:%S"))
-                break
-        except Exception:
-            continue
-
-    if best:
-        return best
-
-    # nothing found
-    return (None, "")
-
+# =============================================================================
+# SECTION: Tab Builders (UI construction)
+# Used In: launch_gui -> Notebook tabs
+# =============================================================================
+# TAB: Backups (launch_gui -> tab_backups)
 def create_backups_tab(tab_backups, save_path_var):
     """
     Backups tab: lists backup folders -> clicking a folder lists CompleteSave*.cfg/.dat
@@ -4101,6 +7453,7 @@ def create_backups_tab(tab_backups, save_path_var):
 
 # ───────────────────────────────────
 
+# TAB: Objectives+ (launch_gui -> tab_objectives)
 def create_objectives_tab(tab, save_path_var):
     """
     Mounts the VirtualObjectivesFast into the provided `tab`.
@@ -4124,7 +7477,10 @@ def create_objectives_tab(tab, save_path_var):
             pass
 
         try:
-            v.load_data_thread()
+            # Quick load from cached/bundled CSV first (no blocking build)
+            v.load_data_thread(allow_build=False, preserve_changes=False, keep_existing_items=False)
+            # Kick off background refresh to fetch newer data
+            v.refresh_data_async()
         except Exception as e:
             try:
                 messagebox.showwarning("Objectives+ loader error", f"Failed to start data loader:\n{e}")
@@ -4153,36 +7509,87 @@ def create_objectives_tab(tab, save_path_var):
             # If we can't even import tkinter for the fallback, do nothing (import-safety preserved).
             log(f"Failed to initialize Objectives+ fallback placeholder: {e}")
 __all__ = ["VirtualObjectivesFast", "create_objectives_tab", "default_parquet_path", "DEBUG"]
-def create_contest_tab(tab, save_path_var):
 
+# UI helper: "Check All" for groups of IntVar checkboxes
+def _add_check_all_checkbox(tab, all_vars, before_widget=None, label="Check All"):
+    guard = {"busy": False}
+    check_all_var = tk.IntVar(value=0)
+
+    def set_all():
+        if guard["busy"]:
+            return
+        guard["busy"] = True
+        try:
+            val = 1 if check_all_var.get() else 0
+            for v in all_vars:
+                try:
+                    v.set(val)
+                except Exception:
+                    pass
+        finally:
+            guard["busy"] = False
+
+    def sync_all(*_):
+        if guard["busy"]:
+            return
+        guard["busy"] = True
+        try:
+            if not all_vars:
+                all_on = False
+            else:
+                all_on = True
+                for v in all_vars:
+                    try:
+                        if not v.get():
+                            all_on = False
+                            break
+                    except Exception:
+                        all_on = False
+                        break
+            check_all_var.set(1 if all_on else 0)
+        finally:
+            guard["busy"] = False
+
+    cb = ttk.Checkbutton(tab, text=label, variable=check_all_var, command=set_all)
+    pack_kwargs = {"anchor": "center", "pady": (5, 0)}
+    if before_widget is not None:
+        pack_kwargs["before"] = before_widget
+    cb.pack(**pack_kwargs)
+
+    for v in all_vars:
+        try:
+            v.trace_add("write", sync_all)
+        except Exception:
+            try:
+                v.trace("w", sync_all)
+            except Exception:
+                pass
+
+    # Ensure initial state matches current selections
+    sync_all()
+    return check_all_var
+
+# UI helper: shared season/base-map selector used by multiple tabs
+def _build_region_selector(
+    tab,
+    seasons,
+    base_maps,
+    other_var=None,
+    other_label="Other Season number (e.g. 18, 19, 20)",
+    base_maps_label="Base Maps:",
+    base_maps_label_font=None,
+    season_pady=(0, 10),
+    base_maps_label_pady=(5, 0),
+):
     season_vars = []
     map_vars = []
-    other_season_var = tk.StringVar()
+    all_check_vars = []
 
-    seasons = [
-        "Season 1: Search & Recover (Kola Peninsula)",
-        "Season 2: Explore & Expand (Yukon)",
-        "Season 3: Locate & Deliver (Wisconsin)",
-        "Season 4: New Frontiers (Amur)",
-        "Season 5: Build & Dispatch (Don)",
-        "Season 6: Haul & Hustle (Maine)",
-        "Season 7: Compete & Conquer (Tennessee)",
-        "Season 8: Grand Harvest (Glades)",
-        "Season 9: Renew & Rebuild (Ontario)",
-        "Season 10: Fix & Connect (British Columbia)",
-        "Season 11: Lights & Cameras (Scandinavia)",
-        "Season 12: Public Energy (North Carolina)",
-        "Season 13: Dig & Drill (Almaty)",
-        "Season 14: Reap & Sow (Austria)",
-        "Season 15: Oil & Dirt (Quebec)",
-        "Season 16: High Voltage (Washington)",
-        "Season 17: Repair & Rescue (Zurdania)"
-    ]
-
-    maps = [("Michigan", "US_01"), ("Alaska", "US_02"), ("Taymyr", "RU_02")]
+    if other_var is None:
+        other_var = tk.StringVar()
 
     season_frame = ttk.Frame(tab)
-    season_frame.pack(pady=5)
+    season_frame.pack(pady=season_pady)
 
     left_column = ttk.Frame(season_frame)
     left_column.pack(side="left", padx=10, anchor="n")
@@ -4190,36 +7597,159 @@ def create_contest_tab(tab, save_path_var):
     right_column = ttk.Frame(season_frame)
     right_column.pack(side="left", padx=10, anchor="n")
 
-    for i, name in enumerate(seasons, 1):
+    for idx, (label, value) in enumerate(seasons, start=1):
         var = tk.IntVar()
-        season_vars.append((i, var))
-        column = left_column if i <= len(seasons) / 2 else right_column
-        ttk.Checkbutton(column, text=name, variable=var).pack(anchor="w", pady=2)
+        column = left_column if idx <= len(seasons) / 2 else right_column
+        cb = ttk.Checkbutton(column, text=label, variable=var)
+        cb.pack(anchor="w", pady=2)
+        season_vars.append((value, var))
+        all_check_vars.append(var)
 
-    ttk.Label(tab, text="Other Season number (e.g. 18, 19, 20)").pack()
-    ttk.Entry(tab, textvariable=other_season_var).pack(pady=5)
+    ttk.Label(tab, text=other_label).pack(pady=5)
+    ttk.Entry(tab, textvariable=other_var).pack(pady=5)
 
-    ttk.Label(tab, text="Base Maps:").pack()
+    if base_maps_label_font is not None:
+        ttk.Label(tab, text=base_maps_label, font=base_maps_label_font).pack(pady=base_maps_label_pady)
+    else:
+        ttk.Label(tab, text=base_maps_label).pack(pady=base_maps_label_pady)
+
     map_frame = ttk.Frame(tab)
-    map_frame.pack()
-    for name, code in maps:
+    map_frame.pack(anchor="center", pady=5)
+
+    for label, value in base_maps:
         var = tk.IntVar()
-        ttk.Checkbutton(map_frame, text=name, variable=var).pack(anchor="w")
-        map_vars.append((code, var))
+        cb = ttk.Checkbutton(map_frame, text=label, variable=var)
+        cb.pack(anchor="w")
+        map_vars.append((value, var))
+        all_check_vars.append(var)
+
+    return {
+        "season_vars": season_vars,
+        "map_vars": map_vars,
+        "all_check_vars": all_check_vars,
+        "other_var": other_var,
+        "season_frame": season_frame,
+        "map_frame": map_frame,
+    }
+
+def _collect_checked_values(pairs):
+    return [value for value, var in pairs if bool(var.get())]
+
+def _append_other_season_int(selected, other_var):
+    try:
+        if other_var is not None and other_var.get().isdigit():
+            selected.append(int(other_var.get()))
+    except Exception:
+        pass
+
+def _append_other_region_code(selected, other_var):
+    try:
+        if other_var is not None and other_var.get().isdigit():
+            selected.append(f"US_{int(other_var.get()):02}")
+    except Exception:
+        pass
+
+def _collect_selected_regions(season_vars, map_vars, other_var=None):
+    selected = _collect_checked_values(season_vars)
+    selected += _collect_checked_values(map_vars)
+    _append_other_region_code(selected, other_var)
+    return selected
+
+def _load_common_ssl_path_from_config():
+    try:
+        cfg = load_config()
+        return cfg.get("common_ssl_path", "") if isinstance(cfg, dict) else ""
+    except Exception:
+        return ""
+
+def _save_common_ssl_path_to_config(path):
+    try:
+        cfg = load_config() or {}
+        cfg["common_ssl_path"] = path
+        save_config(cfg)
+    except Exception:
+        pass
+
+def _find_common_ssl_save_in_folder(folder, allow_json=True):
+    if not folder or not os.path.isdir(folder):
+        return None
+    exts = (".cfg", ".dat", ".json") if allow_json else (".cfg", ".dat")
+    # prefer exact commonsslsave filenames
+    preferred = ("commonsslsave.cfg", "commonsslsave.dat", "common_ssl_save.cfg", "common_ssl_save.dat")
+    candidates = []
+    try:
+        for fname in os.listdir(folder):
+            low = fname.lower()
+            if low in preferred:
+                candidates.append(os.path.join(folder, fname))
+        if not candidates:
+            for fname in os.listdir(folder):
+                low = fname.lower()
+                if "common" in low and "ssl" in low and low.endswith(exts):
+                    candidates.append(os.path.join(folder, fname))
+    except Exception:
+        return None
+    return candidates[0] if candidates else None
+
+def _pick_common_ssl_file(save_path_var, allow_json=True):
+    startdir = os.path.dirname(save_path_var.get()) if save_path_var.get() else os.getcwd()
+    if allow_json:
+        filetypes = [("CommonSslSave", "*.cfg *.dat *.json"), ("All files", "*.*")]
+    else:
+        filetypes = [("CommonSslSave", "*.cfg *.dat"), ("All files", "*.*")]
+    return filedialog.askopenfilename(initialdir=startdir, filetypes=filetypes)
+
+def _sync_common_ssl_from_save(main_save_path, target_var, on_load, allow_json=True):
+    try:
+        if not main_save_path or not os.path.exists(main_save_path):
+            return False
+        folder = os.path.dirname(main_save_path)
+        chosen = _find_common_ssl_save_in_folder(folder, allow_json=allow_json)
+        if chosen:
+            target_var.set(chosen)
+            try:
+                on_load(chosen)
+            except Exception:
+                pass
+            _save_common_ssl_path_to_config(chosen)
+            return True
+    except Exception:
+        pass
+    return False
+
+def _trace_var_write(var, callback):
+    try:
+        var.trace_add("write", lambda *a: callback())
+    except Exception:
+        try:
+            var.trace("w", lambda *a: callback())
+        except Exception:
+            pass
+
+# TAB: Contests (launch_gui -> tab_contests)
+def create_contest_tab(tab, save_path_var):
+
+    seasons = [(name, i) for i, name in enumerate(SEASON_LABELS, start=1)]
+    maps = [(name, code) for code, name in BASE_MAPS]
+    selector = _build_region_selector(tab, seasons, maps, season_pady=5)
+    season_vars = selector["season_vars"]
+    map_vars = selector["map_vars"]
+    all_check_vars = selector["all_check_vars"]
+    other_season_var = selector["other_var"]
 
     def on_click():
         path = save_path_var.get()
         if not os.path.exists(path):
             return messagebox.showerror("Error", "Save file not found.")
-        selected_seasons = [i for i, var in season_vars if var.get() == 1]
-        if other_season_var.get().isdigit():
-            selected_seasons.append(int(other_season_var.get()))
-        selected_maps = [code for code, var in map_vars if var.get() == 1]
+        selected_seasons = _collect_checked_values(season_vars)
+        _append_other_season_int(selected_seasons, other_season_var)
+        selected_maps = _collect_checked_values(map_vars)
         if not selected_seasons and not selected_maps:
             return messagebox.showinfo("Info", "No seasons or maps selected.")
         mark_discovered_contests_complete(path, selected_seasons, selected_maps)
 
     ttk.Button(tab, text="Mark Contests Complete", command=on_click).pack(pady=10)
+    _add_check_all_checkbox(tab, all_check_vars)
 
     ttk.Label(
         tab,
@@ -4238,30 +7768,7 @@ def create_contest_tab(tab, save_path_var):
         wraplength=400,
         justify="center"
     ).pack(pady=(5, 10))
-SEASON_REGION_MAP = {
-    1: ("RU_03", "Season 1: Search & Recover (Kola Peninsula)"),
-    2: ("US_04", "Season 2: Explore & Expand (Yukon)"),
-    3: ("US_03", "Season 3: Locate & Deliver (Wisconsin)"),
-    4: ("RU_04", "Season 4: New Frontiers (Amur)"),
-    5: ("RU_05", "Season 5: Build & Dispatch (Don)"),
-    6: ("US_06", "Season 6: Haul & Hustle (Maine)"),
-    7: ("US_07", "Season 7: Compete & Conquer (Tennessee)"),
-    8: ("RU_08", "Season 8: Grand Harvest (Glades)"),
-    9: ("US_09", "Season 9: Renew & Rebuild (Ontario)"),
-    10: ("US_10", "Season 10: Fix & Connect (British Columbia)"),
-    11: ("US_11", "Season 11: Lights & Cameras (Scandinavia)"),
-    12: ("US_12", "Season 12: Public Energy (North Carolina)"),
-    13: ("RU_13", "Season 13: Dig & Drill (Almaty)"),
-    14: ("US_14", "Season 14: Reap & Sow (Austria)"),
-    15: ("US_15", "Season 15: Oil & Dirt (Quebec)"),
-    16: ("US_16", "Season 16: High Voltage (Washington)"),
-    17: ("RU_17", "Season 17: Repair & Rescue (Zurdania)")
-}
-BASE_MAPS = [
-    ("US_01", "Michigan"),
-    ("US_02", "Alaska"),
-    ("RU_02", "Taymyr")
-]
+# Helper for Upgrades tab actions (launch_gui -> tab_upgrades)
 def find_and_modify_upgrades(save_path, selected_region_codes):
     make_backup_if_enabled(save_path)
     try:
@@ -4276,9 +7783,12 @@ def find_and_modify_upgrades(save_path, selected_region_codes):
         start_index = match.end() - 1
         block, block_start, block_end = extract_brace_block(content, start_index)
         upgrades_data = json.loads(block)
+        added = _ensure_upgrades_defaults(upgrades_data)
         updated = 0
 
         for map_key, upgrades in upgrades_data.items():
+            if not isinstance(upgrades, dict):
+                continue
             for code in selected_region_codes:
                 if f"level_{code.lower()}" in map_key.lower():
                     for upgrade_key, value in upgrades.items():
@@ -4293,7 +7803,10 @@ def find_and_modify_upgrades(save_path, selected_region_codes):
         with open(save_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        messagebox.showinfo("Success", f"Updated {updated} upgrades.")
+        msg = f"Updated {updated} upgrades."
+        if added:
+            msg += f" Added {added} missing entries."
+        messagebox.showinfo("Success", msg)
     except Exception as e:
         messagebox.showerror("Error", str(e))
         
@@ -4860,63 +8373,13 @@ PRESET_COMPLETED_BLOCKS = {
 }
 
 
+# TAB: Achievements (launch_gui -> tab_achievements)
 def create_achievements_tab(tab, save_path_var, plugin_loaders):
     """
     Achievements — top-level tab.
     Auto-detects CommonSslSave (if known), auto-loads achievements and shows
     them as checkboxes arranged in 3 centered columns. Only Browse + Save are shown.
     """
-
-    # --- Auto-detect helper (same-folder strategy) for Achievements (adds persistent sync like Trials) ---
-    def sync_achievements_from_save(main_save_path):
-        try:
-            if not main_save_path or not os.path.exists(main_save_path):
-                return
-            folder = os.path.dirname(main_save_path)
-            candidates = []
-            # prefer exact commonsslsave filenames
-            for fname in os.listdir(folder):
-                low = fname.lower()
-                if low in ("commonsslsave.cfg", "commonsslsave.dat", "common_ssl_save.cfg", "common_ssl_save.dat"):
-                    candidates.append(os.path.join(folder, fname))
-            # fallback: any file containing both 'common' and 'ssl'
-            if not candidates:
-                for fname in os.listdir(folder):
-                    low = fname.lower()
-                    if "common" in low and "ssl" in low and low.endswith((".cfg", ".dat", ".json")):
-                        candidates.append(os.path.join(folder, fname))
-            if candidates:
-                chosen = candidates[0]
-                achievements_path_var.set(chosen)
-                try:
-                    load_achievements_from_file(chosen)
-                except Exception:
-                    # fail silently (UI stays unchanged)
-                    pass
-                try:
-                    cfg = load_config() or {}
-                    cfg["common_ssl_path"] = chosen
-                    save_config(cfg)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    # register auto-detect with plugin_loaders (if provided) so other parts of the app can also trigger it
-    try:
-        if isinstance(plugin_loaders, list) and sync_achievements_from_save not in plugin_loaders:
-            plugin_loaders.append(sync_achievements_from_save)
-    except Exception:
-        pass
-
-    # trace main save path so we run detection whenever it changes (like Trials does)
-    try:
-        save_path_var.trace_add("write", lambda *a: sync_achievements_from_save(save_path_var.get()))
-    except Exception:
-        try:
-            save_path_var.trace("w", lambda *a: sync_achievements_from_save(save_path_var.get()))
-        except Exception:
-            pass
 
     top = ttk.Frame(tab)
     top.pack(fill="x", pady=6, padx=8)
@@ -4925,17 +8388,11 @@ def create_achievements_tab(tab, save_path_var, plugin_loaders):
     ttk.Entry(top, textvariable=achievements_path_var, width=70).pack(side="left", padx=6, fill="x", expand=True)
 
     def pick_file():
-        startdir = os.path.dirname(save_path_var.get()) if save_path_var.get() else os.getcwd()
-        p = filedialog.askopenfilename(initialdir=startdir, filetypes=[("CommonSslSave", "*.cfg *.dat *.json"), ("All files", "*.*")])
+        p = _pick_common_ssl_file(save_path_var, allow_json=True)
         if not p:
             return
         achievements_path_var.set(p)
-        try:
-            cfg = load_config() or {}
-            cfg["common_ssl_path"] = p
-            save_config(cfg)
-        except Exception:
-            pass
+        _save_common_ssl_path_to_config(p)
         load_achievements_from_file(p)
 
     ttk.Button(top, text="Browse...", command=pick_file).pack(side="left", padx=(4,0))
@@ -5141,15 +8598,31 @@ def create_achievements_tab(tab, save_path_var, plugin_loaders):
     bottom.pack(fill="x", padx=12, pady=(6,12))
     ttk.Button(bottom, text="Save to file", command=save_achievements_to_file).pack(anchor="center")
 
+    # --- Auto-detect helper (same-folder strategy) for Achievements ---
+    def sync_achievements_from_save(main_save_path):
+        _sync_common_ssl_from_save(
+            main_save_path,
+            achievements_path_var,
+            load_achievements_from_file,
+            allow_json=True
+        )
+
+    # register auto-detect with plugin_loaders (if provided) so other parts of the app can also trigger it
+    try:
+        if isinstance(plugin_loaders, list) and sync_achievements_from_save not in plugin_loaders:
+            plugin_loaders.append(sync_achievements_from_save)
+    except Exception:
+        pass
+
+    # trace main save path so we run detection whenever it changes (like Trials does)
+    _trace_var_write(save_path_var, lambda: sync_achievements_from_save(save_path_var.get()))
+
     # Auto-detect & load on creation (if possible)
     try:
-        # prefer config value first
-        cfg = load_config() or {}
-        cp = cfg.get("common_ssl_path")
+        cp = _load_common_ssl_path_from_config()
         if cp and os.path.exists(cp):
             load_achievements_from_file(cp)
         else:
-            # fallback to same-folder scanning if save_path_var provides a main save
             _ = sync_achievements_from_save(save_path_var.get()) if save_path_var and save_path_var.get() else None
     except Exception:
         pass
@@ -5157,6 +8630,217 @@ def create_achievements_tab(tab, save_path_var, plugin_loaders):
     return
 
 
+# TAB: PROS (launch_gui -> tab_pros)
+def create_pros_tab(tab, save_path_var, plugin_loaders):
+    """
+    PROS tab — manages givenProsEntitlements in CommonSslSave.
+    Auto-detects CommonSslSave in the same folder as the main save.
+    """
+    PROS_URL = "https://prismray.io/games/snowrunner"
+    PROS_ENTITLEMENTS = [
+        ("Mammoth Ornament & Stickers", "ProsRegistrationReward"),
+        ("An exclusive Voron-AE4380 skin and three unique stickers", "ProsRoadcraftReward"),
+    ]
+
+    pros_path_var = tk.StringVar()
+    try:
+        cp = _load_common_ssl_path_from_config()
+        if cp:
+            pros_path_var.set(cp)
+    except Exception:
+        pass
+
+    # --- Top: file picker ---
+    top = ttk.Frame(tab)
+    top.pack(fill="x", pady=6, padx=8)
+    ttk.Label(top, text="CommonSslSave file:").pack(side="left")
+    ttk.Entry(top, textvariable=pros_path_var, width=70).pack(side="left", padx=6, fill="x", expand=True)
+
+    def pick_pros_file():
+        p = _pick_common_ssl_file(save_path_var, allow_json=True)
+        if not p:
+            return
+        pros_path_var.set(p)
+        _save_common_ssl_path_to_config(p)
+        load_pros_file(p)
+
+    ttk.Button(top, text="Browse...", command=pick_pros_file).pack(side="left", padx=(4,0))
+
+    # --- PROS explanation ---
+    pros_hint = (
+        "PROS lets you keep your SnowRunner progress synced across platforms. "
+        "For example, you can start on PC and continue on PlayStation. "
+        "It also grants some rewards — and you can toggle those rewards here "
+        "without linking your account to PROS."
+    )
+    ttk.Label(tab, text=pros_hint, wraplength=1000, justify="center").pack(fill="x", padx=10, pady=(4, 10))
+
+    # --- PROS link buttons (centered, a bit lower) ---
+    link_frame = ttk.Frame(tab)
+    link_frame.pack(fill="x", padx=10, pady=(0, 12))
+    link_center = ttk.Frame(link_frame)
+    link_center.pack(anchor="center")
+
+    def open_pros():
+        try:
+            webbrowser.open(PROS_URL)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open browser:\n{e}")
+
+    def copy_link():
+        try:
+            root = tab.winfo_toplevel()
+            root.clipboard_clear()
+            root.clipboard_append(PROS_URL)
+            root.update()
+            messagebox.showinfo("Copied", "PROS link copied to clipboard.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to copy link:\n{e}")
+
+    ttk.Button(link_center, text="Open PROS", command=open_pros).pack(side="left", padx=(0, 10))
+    ttk.Button(link_center, text="Copy Link", command=copy_link).pack(side="left")
+
+    # --- Body: checkboxes (centered) ---
+    body = ttk.Frame(tab)
+    body.pack(fill="both", expand=True, padx=10, pady=6)
+    center_container = ttk.Frame(body)
+    center_container.pack(expand=True)
+
+    pros_vars = {}
+    for label, key in PROS_ENTITLEMENTS:
+        var = tk.IntVar(value=0)
+        cb = ttk.Checkbutton(center_container, text=label, variable=var)
+        cb.pack(anchor="w", padx=8, pady=8)
+        pros_vars[key] = var
+
+    # --- helpers ---
+    def _parse_common_ssl(content):
+        """
+        Returns (parsed_obj, block_start, block_end) where block_start/end are
+        only set if CommonSslSave block is found. parsed_obj is the parsed JSON
+        for the CommonSslSave block or the whole file.
+        """
+        m = re.search(r'"CommonSslSave"\s*:\s*{', content)
+        if m:
+            block_str, bs, be = extract_brace_block(content, m.end() - 1)
+            parsed = json.loads(block_str)
+            return parsed, bs, be
+        # fallback: try direct JSON
+        parsed = json.loads(content)
+        return parsed, None, None
+
+    def _get_entitlements_from_parsed(parsed_obj):
+        if isinstance(parsed_obj, dict) and isinstance(parsed_obj.get("SslValue"), dict):
+            return parsed_obj["SslValue"].get("givenProsEntitlements", [])
+        if isinstance(parsed_obj, dict):
+            return parsed_obj.get("givenProsEntitlements", [])
+        return []
+
+    def _set_entitlements_on_parsed(parsed_obj, ent_list):
+        if isinstance(parsed_obj, dict) and isinstance(parsed_obj.get("SslValue"), dict):
+            parsed_obj["SslValue"]["givenProsEntitlements"] = ent_list
+        elif isinstance(parsed_obj, dict):
+            parsed_obj["givenProsEntitlements"] = ent_list
+
+    def load_pros_file(path=None):
+        p = path or pros_path_var.get()
+        if not p or not os.path.exists(p):
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                content = f.read()
+            parsed, _, _ = _parse_common_ssl(content)
+            ent = _get_entitlements_from_parsed(parsed)
+            if not isinstance(ent, list):
+                ent = []
+            for _, key in PROS_ENTITLEMENTS:
+                pros_vars[key].set(1 if key in ent else 0)
+            _save_common_ssl_path_to_config(p)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to read CommonSslSave:\n{e}")
+
+    def save_pros():
+        path = pros_path_var.get()
+        if not path or not os.path.exists(path):
+            return messagebox.showerror("Error", "CommonSslSave file not found.")
+        try:
+            try:
+                if "make_backup_if_enabled" in globals() and callable(globals()["make_backup_if_enabled"]):
+                    make_backup_if_enabled(path)
+            except Exception:
+                pass
+
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            parsed, bs, be = _parse_common_ssl(content)
+            ent = _get_entitlements_from_parsed(parsed)
+            if not isinstance(ent, list):
+                ent = []
+
+            # Update entries (preserve any other entitlements)
+            for _, key in PROS_ENTITLEMENTS:
+                checked = bool(pros_vars[key].get())
+                if checked:
+                    if key not in ent:
+                        ent.append(key)
+                else:
+                    ent = [x for x in ent if x != key]
+
+            _set_entitlements_on_parsed(parsed, ent)
+
+            new_block_str = json.dumps(parsed, separators=(",", ":"))
+            if bs is not None and be is not None:
+                new_content = content[:bs] + new_block_str + content[be:]
+            else:
+                new_content = new_block_str
+
+            with open(path, "w", encoding="utf-8") as out_f:
+                out_f.write(new_content)
+
+            _save_common_ssl_path_to_config(path)
+
+            messagebox.showinfo("Saved", "PROS entitlements saved successfully.")
+        except Exception as e:
+            messagebox.showerror("Save error", f"Failed to save PROS entitlements:\n{e}")
+
+    # --- Bottom: centered Save button ---
+    bottom = ttk.Frame(tab)
+    bottom.pack(fill="x", padx=12, pady=(6,12))
+    ttk.Button(bottom, text="Save PROS", command=save_pros).pack(anchor="center")
+
+    # Auto-detect helper (same-folder strategy)
+    def sync_pros_from_save(main_save_path):
+        _sync_common_ssl_from_save(
+            main_save_path,
+            pros_path_var,
+            load_pros_file,
+            allow_json=True
+        )
+
+    # register auto-detect
+    try:
+        if isinstance(plugin_loaders, list) and sync_pros_from_save not in plugin_loaders:
+            plugin_loaders.append(sync_pros_from_save)
+    except Exception:
+        pass
+
+    # trace main save path to trigger detection
+    _trace_var_write(save_path_var, lambda: sync_pros_from_save(save_path_var.get()))
+
+    # Auto-load saved path if present; otherwise attempt same-folder detection
+    try:
+        if pros_path_var.get() and os.path.exists(pros_path_var.get()):
+            load_pros_file(pros_path_var.get())
+        else:
+            _ = sync_pros_from_save(save_path_var.get()) if save_path_var and save_path_var.get() else None
+    except Exception:
+        pass
+
+    return
+
+
+# TAB: Trials (launch_gui -> tab_trials)
 def create_trials_tab(tab, save_path_var, plugin_loaders):
     """
     Trials tab — no scrollbar, checkbox block uses available vertical space and is
@@ -5177,9 +8861,9 @@ def create_trials_tab(tab, save_path_var, plugin_loaders):
 
     trials_path_var = tk.StringVar()
     try:
-        cfg = load_config()
-        if cfg and cfg.get("common_ssl_path"):
-            trials_path_var.set(cfg.get("common_ssl_path"))
+        cp = _load_common_ssl_path_from_config()
+        if cp:
+            trials_path_var.set(cp)
     except Exception:
         pass
 
@@ -5190,17 +8874,11 @@ def create_trials_tab(tab, save_path_var, plugin_loaders):
     ttk.Entry(top, textvariable=trials_path_var, width=70).pack(side="left", padx=6, fill="x", expand=True)
 
     def pick_trials_file():
-        startdir = os.path.dirname(save_path_var.get()) if save_path_var.get() else os.getcwd()
-        p = filedialog.askopenfilename(initialdir=startdir, filetypes=[("CommonSslSave", "*.cfg *.dat"), ("All files", "*.*")])
+        p = _pick_common_ssl_file(save_path_var, allow_json=False)
         if not p:
             return
         trials_path_var.set(p)
-        try:
-            cfg = load_config() or {}
-            cfg["common_ssl_path"] = p
-            save_config(cfg)
-        except Exception:
-            pass
+        _save_common_ssl_path_to_config(p)
         load_trials_file(p)
 
     ttk.Button(top, text="Browse...", command=pick_trials_file).pack(side="left", padx=(4,0))
@@ -5309,12 +8987,7 @@ def create_trials_tab(tab, save_path_var, plugin_loaders):
             finished = _parse_finished_trials_from_text(content)
             for _, code in TRIALS_LIST:
                 trial_vars[code].set(1 if code in finished else 0)
-            try:
-                cfg = load_config() or {}
-                cfg["common_ssl_path"] = path
-                save_config(cfg)
-            except Exception:
-                pass
+            _save_common_ssl_path_to_config(path)
             # re-layout to adapt center size
             tab.update_idletasks()
             _place_center()
@@ -5337,12 +9010,7 @@ def create_trials_tab(tab, save_path_var, plugin_loaders):
             new_text = _write_finished_trials_into_text(text, finished)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(new_text)
-            try:
-                cfg = load_config() or {}
-                cfg["common_ssl_path"] = path
-                save_config(cfg)
-            except Exception:
-                pass
+            _save_common_ssl_path_to_config(path)
             messagebox.showinfo("Saved", "Trials saved successfully.")
         except Exception as e:
             messagebox.showerror("Save error", f"Failed to save trials:\n{e}")
@@ -5358,32 +9026,12 @@ def create_trials_tab(tab, save_path_var, plugin_loaders):
 
     # Auto-detect helper (same-folder strategy)
     def sync_trials_from_save(main_save_path):
-        try:
-            if not main_save_path or not os.path.exists(main_save_path):
-                return
-            folder = os.path.dirname(main_save_path)
-            candidates = []
-            for fname in os.listdir(folder):
-                low = fname.lower()
-                if low in ("commonsslsave.cfg", "commonsslsave.dat", "common_ssl_save.cfg", "common_ssl_save.dat"):
-                    candidates.append(os.path.join(folder, fname))
-            if not candidates:
-                for fname in os.listdir(folder):
-                    low = fname.lower()
-                    if "common" in low and "ssl" in low and (low.endswith(".cfg") or low.endswith(".dat")):
-                        candidates.append(os.path.join(folder, fname))
-            if candidates:
-                chosen = candidates[0]
-                trials_path_var.set(chosen)
-                load_trials_file(chosen)
-                try:
-                    cfg = load_config() or {}
-                    cfg["common_ssl_path"] = chosen
-                    save_config(cfg)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _sync_common_ssl_from_save(
+            main_save_path,
+            trials_path_var,
+            load_trials_file,
+            allow_json=False
+        )
 
     # register auto-detect
     try:
@@ -5393,102 +9041,45 @@ def create_trials_tab(tab, save_path_var, plugin_loaders):
         pass
 
     # trace main save path to trigger detection
-    try:
-        save_path_var.trace_add("write", lambda *a: sync_trials_from_save(save_path_var.get()))
-    except Exception:
-        try:
-            save_path_var.trace("w", lambda *a: sync_trials_from_save(save_path_var.get()))
-        except Exception:
-            pass
+    _trace_var_write(save_path_var, lambda: sync_trials_from_save(save_path_var.get()))
 
 
+# TAB: Upgrades (launch_gui -> tab_upgrades)
 def create_upgrades_tab(tab, save_path_var):
-    season_vars = []
-    map_vars = []
-    other_season_var = tk.StringVar()
-
-    season_frame = ttk.Frame(tab)
-    season_frame.pack(pady=(0, 10))
-
-    # Two columns: left and right
-    left_column = ttk.Frame(season_frame)
-    left_column.pack(side="left", padx=10, anchor="n")
-
-    right_column = ttk.Frame(season_frame)
-    right_column.pack(side="left", padx=10, anchor="n")
-
-    for idx, (season_num, (code, label)) in enumerate(SEASON_REGION_MAP.items(), start=1):
-        var = tk.IntVar()
-        column = left_column if idx <= len(SEASON_REGION_MAP) / 2 else right_column
-        cb = ttk.Checkbutton(column, text=label, variable=var)
-        cb.pack(anchor="w", pady=2)
-        season_vars.append((code, var))
-
-    # Add Other Season number entry
-    ttk.Label(tab, text="Other Season number (e.g. 18, 19, 20)").pack(pady=5)
-    ttk.Entry(tab, textvariable=other_season_var).pack(pady=5)
-
-    ttk.Label(tab, text="Base Maps:").pack(pady=(5, 0))
-
-    map_frame = ttk.Frame(tab)
-    map_frame.pack(anchor="center", pady=5)
-
-    for code, name in BASE_MAPS:
-        var = tk.IntVar()
-        cb = ttk.Checkbutton(map_frame, text=name, variable=var)
-        cb.pack(anchor="w")
-        map_vars.append((code, var))
+    seasons = [(label, code) for _, (code, label) in SEASON_ENTRIES]
+    maps = [(name, code) for code, name in BASE_MAPS]
+    selector = _build_region_selector(tab, seasons, maps)
+    season_vars = selector["season_vars"]
+    map_vars = selector["map_vars"]
+    all_check_vars = selector["all_check_vars"]
+    other_season_var = selector["other_var"]
 
     def on_apply():
         path = save_path_var.get()
         if not os.path.exists(path):
             messagebox.showerror("Error", "Save file not found.")
             return
-        selected_regions = [code for code, var in season_vars if var.get()]
-        selected_regions += [code for code, var in map_vars if var.get()]
-        if other_season_var.get().isdigit():
-            selected_regions.append(f"US_{int(other_season_var.get()):02}")
+        selected_regions = _collect_selected_regions(season_vars, map_vars, other_season_var)
         if not selected_regions:
             messagebox.showinfo("Info", "No seasons or maps selected.")
             return
         find_and_modify_upgrades(path, selected_regions)
 
     ttk.Button(tab, text="Unlock Upgrades", command=on_apply).pack(pady=(10, 5))
+    _add_check_all_checkbox(tab, all_check_vars)
 
     ttk.Label(tab, text="At least one upgrade must be marked or collected in-game for this to work.",
               foreground="red").pack(pady=(0, 2))
     ttk.Label(tab, text="If a new season is added, you may need to mark or collect one new upgrade.",
               foreground="red").pack()
+# TAB: Game Stats (launch_gui -> tab_stats)
 def create_game_stats_tab(tab, save_path_var, plugin_loaders):
 
     stats_vars = {}
     distance_vars = {}
 
     # Full mapping for region codes -> full names (uppercase keys)
-    REGION_NAME_MAP = {
-        "US_01": "Michigan",
-        "US_02": "Alaska",
-        "RU_02": "Taymyr",
-        "RU_03": "Season 1: Search & Recover (Kola Peninsula)",
-        "US_03": "Season 3: Locate & Deliver (Wisconsin)",
-        "US_04": "Season 2: Explore & Expand (Yukon)",
-        "RU_04": "Season 4: New Frontiers (Amur)",
-        "RU_05": "Season 5: Build & Dispatch (Don)",
-        "US_06": "Season 6: Haul & Hustle (Maine)",
-        "US_07": "Season 7: Compete & Conquer (Tennessee)",
-        "RU_08": "Season 8: Grand Harvest (Glades)",
-        "US_09": "Season 9: Renew & Rebuild (Ontario)",
-        "US_10": "Season 10: Fix & Connect (British Columbia)",
-        "US_11": "Season 11: Lights & Cameras (Scandinavia)",
-        "US_12": "Season 12: Public Energy (North Carolina)",
-        "RU_13": "Season 13: Dig & Drill (Almaty)",
-        "US_14": "Season 14: Reap & Sow (Austria)",
-        "US_15": "Season 15: Oil & Dirt (Quebec)",
-        "US_16": "Season 16: High Voltage (Washington)",
-        "RU_17": "Season 17: Repair & Rescue (Zurdania)",
-        "TRIALS": "Trials"
-    }
-    REGION_ORDER = list(REGION_NAME_MAP.keys())
+    REGION_ORDER = list(REGION_LONG_NAME_MAP.keys())
 
     def nice_name(raw_key: str) -> str:
         """Turn MONEY_SPENT → Money Spent and fix plural forms"""
@@ -5572,7 +9163,7 @@ def create_game_stats_tab(tab, save_path_var, plugin_loaders):
         dist_items = sorted(distance_parsed.items(), key=lambda kv: dist_sort_key(kv[0]))
         for i, (region, value) in enumerate(dist_items, start=1):
             region_up = str(region).upper()
-            label_text = REGION_NAME_MAP.get(region_up, region)
+            label_text = REGION_LONG_NAME_MAP.get(region_up, region)
             ttk.Label(center_frame, text=label_text + ":", anchor="w", justify="left").grid(row=i, column=0, sticky="w", padx=(0, 6), pady=2)
             var = tk.StringVar(value=str(value))
             distance_vars[region] = var
@@ -5658,57 +9249,120 @@ def create_game_stats_tab(tab, save_path_var, plugin_loaders):
 
     if os.path.exists(save_path_var.get()):
         refresh_ui(save_path_var.get())
+# TAB: Watchtowers (launch_gui -> tab_watchtowers)
 def create_watchtowers_tab(tab, save_path_var):
-    season_vars = []
-    map_vars = []
-    other_season_var = tk.StringVar()
-
-    season_frame = ttk.Frame(tab)
-    season_frame.pack(pady=(0, 10))
-
-    # Two columns: left and right
-    left_column = ttk.Frame(season_frame)
-    left_column.pack(side="left", padx=10, anchor="n")
-
-    right_column = ttk.Frame(season_frame)
-    right_column.pack(side="left", padx=10, anchor="n")
-
-    for idx, (season_num, (code, label)) in enumerate(SEASON_REGION_MAP.items(), start=1):
-        var = tk.IntVar()
-        column = left_column if idx <= len(SEASON_REGION_MAP) / 2 else right_column
-        cb = ttk.Checkbutton(column, text=label, variable=var)
-        cb.pack(anchor="w", pady=2)
-        season_vars.append((code, var))
-
-    ttk.Label(tab, text="Other Season number (e.g. 18, 19, 20)").pack(pady=5)
-    ttk.Entry(tab, textvariable=other_season_var).pack(pady=5)
-
-    ttk.Label(tab, text="Base Maps:").pack(pady=(5, 0))
-
-    map_frame = ttk.Frame(tab)
-    map_frame.pack(anchor="center", pady=5)
-
-    for code, name in BASE_MAPS:
-        var = tk.IntVar()
-        cb = ttk.Checkbutton(map_frame, text=name, variable=var)
-        cb.pack(anchor="w")   # align left inside block
-        map_vars.append((code, var))
+    seasons = [(label, code) for _, (code, label) in SEASON_ENTRIES]
+    maps = [(name, code) for code, name in BASE_MAPS]
+    selector = _build_region_selector(tab, seasons, maps)
+    season_vars = selector["season_vars"]
+    map_vars = selector["map_vars"]
+    all_check_vars = selector["all_check_vars"]
+    other_season_var = selector["other_var"]
 
     def on_apply():
         path = save_path_var.get()
         if not os.path.exists(path):
             return messagebox.showerror("Error", "Save file not found.")
-        selected_regions = [code for code, var in season_vars if var.get()]
-        selected_regions += [code for code, var in map_vars if var.get()]
-        if other_season_var.get().isdigit():
-            selected_regions.append(f"US_{int(other_season_var.get()):02}")
+        selected_regions = _collect_selected_regions(season_vars, map_vars, other_season_var)
         if not selected_regions:
             return messagebox.showinfo("Info", "No seasons or maps selected.")
         unlock_watchtowers(path, selected_regions)
 
     ttk.Button(tab, text="Unlock Watchtowers", command=on_apply).pack(pady=(10, 5))
+    _add_check_all_checkbox(tab, all_check_vars)
     ttk.Label(tab, text="It will mark them as found but wont reveal the map use the Fog Tool for that.",
               foreground="red").pack()
+
+# TAB: Discoveries (launch_gui -> tab_discoveries)
+def create_discoveries_tab(tab, save_path_var):
+    seasons = [(label, code) for _, (code, label) in SEASON_ENTRIES]
+    maps = [(name, code) for code, name in BASE_MAPS]
+    selector = _build_region_selector(tab, seasons, maps)
+    season_vars = selector["season_vars"]
+    map_vars = selector["map_vars"]
+    all_check_vars = selector["all_check_vars"]
+    other_season_var = selector["other_var"]
+
+    def on_apply():
+        path = save_path_var.get()
+        if not os.path.exists(path):
+            return messagebox.showerror("Error", "Save file not found.")
+        selected_regions = _collect_selected_regions(season_vars, map_vars, other_season_var)
+        if not selected_regions:
+            return messagebox.showinfo("Info", "No seasons or maps selected.")
+        unlock_discoveries(path, selected_regions)
+
+    ttk.Button(tab, text="Unlock Discoveries", command=on_apply).pack(pady=(10, 5))
+    _add_check_all_checkbox(tab, all_check_vars)
+    ttk.Label(tab, text="Sets discovered trucks to their max for selected regions but won't add them to garage.",
+              foreground="red").pack()
+
+# TAB: Levels (launch_gui -> tab_levels)
+def create_levels_tab(tab, save_path_var):
+    seasons = [(label, code) for _, (code, label) in SEASON_ENTRIES]
+    maps = [(name, code) for code, name in BASE_MAPS]
+    selector = _build_region_selector(tab, seasons, maps)
+    season_vars = selector["season_vars"]
+    map_vars = selector["map_vars"]
+    all_check_vars = selector["all_check_vars"]
+    other_season_var = selector["other_var"]
+
+    def on_apply():
+        path = save_path_var.get()
+        if not os.path.exists(path):
+            return messagebox.showerror("Error", "Save file not found.")
+        selected_regions = _collect_selected_regions(season_vars, map_vars, other_season_var)
+        if not selected_regions:
+            return messagebox.showinfo("Info", "No seasons or maps selected.")
+        unlock_levels(path, selected_regions)
+
+    ttk.Button(tab, text="Unlock Levels", command=on_apply).pack(pady=(10, 5))
+    _add_check_all_checkbox(tab, all_check_vars)
+    ttk.Label(
+        tab,
+        text="Lets you view regions you haven't visited yet.",
+        foreground="red"
+    ).pack()
+
+# TAB: Garages (launch_gui -> tab_garages)
+def create_garages_tab(tab, save_path_var):
+    upgrade_all_var = tk.IntVar()
+    seasons = [(label, code) for _, (code, label) in SEASON_ENTRIES]
+    maps = [(name, code) for code, name in BASE_MAPS]
+    selector = _build_region_selector(tab, seasons, maps)
+    season_vars = selector["season_vars"]
+    map_vars = selector["map_vars"]
+    all_check_vars = selector["all_check_vars"]
+    other_season_var = selector["other_var"]
+
+    def on_apply():
+        path = save_path_var.get()
+        if not os.path.exists(path):
+            return messagebox.showerror("Error", "Save file not found.")
+        selected_regions = _collect_selected_regions(season_vars, map_vars, other_season_var)
+        if not selected_regions:
+            return messagebox.showinfo("Info", "No seasons or maps selected.")
+        unlock_garages(path, selected_regions, upgrade_all=bool(upgrade_all_var.get()))
+
+    ttk.Button(tab, text="Unlock Garages", command=on_apply).pack(pady=(10, 5))
+    _add_check_all_checkbox(tab, all_check_vars)
+    ttk.Checkbutton(tab, text="Upgrade All Garages", variable=upgrade_all_var).pack(anchor="center", pady=(4, 0))
+    ttk.Label(
+        tab,
+        text=(
+            "Garages will be unlocked but may be hidden under fog of war. To make it work correctly, "
+            "don’t open the map itself to go into the garage. Instead, in map-selection "
+            "put your cursor over the map you want — you should see a yellow-highlighted garage icon in the bottom part of the map labeled "
+            "'Garage Opened'. Click it to port into the garage instantly. The garage can still be hidden "
+            "under fog, so drive to the yellow garage box (entrance/move to garage) to reveal it on the map. "
+            "Recover feature on that map will be semi-broken until you find the garage entrance. Note: some garage entrances "
+            "are hidden behind a quest, so you may need to use Objectives+ or complete it yourself "
+            "(e.g., the garage in Amur – Chernokamensk)."
+        ),
+        foreground="red",
+        wraplength=1000,
+        justify="left"
+    ).pack(pady=(6, 0), padx=12)
 
 # ---------- FACTOR_RULE_DEFINITIONS (use your exact names/keys) ----------
 FACTOR_RULE_DEFINITIONS = [
@@ -5759,6 +9413,14 @@ except NameError:
 # ---------- SAFE helpers ----------
 
 _key_pattern_cache = {}
+# -----------------------------------------------------------------------------
+# END SECTION: Tab Builders (UI construction)
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Rules Tab Helpers (Rules tab)
+# Used In: create_rules_tab, sync_all_rules
+# =============================================================================
 def _value_pattern():
     # Matches: quoted string OR array OR object OR primitive (no comma/closing brace)
     return r'(?:"[^"]*"|\[[^\]]*\]|\{[^}]*\}|[^,}]+)'
@@ -5824,6 +9486,7 @@ _DEFAULT_DEPLOY_PRICE = {"Region":3500,"Map":1000}
 _DEFAULT_AUTOLOAD_PRICE = 150
 
 # ---------- UI builder ----------
+# TAB: Rules (launch_gui -> tab_rules)
 def create_rules_tab(tab_rules, save_path_var):
     """
     3-column centered rules UI. Register loader + trace save_path_var for immediate sync.
@@ -5849,6 +9512,13 @@ def create_rules_tab(tab_rules, save_path_var):
 
     wrapper = ttk.Frame(canvas)
     window_id = canvas.create_window((0, 0), window=wrapper, anchor="nw")
+
+    # expose for window auto-sizing
+    try:
+        globals()["_RULES_CONTENT_FRAME"] = wrapper
+        globals()["_RULES_CANVAS"] = canvas
+    except Exception:
+        pass
 
     def _on_canvas_config(e):
         canvas.itemconfig(window_id, width=e.width)
@@ -6132,6 +9802,14 @@ def create_rules_tab(tab_rules, save_path_var):
 GITHUB_RELEASES_API = "https://api.github.com/repos/MrBoxik/SnowRunner-Save-Editor/releases"
 GITHUB_RELEASES_PAGE = "https://github.com/MrBoxik/SnowRunner-Save-Editor/releases"
 GITHUB_MAIN_PAGE = "https://github.com/MrBoxik/SnowRunner-Save-Editor"
+# -----------------------------------------------------------------------------
+# END SECTION: Rules Tab Helpers (Rules tab)
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Update Checks
+# Used In: Settings tab -> "Check for Update"
+# =============================================================================
 def normalize_version(tag: str) -> int:
     """
     Extract numeric part of version string only.
@@ -6144,15 +9822,16 @@ def normalize_version(tag: str) -> int:
     return int(m.group(1)) if m else 0
 def check_for_updates_background(root, debug=False):
     """Check GitHub for newer release in a background thread."""
+    if requests is None:
+        if debug:
+            print("[UpdateCheck] requests not installed; skipping update check.")
+        return
 
     def log(msg):
         if debug:
             print(f"[UpdateCheck] {msg}")
 
     def worker():
-        cfg = load_config()
-        current_version = cfg.get("current_version", None)
-
         try:
             log("Trying to reach GitHub API...")
             r = requests.get(GITHUB_RELEASES_API, timeout=5)
@@ -6181,23 +9860,15 @@ def check_for_updates_background(root, debug=False):
                 log("No valid tag found, aborting.")
                 return
 
-            latest_num = normalize_version(latest_raw)
-
-            # First launch → save numeric version once
-            if current_version is None:
-                numeric_latest = str(normalize_version(latest_raw))
-                cfg["current_version"] = numeric_latest
-                save_config(cfg)
-                log(f"No version in config → writing {numeric_latest} as first launch version.")
-                return
-
-            log(f"User version from config: {current_version}")
-
-            current_num = normalize_version(current_version)
+            current_num = normalize_version(APP_VERSION)
             log(f"Normalized versions → current: {current_num}, latest: {latest_num}")
 
             if latest_num > current_num:
                 log("Newer version detected → scheduling popup.")
+                try:
+                    globals()["_UPDATE_STATUS"] = "update"
+                except Exception:
+                    pass
 
                 def popup():
                     top = tk.Toplevel(root)
@@ -6208,35 +9879,19 @@ def check_for_updates_background(root, debug=False):
                     ttk.Label(
                         top,
                         text=f"A new version is available!\n\n"
-                             f"Current: {current_version}\nLatest: {latest_num}",
+                             f"Current: {current_num}\nLatest: {latest_num}",
                         justify="center",
                         wraplength=340
                     ).pack(pady=10)
 
-                    def confirm_update():
-                        numeric_latest = str(latest_num)   # ✅ always numeric
-                        cfg["current_version"] = numeric_latest
-                        save_config(cfg)
-                        log(f"User confirmed update → saved version {numeric_latest} to config.")
-                        top.destroy()
-
-                    updated_var = tk.BooleanVar(value=False)
-                    chk = ttk.Checkbutton(
-                        top,
-                        text="I updated",
-                        variable=updated_var,
-                        command=lambda: confirm_update() if updated_var.get() else None
-                    )
-                    chk.pack(pady=(0, 5))  # ✅ tighten space above
-
                     def open_page():
-                        webbrowser.open(GITHUB_MAIN_PAGE)
+                        webbrowser.open(GITHUB_RELEASES_PAGE)
 
                     def copy_link():
                         root.clipboard_clear()
-                        root.clipboard_append(GITHUB_MAIN_PAGE)
+                        root.clipboard_append(GITHUB_RELEASES_PAGE)
                         root.update()
-                        messagebox.showinfo("Copied", "Main page link copied to clipboard.")
+                        messagebox.showinfo("Copied", "Releases page link copied to clipboard.")
 
                     btn_frame = ttk.Frame(top)
                     btn_frame.pack(pady=10)
@@ -6246,25 +9901,235 @@ def check_for_updates_background(root, debug=False):
 
                 # show popup in main thread
                 root.after(0, popup)
+                # update footer version label if present
+                try:
+                    if "_VERSION_FOOTER_LABEL" in globals() and globals()["_VERSION_FOOTER_LABEL"] is not None:
+                        globals()["_VERSION_FOOTER_LABEL"].config(
+                            text=f"Version: {APP_VERSION} (update available)"
+                        )
+                except Exception:
+                    pass
+            elif latest_num < current_num:
+                log("Current version ahead of latest → dev build.")
+                try:
+                    globals()["_UPDATE_STATUS"] = "dev"
+                except Exception:
+                    pass
+                try:
+                    if "_VERSION_FOOTER_LABEL" in globals() and globals()["_VERSION_FOOTER_LABEL"] is not None:
+                        globals()["_VERSION_FOOTER_LABEL"].config(
+                            text=f"Version: {APP_VERSION} (dev build)"
+                        )
+                except Exception:
+                    pass
             else:
                 log("No update available.")
+                try:
+                    globals()["_UPDATE_STATUS"] = "none"
+                except Exception:
+                    pass
+                try:
+                    if "_VERSION_FOOTER_LABEL" in globals() and globals()["_VERSION_FOOTER_LABEL"] is not None:
+                        globals()["_VERSION_FOOTER_LABEL"].config(
+                            text=f"Version: {APP_VERSION}"
+                        )
+                except Exception:
+                    pass
 
         except Exception as e:
             log(f"Update check failed: {e}")
 
     # run worker in background thread
     threading.Thread(target=worker, daemon=True).start()
+
+# -----------------------------------------------------------------------------
+# END SECTION: Update Checks
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Dependency Checks + App Launch
+# Used In: __main__ entrypoint
+# =============================================================================
+def check_dependencies():
+    """Check for required dependencies and warn if missing."""
+    missing = []
+    
+    # Check tkinter
+    try:
+        import tkinter
+    except ImportError:
+        missing.append(
+            "tkinter: Install with 'python -m pip install python3-tk' (Linux/macOS) "
+            "or use python.org installer (macOS/Windows)"
+        )
+    
+    # Check for optional dependencies
+    if Image is None:
+        missing.append(
+            "Pillow: Install with 'pip install Pillow' (image loading/overlay features will be disabled)"
+        )
+    
+    if requests is None:
+        missing.append(
+            "requests: Install with 'pip install requests' (some network features will be disabled)"
+        )
+    
+    if missing:
+        print("\n⚠️  WARNING: Missing dependencies:")
+        for msg in missing:
+            print(f"  • {msg}")
+        print()
+        
+        # Only exit if tkinter is missing (critical)
+        if "tkinter" in missing[0]:
+            print("❌ tkinter is required to run this application.")
+            sys.exit(1)
+
+
+# UI helper: hide dotted focus rectangles without disabling focus/clicking
+def _apply_focus_outline_fix(root):
+    try:
+        style = ttk.Style(root)
+    except Exception:
+        return
+
+    try:
+        bg = root.cget("background")
+    except Exception:
+        try:
+            bg = style.lookup("TFrame", "background")
+        except Exception:
+            bg = ""
+    if not bg:
+        bg = "SystemButtonFace"
+
+    def _strip_focus(layout):
+        if not layout:
+            return layout
+        new_layout = []
+        for elem, opts in layout:
+            children = None
+            if isinstance(opts, dict):
+                children = opts.get("children")
+
+            if "focus" in elem.lower():
+                # If focus element wraps children, keep the children (flatten) to avoid
+                # removing actual content like labels/indicators.
+                if children:
+                    new_layout.extend(_strip_focus(children))
+                continue
+
+            if children:
+                opts = dict(opts)
+                opts["children"] = _strip_focus(children)
+            new_layout.append((elem, opts))
+        return new_layout
+
+    # Only strip focus from specific widget layouts to avoid breaking notebook tabs.
+    layout_targets = (
+        "TButton",
+        "TCheckbutton",
+        "TRadiobutton",
+        "TNotebook.Tab",
+    )
+
+    for name in layout_targets:
+        try:
+            layout = style.layout(name)
+            if layout:
+                stripped = _strip_focus(layout)
+                if stripped and stripped != layout:
+                    style.layout(name, stripped)
+        except Exception:
+            pass
+
+    style_names = layout_targets
+
+    for name in style_names:
+        try:
+            style.configure(name, focuscolor=bg, focusthickness=0)
+        except Exception:
+            pass
+        try:
+            style.map(name, focuscolor=[("focus", bg), ("!focus", bg)])
+        except Exception:
+            pass
+
+    # Tk widgets (fallback): remove highlight borders without affecting focus
+    try:
+        root.option_add("*highlightThickness", 0)
+        root.option_add("*highlightColor", bg)
+        root.option_add("*highlightBackground", bg)
+    except Exception:
+        pass
+
+    # Prevent focus auto-select for Entry/Combobox (clears only if full text is selected)
+    def _clear_full_selection(widget):
+        try:
+            if not hasattr(widget, "selection_present") or not widget.selection_present():
+                return
+            first = widget.index("sel.first")
+            last = widget.index("sel.last")
+            end = widget.index("end")
+            if first == 0 and last >= end:
+                widget.selection_clear()
+        except Exception:
+            pass
+
+    def _clear_full_selection_late(event):
+        w = event.widget
+        def _do():
+            _clear_full_selection(w)
+        try:
+            w.after_idle(_do)
+            w.after(1, _do)
+        except Exception:
+            _do()
+
+    try:
+        root.bind_class("TEntry", "<FocusIn>", _clear_full_selection_late, add="+")
+        root.bind_class("TCombobox", "<FocusIn>", _clear_full_selection_late, add="+")
+        root.bind_class("TCombobox", "<<ComboboxSelected>>", _clear_full_selection_late, add="+")
+    except Exception:
+        pass
+
+
+# Main GUI entry (builds all tabs + wires callbacks)
 def launch_gui():
+    # Check for required/optional dependencies first
+    check_dependencies()
+
+    # --- Set AppUserModelID early (must happen before creating the Tk root) ---
+    if platform.system() == "Windows":
+        try:
+            MYAPPID = "com.mrboxik.snowrunnereditor"
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(MYAPPID)
+            print("[DEBUG] AppUserModelID set:", MYAPPID)
+        except Exception as e:
+            print("[AppID Warning]", e)
+    
     global max_backups_var, make_backup_var, full_backup_var, save_path_var
-    global money_var, rank_var, time_preset_var, skip_time_var
+    global money_var, rank_var, time_preset_var, skip_time_var, time_presets
     global custom_day_var, custom_night_var, other_season_var
     global FACTOR_RULE_VARS, rule_savers, plugin_loaders
     global tyre_var, delete_path_on_close_var, dont_remember_path_var, autosave_var
     
     # Create root window first
     root = tk.Tk()
-    root.geometry("900x900")
     root.title("SnowRunner Editor")
+    # Hide during initial layout to avoid size jump on startup
+    try:
+        root.withdraw()
+    except Exception:
+        pass
+
+    # Hide dotted focus rectangles (configurable via config key: hide_focus_outlines)
+    try:
+        _cfg = load_config() or {}
+    except Exception:
+        _cfg = {}
+    if _cfg.get("hide_focus_outlines", True):
+        _apply_focus_outline_fix(root)
     # Try to set a cross-platform application icon (app_icon.ico for Windows, app_icon.png for others).
     try:
         set_app_icon(root)
@@ -6325,15 +10190,6 @@ def launch_gui():
         full_backup_var.set(cfg.get("full_backup", False))
     except Exception:
         pass
-
-    # --- Set AppUserModelID early (must happen before icon usage) ---
-    if platform.system() == "Windows":
-        try:
-            MYAPPID = "com.mrboxik.snowrunnereditor"
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(MYAPPID)
-            print("[DEBUG] AppUserModelID set:", MYAPPID)
-        except Exception as e:
-            print("[AppID Warning]", e)
 
     check_for_updates_background(root, debug=True)
 
@@ -6453,43 +10309,8 @@ def launch_gui():
                     except Exception as e:
                         print("Plugin loader failed:", e)
 
-            # --- Time settings (use the actual GUI var names used in your time tab) ---
-            if "custom_day_var" in globals():
-                try:
-                    custom_day_var.set(round(float(day), 2) if day is not None else 1.0)
-                except Exception:
-                    custom_day_var.set(1.0)
-
-            if "custom_night_var" in globals():
-                try:
-                    custom_night_var.set(round(float(night), 2) if night is not None else 1.0)
-                except Exception:
-                    custom_night_var.set(1.0)
-
-            if "skip_time_var" in globals():
-                skip_time_var.set(bool(skip_time))
-
-            # also push values to the raw stringvars so they're in sync too
-            if "time_day_var" in globals() and day is not None:
-                time_day_var.set(str(day))
-            if "time_night_var" in globals() and night is not None:
-                time_night_var.set(str(night))
-
-            # detect matching preset
-            if "time_preset_var" in globals():
-                matched_preset = None
-                try:
-                    for preset_name, (p_day, p_night) in time_presets.items():
-                        if (
-                            day is not None and night is not None
-                            and float(day) == float(p_day)
-                            and float(night) == float(p_night)
-                        ):
-                            matched_preset = preset_name
-                            break
-                except Exception:
-                    matched_preset = None
-                time_preset_var.set(matched_preset if matched_preset else "Custom")
+            # --- Time settings ---
+            _sync_time_ui(day=day, night=night, skip_time=skip_time)
                 
             # --- other optional UI flags (if present) ---
             if "other_season_var" in globals():
@@ -6504,6 +10325,30 @@ def launch_gui():
 
         except Exception as e:
             print("Failed to sync all rules:", e)
+
+    def _refresh_all_tabs_from_save(path):
+        """Centralized refresh after a save path is selected."""
+        try:
+            sync_all_rules(path)
+        except Exception as e:
+            print(f"sync_all_rules failed: {e}")
+        # Ensure Tk flushes variable -> widget updates
+        try:
+            root.update_idletasks()
+            root.update()
+        except Exception:
+            try:
+                tk._default_root.update_idletasks()
+                tk._default_root.update()
+            except Exception:
+                pass
+
+    # Expose refresh helpers to module-level code that uses globals()
+    try:
+        globals()["sync_all_rules"] = sync_all_rules
+        globals()["_refresh_all_tabs_from_save"] = _refresh_all_tabs_from_save
+    except Exception:
+        pass
 
     difficulty_map = {0: "Normal", 1: "Hard", 2: "New Game+"}
     reverse_difficulty_map = {v: k for k, v in difficulty_map.items()}
@@ -6662,32 +10507,12 @@ def launch_gui():
         # Persist the selection
         save_path(file_path)
 
-        # Call plugin GUI loaders to refresh their values from file
-        for loader in plugin_loaders:
-            try:
-                loader(file_path)
-            except Exception as e:
-                print(f"Plugin failed to update GUI from file: {e}")
-
-        # PRIMARY: use the single source-of-truth refresher if available
-        if "sync_all_rules" in globals():
-            try:
-                print("[DEBUG] browse_file → calling sync_all_rules for:", file_path)
-                sync_all_rules(file_path)
-                # Force the Tk mainloop to process pending variable->widget updates
-                try:
-                    root.update_idletasks()
-                    root.update()
-                except Exception:
-                    # in case 'root' isn't available in this scope, try default_root
-                    try:
-                        tk._default_root.update_idletasks()
-                        tk._default_root.update()
-                    except Exception:
-                        pass
-                return
-            except Exception as e:
-                print(f"sync_all_rules failed: {e}")
+        # Centralized refresh
+        try:
+            _refresh_all_tabs_from_save(file_path)
+            return
+        except Exception as e:
+            print(f"_refresh_all_tabs_from_save failed: {e}")
 
         # FALLBACK: manual UI update (keeps previous behavior if sync_all_rules is not defined)
         try:
@@ -6745,15 +10570,9 @@ def launch_gui():
             except Exception:
                 pass
 
-            # Time preset matching (guarded)
+            # Time UI (sliders + preset)
             try:
-                if day is not None and night is not None and "time_preset_var" in globals() and time_preset_var is not None:
-                    match = next(
-                        (k for k, v in time_presets.items()
-                         if abs(day - v[0]) < 0.01 and abs(night - v[1]) < 0.01),
-                        "Custom"
-                    )
-                    time_preset_var.set(match)
+                _sync_time_ui(day=day, night=night, skip_time=s)
             except Exception:
                 pass
 
@@ -6767,36 +10586,79 @@ def launch_gui():
             return
 
 
+    # -------------------------------------------------------------------------
+    # NOTEBOOK + TAB REGISTRY (content is built below)
+    # -------------------------------------------------------------------------
     tab_control = ttk.Notebook(root)
     tab_file = ttk.Frame(tab_control)
     tab_money = ttk.Frame(tab_control)
     tab_missions = ttk.Frame(tab_control)
     tab_rules = ttk.Frame(tab_control)
     tab_time = ttk.Frame(tab_control)
+
+    # TAB: Save File (inline UI built below)
     tab_control.add(tab_file, text='Save File')
+
+    # TAB: Backups (create_backups_tab)
     tab_backups = ttk.Frame(tab_control)
     tab_control.add(tab_backups, text='Backups')
     create_backups_tab(tab_backups, save_path_var)
+
+    # TAB: Money & Rank (inline UI built below)
     tab_control.add(tab_money, text='Money & Rank')
+
+    # TAB: Missions (inline UI built below)
     tab_control.add(tab_missions, text='Missions')
+
+    # TAB: Contests (create_contest_tab)
     tab_contests = ttk.Frame(tab_control)
     tab_control.add(tab_contests, text='Contests')
     create_contest_tab(tab_contests, save_path_var)
+
+    # TAB: Objectives+ (create_objectives_tab)
     tab_objectives = ttk.Frame(tab_control)
     tab_control.add(tab_objectives, text='Objectives+')
     create_objectives_tab(tab_objectives, save_path_var)
+
+    # TAB: Trials (create_trials_tab)
     tab_trials = ttk.Frame(tab_control)
     tab_control.add(tab_trials, text='Trials')
     create_trials_tab(tab_trials, save_path_var, plugin_loaders)
+
+    # TAB: Achievements (create_achievements_tab)
     tab_achievements = ttk.Frame(tab_control)
     tab_control.add(tab_achievements, text='Achievements')
     create_achievements_tab(tab_achievements, save_path_var, plugin_loaders)
+
+    # TAB: PROS (create_pros_tab)
+    tab_pros = ttk.Frame(tab_control)
+    tab_control.add(tab_pros, text='PROS')
+    create_pros_tab(tab_pros, save_path_var, plugin_loaders)
+
+    # TAB: Upgrades (create_upgrades_tab)
     tab_upgrades = ttk.Frame(tab_control)
     tab_control.add(tab_upgrades, text='Upgrades')
     create_upgrades_tab(tab_upgrades, save_path_var)
+
+    # TAB: Watchtowers (create_watchtowers_tab)
     tab_watchtowers = ttk.Frame(tab_control)
     tab_control.add(tab_watchtowers, text="Watchtowers")
     create_watchtowers_tab(tab_watchtowers, save_path_var)
+
+    # TAB: Discoveries (create_discoveries_tab)
+    tab_discoveries = ttk.Frame(tab_control)
+    tab_control.add(tab_discoveries, text="Discoveries")
+    create_discoveries_tab(tab_discoveries, save_path_var)
+
+    # TAB: Levels (create_levels_tab)
+    tab_levels = ttk.Frame(tab_control)
+    tab_control.add(tab_levels, text="Levels")
+    create_levels_tab(tab_levels, save_path_var)
+
+    # TAB: Garages (create_garages_tab)
+    tab_garages = ttk.Frame(tab_control)
+    tab_control.add(tab_garages, text="Garages")
+    create_garages_tab(tab_garages, save_path_var)
 
 
     # start autosave monitor if autosave enabled in config
@@ -6814,22 +10676,28 @@ def launch_gui():
         pass
 
 
-    # ---------- Initialize Rules tab UI ----------
+    # TAB: Rules (create_rules_tab)
     try:
         create_rules_tab(tab_rules, save_path_var)
     except Exception as e:
         ttk.Label(tab_rules, text=f"Failed to initialize Rules tab:\n{e}", foreground="red", wraplength=600, justify="center").pack(fill="both", expand=True, padx=10, pady=10)
-    # ---------- End Rules init ----------
+    # End TAB: Rules
 
     tab_control.add(tab_rules, text='Rules')
+
+    # TAB: Time (inline UI built below)
     tab_control.add(tab_time, text='Time')
+
+    # TAB: Game Stats (create_game_stats_tab)
     tab_stats = ttk.Frame(tab_control)
     tab_control.add(tab_stats, text="Game Stats")
     create_game_stats_tab(tab_stats, save_path_var, plugin_loaders)
+
+    # TAB: Settings (inline UI built below)
     tab_settings = ttk.Frame(tab_control)
     tab_control.add(tab_settings, text='Settings')
 
-    # Create Fog Tool tab
+    # TAB: Fog Tool (FogToolFrame)
     tab_fog = ttk.Frame(tab_control)
 
     if FogToolFrame is not None:
@@ -6862,8 +10730,10 @@ def launch_gui():
         ).pack(expand=True, fill="both", padx=20, pady=20)
 
     tab_control.add(tab_fog, text="Fog Tool")
+    # End TAB: Fog Tool
 
     tab_control.pack(expand=1, fill='both')
+    # End NOTEBOOK + TAB REGISTRY
     # ensure Settings is last
     try:
         tab_control.forget(tab_settings)   # remove if already added
@@ -6888,6 +10758,9 @@ def launch_gui():
         pass
 
 
+    # -------------------------------------------------------------------------
+    # TAB UI: Settings (tab_settings)
+    # -------------------------------------------------------------------------
     ttk.Checkbutton(tab_settings, text="Don't remember save file path", variable=dont_remember_path_var).pack(pady=(10, 0))
     ttk.Checkbutton(tab_settings, text="Delete saved path on close", variable=delete_path_on_close_var).pack(pady=(5, 10))
     def save_settings_silent():
@@ -6906,8 +10779,7 @@ def launch_gui():
         messagebox.showinfo("Settings", "Settings have been saved.")
 
         if delete_path_on_close_var.get():
-            if os.path.exists(SAVE_PATH_FILE):
-                os.remove(SAVE_PATH_FILE)
+            _delete_config_keys(["last_save_path"])
         elif not dont_remember_path_var.get():
             save_path(save_path_var.get())
 
@@ -6917,26 +10789,101 @@ def launch_gui():
             messagebox.showwarning("Unavailable", "This feature only works in the built version.")
             return
 
-        if platform.system() != "Windows":
-            messagebox.showwarning("Unsupported", "This feature is only available on Windows.")
-            return
-
         try:
-            import pythoncom
-            from win32com.client import Dispatch
-
-            exe_path = sys.executable
+            exe_path = os.path.abspath(sys.executable)
             desktop = get_desktop_path()
-            shortcut_path = os.path.join(desktop, "SnowRunner Editor.lnk")
+            app_name = "SnowRunner Editor"
+            system = platform.system()
 
-            shell = Dispatch('WScript.Shell')
-            shortcut = shell.CreateShortcut(shortcut_path)
-            shortcut.TargetPath = exe_path
-            shortcut.WorkingDirectory = os.path.dirname(exe_path)
-            shortcut.IconLocation = exe_path
-            shortcut.save()
+            def _run_powershell(ps_command: str):
+                for exe in ("powershell", "pwsh"):
+                    try:
+                        result = subprocess.run(
+                            [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command],
+                            capture_output=True,
+                            text=True,
+                        )
+                        if result.returncode == 0:
+                            return
+                        last_error = result.stderr.strip() or result.stdout.strip()
+                    except FileNotFoundError:
+                        last_error = f"{exe} not found"
+                        continue
+                raise RuntimeError(last_error or "PowerShell failed")
 
-            messagebox.showinfo("Success", f"Shortcut created:\n{shortcut_path}")
+            def _ps_quote(value: str) -> str:
+                # PowerShell single-quoted string escaping
+                return "'" + value.replace("'", "''") + "'"
+
+            if system == "Windows":
+                shortcut_path = os.path.join(desktop, f"{app_name}.lnk")
+                ps = (
+                    "$W = New-Object -ComObject WScript.Shell; "
+                    f"$S = $W.CreateShortcut({_ps_quote(shortcut_path)}); "
+                    f"$S.TargetPath = {_ps_quote(exe_path)}; "
+                    f"$S.WorkingDirectory = {_ps_quote(os.path.dirname(exe_path))}; "
+                    f"$S.IconLocation = {_ps_quote(exe_path)}; "
+                    "$S.Save()"
+                )
+                _run_powershell(ps)
+                messagebox.showinfo("Success", f"Shortcut created:\n{shortcut_path}")
+                return
+
+            if system == "Darwin":
+                # Prefer Finder alias via AppleScript (no extra dependencies)
+                alias_path = os.path.join(desktop, f"{app_name}")
+                try:
+                    def _osa_quote(value: str) -> str:
+                        return value.replace('"', '\\"')
+                    osa = (
+                        'tell application "Finder" to make alias file to POSIX file "'
+                        + _osa_quote(exe_path)
+                        + '" at POSIX file "'
+                        + _osa_quote(desktop)
+                        + '"'
+                    )
+                    result = subprocess.run(
+                        ["osascript", "-e", osa],
+                        capture_output=True,
+                        text=True,
+                    )
+                    if result.returncode == 0:
+                        messagebox.showinfo("Success", f"Alias created on Desktop:\n{alias_path}")
+                        return
+                except Exception:
+                    pass
+
+                # Fallback: create a .command launcher
+                command_path = os.path.join(desktop, f"{app_name}.command")
+                with open(command_path, "w", encoding="utf-8") as f:
+                    f.write("#!/bin/bash\n")
+                    f.write(f"\"{exe_path}\" &\n")
+                try:
+                    os.chmod(command_path, 0o755)
+                except Exception:
+                    pass
+                messagebox.showinfo("Success", f"Launcher created:\n{command_path}")
+                return
+
+            # Linux and other Unix-like systems: create a .desktop entry
+            desktop_entry_path = os.path.join(desktop, f"{app_name}.desktop")
+            exe_path_escaped = exe_path.replace(" ", "\\ ")
+            lines = [
+                "[Desktop Entry]",
+                "Type=Application",
+                f"Name={app_name}",
+                f"Exec={exe_path_escaped}",
+                f"Path={os.path.dirname(exe_path)}",
+                "Terminal=false",
+                "Categories=Utility;",
+            ]
+            with open(desktop_entry_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            try:
+                os.chmod(desktop_entry_path, 0o755)
+            except Exception:
+                pass
+            messagebox.showinfo("Success", f"Shortcut created:\n{desktop_entry_path}")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create shortcut:\n{e}")
 
@@ -6955,6 +10902,12 @@ def launch_gui():
     ttk.Button(tab_settings, text="Make a Backup", command=make_backup_now).pack(pady=(5, 10))
 
     def manual_update_check():
+        if requests is None:
+            messagebox.showwarning(
+                "Missing dependency",
+                "requests is required to check for updates.\nRun: pip install requests"
+            )
+            return
         check_for_updates_background(root, debug=True)
 
     ttk.Button(tab_settings, text="Check for Update", command=manual_update_check).pack(pady=(5, 10))
@@ -6968,7 +10921,13 @@ def launch_gui():
         minesweeper_frame.pack(pady=5)
         MinesweeperApp(minesweeper_frame)
 
-    # Save file tab
+    # -------------------------------------------------------------------------
+    # END TAB UI: Settings
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # TAB UI: Save File (tab_file)
+    # -------------------------------------------------------------------------
     ttk.Label(tab_file, text="Selected Save File:").pack(pady=10)
 
     # Main container for the save-path controls (vertical layout)
@@ -6993,36 +10952,42 @@ def launch_gui():
         """Validate candidate_path and, if valid, set save_path_var and run normal sync."""
         if not candidate_path or not os.path.exists(candidate_path):
             return messagebox.showerror("Not found", f"Path not found:\n{candidate_path}")
-        try:
-            # quick read + reuse existing parsing/validation
-            with open(candidate_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            m, r, xp, d, t, s, day, night, tp = get_file_info(content)
-            if day is None or night is None:
-                raise ValueError("Missing time settings")
-        except Exception as e:
-            return messagebox.showerror("Invalid save", f"Selected file could not be validated:\n{e}")
+
+        file_path = candidate_path
+
+        # Keep the same validation + version-mismatch flow as Browse...
+        while True:
+            try:
+                # quick read + reuse existing parsing/validation
+                with open(file_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                m, r, xp, d, t, s, day, night, tp = get_file_info(content)
+                if day is None or night is None:
+                    raise ValueError("Missing time settings")
+            except Exception as e:
+                return messagebox.showerror("Invalid save", f"Selected file could not be validated:\n{e}")
+
+            # Run version mismatch check (same as Browse)
+            action, new_path = prompt_save_version_mismatch_and_choose(file_path)
+            if action == "error":
+                save_path_var.set("")
+                return
+            if action == "select" and new_path:
+                file_path = new_path
+                continue
+
+            # action == "ok"
+            break
 
         # Accept and persist into UI + existing save behavior
-        save_path_var.set(candidate_path)
+        save_path_var.set(file_path)
         try:
-            save_path(candidate_path)
+            save_path(file_path)
         except Exception:
             pass
-
-        # plugin loaders + global sync (best-effort)
+        # Centralized refresh (best-effort)
         try:
-            for loader in plugin_loaders:
-                try:
-                    loader(candidate_path)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        try:
-            if "sync_all_rules" in globals():
-                sync_all_rules(candidate_path)
+            _refresh_all_tabs_from_save(file_path)
         except Exception:
             pass
 
@@ -7057,12 +11022,21 @@ def launch_gui():
         """Best-effort scan for Steam userdata -> */1465360/remote that contain CompleteSave files."""
         candidates = []
         env_candidates = []
-        pf86 = os.environ.get("PROGRAMFILES(X86)") or os.environ.get("PROGRAMFILES")
-        if pf86:
-            env_candidates.append(os.path.join(pf86, "Steam", "userdata"))
-        env_candidates.append(os.path.join(os.path.expanduser("~"), "AppData", "Local", "Steam", "userdata"))
-        env_candidates.append(os.path.join("C:\\", "Program Files (x86)", "Steam", "userdata"))
-        env_candidates.append(os.path.join("D:\\", "Program Files (x86)", "Steam", "userdata"))
+        system = platform.system()
+        if system == "Windows":
+            pf86 = os.environ.get("PROGRAMFILES(X86)") or os.environ.get("PROGRAMFILES")
+            if pf86:
+                env_candidates.append(os.path.join(pf86, "Steam", "userdata"))
+            env_candidates.append(os.path.join(os.path.expanduser("~"), "AppData", "Local", "Steam", "userdata"))
+            env_candidates.append(os.path.join("C:\\", "Program Files (x86)", "Steam", "userdata"))
+            env_candidates.append(os.path.join("D:\\", "Program Files (x86)", "Steam", "userdata"))
+        elif system == "Darwin":
+            env_candidates.append(os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Steam", "userdata"))
+        else:
+            env_candidates.append(os.path.join(os.path.expanduser("~"), ".local", "share", "Steam", "userdata"))
+            env_candidates.append(os.path.join(os.path.expanduser("~"), ".steam", "steam", "userdata"))
+            env_candidates.append(os.path.join(os.path.expanduser("~"), ".steam", "root", "userdata"))
+            env_candidates.append(os.path.join(os.path.expanduser("~"), ".var", "app", "com.valvesoftware.Steam", "data", "Steam", "userdata"))
 
         for root in env_candidates:
             if not root or not os.path.isdir(root):
@@ -7079,14 +11053,37 @@ def launch_gui():
                 continue
 
         # try parsing libraryfolders.vdf for additional library paths
-        steam_config = os.path.join(os.path.expanduser("~"), "AppData", "Local", "Steam", "steamapps")
-        library_vdf = os.path.join(steam_config, "libraryfolders.vdf")
-        if os.path.exists(library_vdf):
+        def _extract_library_paths(txt):
+            paths = []
+            if system == "Windows":
+                for m in re.finditer(r'\"(.:\\\\[^"]*?)\"', txt):
+                    p = m.group(1).replace("\\\\", "\\")
+                    paths.append(p)
+            else:
+                for m in re.finditer(r'\"path\"\\s*\"([^\"]+)\"', txt):
+                    paths.append(m.group(1))
+                for m in re.finditer(r'\"\\d+\"\\s*\"([^\"]+)\"', txt):
+                    paths.append(m.group(1))
+            return paths
+
+        steamapps_candidates = []
+        if system == "Windows":
+            steamapps_candidates.append(os.path.join(os.path.expanduser("~"), "AppData", "Local", "Steam", "steamapps"))
+        elif system == "Darwin":
+            steamapps_candidates.append(os.path.join(os.path.expanduser("~"), "Library", "Application Support", "Steam", "steamapps"))
+        else:
+            steamapps_candidates.append(os.path.join(os.path.expanduser("~"), ".local", "share", "Steam", "steamapps"))
+            steamapps_candidates.append(os.path.join(os.path.expanduser("~"), ".steam", "steam", "steamapps"))
+            steamapps_candidates.append(os.path.join(os.path.expanduser("~"), ".var", "app", "com.valvesoftware.Steam", "data", "Steam", "steamapps"))
+
+        for steam_config in steamapps_candidates:
+            library_vdf = os.path.join(steam_config, "libraryfolders.vdf")
+            if not os.path.exists(library_vdf):
+                continue
             try:
                 with open(library_vdf, "r", encoding="utf-8", errors="ignore") as f:
                     txt = f.read()
-                for m in re.finditer(r'\"(.:\\\\[^"]*?)\"', txt):
-                    p = m.group(1).replace("\\\\", "\\")
+                for p in _extract_library_paths(txt):
                     userdata = os.path.join(p, "userdata")
                     if os.path.isdir(userdata):
                         try:
@@ -7117,7 +11114,7 @@ def launch_gui():
             for p in candidates:
                 def _h(pp=p, w=win):
                     return lambda: (_choose_complete_save_in_folder(pp), w.destroy())
-                ttk.Button(frame, text=os.path.basename(os.path.dirname(os.path.dirname(pp))) + " / " + os.path.basename(pp), command=_h()).pack(fill="x", pady=2)
+                ttk.Button(frame, text=os.path.basename(os.path.dirname(os.path.dirname(p))) + " / " + os.path.basename(p), command=_h()).pack(fill="x", pady=2)
 
     def _find_epic_saves():
         """Check %USERPROFILE%\\Documents\\My Games\\SnowRunner\\base\\storage\\<id> for CompleteSave files."""
@@ -7151,7 +11148,7 @@ def launch_gui():
             for p in found_folders:
                 def _h(pp=p, w=win):
                     return lambda: (_choose_complete_save_in_folder(pp), w.destroy())
-                ttk.Button(frame, text=os.path.basename(pp), command=_h()).pack(fill="x", pady=2)
+                ttk.Button(frame, text=os.path.basename(p), command=_h()).pack(fill="x", pady=2)
 
     def _load_saved_path(slot_idx: int):
         p = _get_saved_path(slot_idx)
@@ -7223,16 +11220,48 @@ def launch_gui():
         font=("TkDefaultFont", 9, "bold")
     ).pack(pady=(5, 10))
 
-    # Footer text at the bottom of the Save File tab
+    # Footer text pinned to bottom center of the Save File tab
+    footer_frame = ttk.Frame(tab_file)
+    footer_frame.place(relx=0.5, rely=1.0, anchor="s", y=-10)
+
     ttk.Label(
-        tab_file,
+        footer_frame,
         text="Made with hatred for bugs by: MrBoxik",
+        foreground="black",
+        font=("TkDefaultFont", 11, "bold"),
+        justify="center"
+    ).pack()
+
+    _version_text = f"Version: {APP_VERSION}"
+    try:
+        status = globals().get("_UPDATE_STATUS")
+        if status == "update":
+            _version_text = f"Version: {APP_VERSION} (update available)"
+        elif status == "dev":
+            _version_text = f"Version: {APP_VERSION} (dev build)"
+    except Exception:
+        pass
+
+    _VERSION_FOOTER_LABEL = ttk.Label(
+        footer_frame,
+        text=_version_text,
         foreground="black",
         font=("TkDefaultFont", 9),
         justify="center"
-    ).pack(pady=(350, 5))
+    )
+    _VERSION_FOOTER_LABEL.pack()
+    try:
+        globals()["_VERSION_FOOTER_LABEL"] = _VERSION_FOOTER_LABEL
+    except Exception:
+        pass
 
-    # Money tab
+    # -------------------------------------------------------------------------
+    # END TAB UI: Save File
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # TAB UI: Money & Rank (tab_money)
+    # -------------------------------------------------------------------------
     # Money & Rank tab (new layout + helpers)
     def _write_json_key_to_file(path, key, value):
         """Helper: safe replace/insert using _set_key_in_text (uses json.dumps)."""
@@ -7565,71 +11594,43 @@ def launch_gui():
     except Exception:
         ttk.Label(req_frame, text="No XP table available.").pack(anchor="center")
 
-    # Missions tab
-    seasons = [
-        "Season 1: Search & Recover (Kola Peninsula)",
-        "Season 2: Explore & Expand (Yukon)",
-        "Season 3: Locate & Deliver (Wisconsin)",
-        "Season 4: New Frontiers (Amur)",
-        "Season 5: Build & Dispatch (Don)",
-        "Season 6: Haul & Hustle (Maine)",
-        "Season 7: Compete & Conquer (Tennessee)",
-        "Season 8: Grand Harvest (Glades)",
-        "Season 9: Renew & Rebuild (Ontario)",
-        "Season 10: Fix & Connect (British Columbia)",
-        "Season 11: Lights & Cameras (Scandinavia)",
-        "Season 12: Public Energy (North Carolina)",
-        "Season 13: Dig & Drill (Almaty)",
-        "Season 14: Reap & Sow (Austria)",
-        "Season 15: Oil & Dirt (Quebec)",
-        "Season 16: High Voltage (Washington)",
-        "Season 17: Repair & Rescue (Zurdania)"
-    ]
-    season_vars = []
-    season_frame = ttk.Frame(tab_missions)
-    season_frame.pack(pady=10)
-    left_column = ttk.Frame(season_frame)
-    left_column.pack(side='left', padx=10, anchor='n')
-    right_column = ttk.Frame(season_frame)
-    right_column.pack(side='left', padx=10, anchor='n')
-    for i, name in enumerate(seasons, 1):
-        var = tk.IntVar()
-        season_vars.append((i, var))
-        column = left_column if i <= len(seasons) / 2 else right_column
-        ttk.Checkbutton(column, text=name, variable=var).pack(anchor='w', pady=2)
+    # -------------------------------------------------------------------------
+    # END TAB UI: Money & Rank
+    # -------------------------------------------------------------------------
 
-    ttk.Label(tab_missions, text="Other Season number (e.g. 18, 19, 20)").pack(pady=5)
-    ttk.Entry(tab_missions, textvariable=other_season_var).pack(pady=5)
-
-    ttk.Label(tab_missions, text="Base Game Maps:", font=("TkDefaultFont", 10, "bold")).pack(pady=5)
-
-    map_frame = ttk.Frame(tab_missions)              # new frame
-    map_frame.pack(anchor="center", pady=5)          # center the block
-
-    base_maps = [("Michigan", "US_01"), ("Alaska", "US_02"), ("Taymyr", "RU_02")]
-    base_map_vars = []
-
-    for name, map_id in base_maps:
-        var = tk.IntVar()
-        base_map_vars.append((map_id, var))
-        ttk.Checkbutton(map_frame, text=name, variable=var).pack(anchor="w")  # left align
-
+    # -------------------------------------------------------------------------
+    # TAB UI: Missions (tab_missions)
+    # -------------------------------------------------------------------------
+    seasons = [(name, i) for i, name in enumerate(SEASON_LABELS, start=1)]
+    base_maps = [(name, code) for code, name in BASE_MAPS]
+    selector = _build_region_selector(
+        tab_missions,
+        seasons,
+        base_maps,
+        other_var=other_season_var,
+        base_maps_label="Base Game Maps:",
+        base_maps_label_font=("TkDefaultFont", 10, "bold"),
+        season_pady=10
+    )
+    season_vars = selector["season_vars"]
+    base_map_vars = selector["map_vars"]
+    all_check_vars = selector["all_check_vars"]
 
     def run_complete():
         make_backup_if_enabled(save_path_var.get())
         if not os.path.exists(save_path_var.get()):
             messagebox.showerror("Error", "Save file not found.")
             return
-        selected_seasons = [i for i, var in season_vars if var.get() == 1]
-        if other_season_var.get().isdigit():
-            selected_seasons.append(int(other_season_var.get()))
-        selected_maps = [map_id for map_id, var in base_map_vars if var.get() == 1]
+        selected_seasons = _collect_checked_values(season_vars)
+        _append_other_season_int(selected_seasons, other_season_var)
+        selected_maps = _collect_checked_values(base_map_vars)
         if not selected_seasons and not selected_maps:
             messagebox.showinfo("Info", "No seasons or maps selected.")
             return
         complete_seasons_and_maps(save_path_var.get(), selected_seasons, selected_maps)
 
     ttk.Button(tab_missions, text="Complete Selected Missions", command=run_complete).pack(pady=10)
+    _add_check_all_checkbox(tab_missions, all_check_vars)
 
     # Disclaimer below the complete button
     ttk.Label(
@@ -7642,7 +11643,13 @@ def launch_gui():
     ).pack(pady=(5, 15))
 
 
-    # Time tab
+    # -------------------------------------------------------------------------
+    # END TAB UI: Missions
+    # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # TAB UI: Time (tab_time)
+    # -------------------------------------------------------------------------
     ttk.Label(tab_time, text="Time Preset:").pack(pady=10)
     ttk.Combobox(tab_time, textvariable=time_preset_var, values=list(time_presets.keys()), state="readonly", width=30).pack(pady=5)
     ttk.Checkbutton(tab_time, text="Enable Time Skipping", variable=skip_time_var).pack(pady=10)
@@ -7690,6 +11697,47 @@ def launch_gui():
     except Exception:
         custom_night_var.set(1.0)
 
+    # --- Time preset <-> custom sliders sync ---
+    def _on_time_preset_change(*_):
+        if _TIME_SYNC_GUARD:
+            return
+        preset = time_preset_var.get()
+        if not preset:
+            return
+        if preset != "Custom":
+            day_night = time_presets.get(preset, (1.0, 1.0))
+            _sync_time_ui(day=day_night[0], night=day_night[1], preset_name=preset)
+
+    def _on_custom_time_change(*_):
+        if _TIME_SYNC_GUARD:
+            return
+        try:
+            if time_preset_var.get() != "Custom":
+                _sync_time_ui(
+                    day=custom_day_var.get(),
+                    night=custom_night_var.get(),
+                    preset_name="Custom"
+                )
+        except Exception:
+            pass
+
+    try:
+        time_preset_var.trace_add("write", _on_time_preset_change)
+    except Exception:
+        try:
+            time_preset_var.trace("w", _on_time_preset_change)
+        except Exception:
+            pass
+
+    for _v in (custom_day_var, custom_night_var):
+        try:
+            _v.trace_add("write", _on_custom_time_change)
+        except Exception:
+            try:
+                _v.trace("w", _on_custom_time_change)
+            except Exception:
+                pass
+
 
     ttk.Label(tab_time, text="""ℹ️ Time Speed Settings:
   2.0 = Twice as fast
@@ -7718,7 +11766,10 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
 
     ttk.Button(tab_time, text="Apply Time Settings", command=update_time_btn).pack(pady=20)
 
-    
+    # -------------------------------------------------------------------------
+    # END TAB UI: Time
+    # -------------------------------------------------------------------------
+
     if os.path.exists(save_path_var.get()):
         sync_rule_dropdowns(save_path_var.get())
 
@@ -7735,9 +11786,9 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
     # External rules/extensions no longer mounted into the Rules tab (tab intentionally left empty).
 
     
-    if delete_path_on_close_var.get() and os.path.exists(SAVE_PATH_FILE):
+    if delete_path_on_close_var.get():
         try:
-            os.remove(SAVE_PATH_FILE)
+            _delete_config_keys(["last_save_path"])
         except Exception as e:
             print("[Warning] Could not delete save path:", e)
 
@@ -7748,14 +11799,79 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
             print("[DEBUG] Auto-sync applied on startup.")
         except Exception as e:
             print("[Warning] Auto-sync failed:", e)
-            
-    root.mainloop()
-def write_save_file(path, content):
+
+    # --- Auto-size window to show all tabs and full Rules tab content ---
+    def _fit_window_to_tabs_and_rules():
+        try:
+            root.update_idletasks()
+            # Compute actual tab header width from the last tab bbox (more accurate)
+            header_width = 0
+            try:
+                tab_count = tab_control.index("end")
+            except Exception:
+                tab_count = 0
+            if tab_count > 0:
+                try:
+                    x, y, w, h = tab_control.bbox(tab_count - 1)
+                    header_width = x + w
+                except Exception:
+                    header_width = 0
+
+            if not header_width:
+                # Fallback: text width estimate with smaller padding
+                try:
+                    font = tkfont.nametofont("TkDefaultFont")
+                except Exception:
+                    font = tkfont.Font()
+                tab_texts = []
+                for i in range(tab_count):
+                    try:
+                        tab_texts.append(tab_control.tab(i, "text"))
+                    except Exception:
+                        pass
+                text_width = sum(font.measure(t) for t in tab_texts)
+                header_width = text_width + (12 * tab_count) + 20
+
+            nb_req_w = tab_control.winfo_reqwidth()
+            nb_req_h = tab_control.winfo_reqheight()
+            rules_req_w = tab_rules.winfo_reqwidth() if 'tab_rules' in locals() else 0
+            rules_req_h = tab_rules.winfo_reqheight() if 'tab_rules' in locals() else 0
+
+            # Use full rules content height if available (so all rules are visible)
+            rules_frame = globals().get("_RULES_CONTENT_FRAME")
+            if rules_frame is not None:
+                try:
+                    rules_req_w = max(rules_req_w, rules_frame.winfo_reqwidth())
+                    rules_req_h = max(rules_req_h, rules_frame.winfo_reqheight())
+                except Exception:
+                    pass
+
+            target_w = int(max(header_width, nb_req_w, rules_req_w) + 16)
+            target_h = int(max(nb_req_h, rules_req_h) + 60)
+            if target_w > 0 and target_h > 0:
+                root.geometry(f"{target_w}x{target_h}")
+        except Exception as e:
+            print("[Warning] auto-size failed:", e)
+
+    # Size before showing the window (avoid visible resize jump)
+    _fit_window_to_tabs_and_rules()
     try:
-        with open(path, 'w', encoding='utf-8') as f:
-            f.write(content)
-    except Exception as e:
-        messagebox.showerror("Write Error", f"Failed to save file: {e}")
+        root.update_idletasks()
+        _fit_window_to_tabs_and_rules()
+    except Exception:
+        pass
+    try:
+        root.deiconify()
+    except Exception:
+        pass
+
+    root.mainloop()
+
+# -----------------------------------------------------------------------------
+# END SECTION: Dependency Checks + App Launch
+# -----------------------------------------------------------------------------
+
 FogToolFrame = FogToolApp
 if __name__ == "__main__":
+    check_dependencies()  # Run dependency checks before UI
     launch_gui()
