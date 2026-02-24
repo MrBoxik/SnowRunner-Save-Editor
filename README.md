@@ -69,7 +69,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 > **Peace out – MrBoxik**
 
 <p align="center">
-  <img src="https://github.com/MrBoxik/SnowRunner-Save-Editor/blob/main/gifi.gif" alt="SnowRunner Save Editor demo" width="500"/>
+  <img src="https://github.com/MrBoxik/SnowRunner-Save-Editor/blob/main/app/gifi.gif" alt="SnowRunner Save Editor demo" width="500"/>
 </p>
 
 ---
