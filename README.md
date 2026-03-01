@@ -41,6 +41,9 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 - 🛡️ **Auto-backup system** (with cleanup & recall)
 - 📦 Supports **all base maps** and **Seasons 1–17** (future-ready for later seasons)
 - 📂 Remembers your **last used save file**
+- 🚚 Unstuck trucks and trailers
+- 🔁 Restart completed tasks
+- 📋 Accept all tasks
 - 👑 Unlock **PROS rewards**
 - 🏠 Unlock **garages**
 - 🔄 Built-in **update checker**
