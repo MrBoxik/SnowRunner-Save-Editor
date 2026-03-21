@@ -16,6 +16,7 @@ if platform.system() == "Windows":
 import time
 import struct
 import zlib
+import copy
 import traceback
 import shutil
 import threading
@@ -33,7 +34,9 @@ import random
 import re
 import json
 import math
-from datetime import datetime
+import hashlib
+import uuid
+from datetime import datetime, timezone
 
 # Pillow is intentionally not imported. Fog/image features below use
 # tkinter + pure-Python pixel buffers so we can avoid bundling Pillow.
@@ -51,7 +54,7 @@ _NATIVE_SHOWERROR = messagebox.showerror
 # =============================================================================
 # APP VERSION (manual)
 # =============================================================================
-APP_VERSION = 97
+APP_VERSION = 100
 _UPDATE_STATUS = None  # "update", "dev", "none"
 
 # -----------------------------------------------------------------------------
@@ -150,6 +153,7 @@ garage_refuel_var = None
 autosave_var = None
 dark_mode_var = None
 theme_preset_var = None
+objectives_safe_fallback_var = None
 _AUTOSAVE_THREAD = None
 _AUTOSAVE_STOP_EVENT = None
 _AUTOSAVE_STATE_LOCK = threading.Lock()
@@ -157,6 +161,7 @@ _AUTOSAVE_ENABLED = False
 _AUTOSAVE_FULL_BACKUP = False
 _AUTOSAVE_SAVE_PATH = ""
 _AUTOSAVE_STATE_TRACES_BOUND = False
+_WINDOWS_UPDATE_IN_PROGRESS = False
 _TIME_SYNC_GUARD = False
 _BASE_TTK_THEME = None
 _THEME_CUSTOM_PRESETS = {}
@@ -170,6 +175,28 @@ _DEFAULT_STATUS_TEXT = "Status: Ready. Select an action."
 
 SAVE_FILE_NAME = "snowrunner_editor_save.json"
 _SAVE_FILE_PATH = None
+EDITOR_DATA_DIR_NAME = "snowrunner_save_editor_data"
+_EDITOR_DATA_DIR = None
+_STATUS_LOG_PATH = None
+_STATUS_LOG_LOCK = threading.Lock()
+_LOG_STREAMS_INSTALLED = False
+_OBJECTIVES_PREFETCH_LOCK = threading.Lock()
+_OBJECTIVES_PREFETCH_STATE = {
+    "started": False,
+    "inflight": False,
+    "completed": False,
+    "built": False,
+    "error": "",
+    "last_completed_ts": 0.0,
+}
+
+# Optional "Make editor better" upload (desktop app, Save File tab)
+IMPROVE_UPLOAD_ENDPOINT = "https://broad-star-66c2.mrtnhliza.workers.dev/"
+IMPROVE_UPLOAD_ORIGIN_HEADER = "https://mrboxik.github.io"
+IMPROVE_UPLOAD_REFERER_HEADER = "https://mrboxik.github.io/snowrunner-save-editor-web/"
+IMPROVE_UPLOAD_TIMEOUT_MS = 45000
+IMPROVE_UPLOAD_MAX_FILES_PER_REQUEST = 1
+IMPROVE_UPLOAD_BETWEEN_CHUNKS_MS = 5000
 
 # -----------------------------------------------------------------------------
 # END SECTION: Global Tk/Editor State
@@ -202,6 +229,10 @@ def set_app_status(message, timeout_ms=6000):
     text = _compact_status_text(message)
     if not text:
         return
+    try:
+        _append_status_log_line(text, source="status")
+    except Exception:
+        pass
 
     root = _APP_ROOT
     status_var = _APP_STATUS_VAR
@@ -259,6 +290,124 @@ def _ensure_dir(path):
     except Exception:
         return False
 
+
+def get_editor_data_dir():
+    """Central folder for app-generated non-save files/logs/caches."""
+    global _EDITOR_DATA_DIR
+    if _EDITOR_DATA_DIR:
+        return _EDITOR_DATA_DIR
+
+    base_dir = ""
+    try:
+        home = os.path.expanduser("~")
+    except Exception:
+        home = ""
+    if home:
+        base_dir = os.path.join(home, EDITOR_DATA_DIR_NAME)
+
+    if base_dir and _ensure_dir(base_dir):
+        _EDITOR_DATA_DIR = base_dir
+        return _EDITOR_DATA_DIR
+
+    # Fallback to current working directory if home path is unavailable.
+    try:
+        fallback = os.path.join(os.getcwd(), EDITOR_DATA_DIR_NAME)
+        _ensure_dir(fallback)
+        _EDITOR_DATA_DIR = fallback
+    except Exception:
+        _EDITOR_DATA_DIR = os.getcwd()
+    return _EDITOR_DATA_DIR
+
+
+def get_status_log_path():
+    global _STATUS_LOG_PATH
+    if _STATUS_LOG_PATH:
+        return _STATUS_LOG_PATH
+    try:
+        _STATUS_LOG_PATH = os.path.join(get_editor_data_dir(), "status_logs.txt")
+    except Exception:
+        _STATUS_LOG_PATH = os.path.join(os.getcwd(), "status_logs.txt")
+    return _STATUS_LOG_PATH
+
+
+def _append_status_log_line(message, source="status"):
+    text = str(message or "").replace("\r", "")
+    if not text:
+        return
+    try:
+        lines = [ln for ln in text.split("\n") if ln.strip()]
+        if not lines:
+            return
+        path = get_status_log_path()
+        folder = os.path.dirname(path)
+        if folder:
+            _ensure_dir(folder)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _STATUS_LOG_LOCK:
+            with open(path, "a", encoding="utf-8") as fh:
+                for line in lines:
+                    fh.write(f"[{stamp}] [{source}] {line}\n")
+    except Exception:
+        # logging should never break app behavior
+        pass
+
+
+class _StreamTee:
+    """Mirror stdout/stderr to terminal and append complete lines to status log."""
+
+    def __init__(self, original, source):
+        self._original = original
+        self._source = str(source or "stdout")
+        self._buffer = ""
+
+    def write(self, data):
+        text = "" if data is None else str(data)
+        try:
+            self._original.write(text)
+        except Exception:
+            pass
+
+        if not text:
+            return 0
+
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line.strip():
+                _append_status_log_line(line, source=self._source)
+        return len(text)
+
+    def flush(self):
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+        if self._buffer.strip():
+            _append_status_log_line(self._buffer, source=self._source)
+        self._buffer = ""
+
+    def isatty(self):
+        try:
+            return bool(self._original.isatty())
+        except Exception:
+            return False
+
+
+def install_status_log_stream_tee():
+    """Install stdout/stderr tees once so terminal output is stored in status_logs.txt."""
+    global _LOG_STREAMS_INSTALLED
+    if _LOG_STREAMS_INSTALLED:
+        return
+    try:
+        if not isinstance(sys.stdout, _StreamTee):
+            sys.stdout = _StreamTee(sys.stdout, "stdout")
+        if not isinstance(sys.stderr, _StreamTee):
+            sys.stderr = _StreamTee(sys.stderr, "stderr")
+        _LOG_STREAMS_INSTALLED = True
+        _append_status_log_line("Status log capture initialized.", source="system")
+    except Exception:
+        pass
+
 def _legacy_save_candidates():
     candidates = []
     try:
@@ -297,29 +446,15 @@ def _migrate_legacy_save(target_path):
             pass
 
 def get_save_file_path():
-    """Return a writable path for Minesweeper progress data."""
+    """Return a writable path for legacy/migrated Minesweeper progress data."""
     global _SAVE_FILE_PATH
     if _SAVE_FILE_PATH:
         return _SAVE_FILE_PATH
 
-    base_dir = None
     try:
-        system = platform.system()
+        base_dir = get_editor_data_dir()
     except Exception:
-        system = None
-
-    if system == "Windows":
-        base_dir = os.getenv("LOCALAPPDATA") or os.getenv("APPDATA")
-        if base_dir:
-            base_dir = os.path.join(base_dir, "SnowRunnerEditor")
-    elif system == "Darwin":
-        base_dir = os.path.expanduser("~/Library/Application Support/SnowRunnerEditor")
-    else:
-        base_dir = os.getenv("XDG_DATA_HOME")
-        if base_dir:
-            base_dir = os.path.join(base_dir, "snowrunner_editor")
-        else:
-            base_dir = os.path.expanduser("~/.local/share/snowrunner_editor")
+        base_dir = ""
 
     if base_dir and _ensure_dir(base_dir):
         _SAVE_FILE_PATH = os.path.join(base_dir, SAVE_FILE_NAME)
@@ -2010,19 +2145,39 @@ def get_desktop_path():
         # Linux / macOS → just point to ~/Desktop (safe fallback)
         return os.path.join(os.path.expanduser("~"), "Desktop")
 
-SAVE_PATH_FILE = os.path.join(os.path.expanduser("~"), ".snowrunner_save_path.txt")  # legacy
-CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".snowrunner_editor_config.json")
+LEGACY_SAVE_PATH_FILE = os.path.join(os.path.expanduser("~"), ".snowrunner_save_path.txt")  # legacy
+SAVE_PATH_FILE = LEGACY_SAVE_PATH_FILE  # read-only migration source
+LEGACY_CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".snowrunner_editor_config.json")
+CONFIG_FILE = os.path.join(get_editor_data_dir(), "snowrunner_editor_config.json")
+
+
+def _migrate_legacy_config_if_needed():
+    if os.path.exists(CONFIG_FILE):
+        return
+    if not os.path.exists(LEGACY_CONFIG_FILE):
+        return
+    try:
+        with open(LEGACY_CONFIG_FILE, "r", encoding="utf-8") as f:
+            legacy_data = json.load(f)
+        if isinstance(legacy_data, dict):
+            save_config(legacy_data)
+    except Exception:
+        pass
+
+
 def load_config():
+    _migrate_legacy_config_if_needed()
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, "r") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
     return {}
 def save_config(data):
     try:
-        with open(CONFIG_FILE, "w") as f:
+        os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
     except Exception as e:
         print("Failed to save config:", e)
@@ -2059,6 +2214,384 @@ def _delete_config_keys(keys):
     if changed:
         _save_config_safe(cfg)
     return changed
+
+
+def _remove_var_traces(var, fallback_modes=("write", "w")):
+    """
+    Remove all traces from a tkinter Variable.
+    Uses trace_remove() first (Tcl 8.6+ / Tcl 9-safe), with trace_vdelete()
+    only as a legacy fallback.
+    """
+    if var is None:
+        return
+    try:
+        traces = var.trace_info() or []
+    except Exception:
+        traces = []
+
+    for t in traces:
+        mode = None
+        cbname = None
+        try:
+            if isinstance(t, (list, tuple)):
+                if len(t) >= 2:
+                    mode, cbname = t[0], t[1]
+                elif len(t) == 1:
+                    cbname = t[0]
+            else:
+                cbname = t
+        except Exception:
+            mode = None
+            cbname = None
+
+        if not cbname:
+            continue
+
+        removed = False
+
+        # Preferred API (no Tcl9 deprecation warning).
+        if mode is not None:
+            try:
+                var.trace_remove(mode, cbname)
+                removed = True
+            except Exception:
+                pass
+        if not removed:
+            for m in fallback_modes:
+                try:
+                    var.trace_remove(m, cbname)
+                    removed = True
+                    break
+                except Exception:
+                    pass
+
+        # Legacy fallback for very old tkinter.
+        if removed:
+            continue
+        if mode is not None:
+            try:
+                var.trace_vdelete(mode, cbname)
+                removed = True
+            except Exception:
+                pass
+        if not removed:
+            for m in fallback_modes:
+                try:
+                    var.trace_vdelete(m, cbname)
+                    removed = True
+                    break
+                except Exception:
+                    pass
+
+
+def _cfg_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "on"):
+            return True
+        if v in ("0", "false", "no", "off"):
+            return False
+        return bool(default)
+    try:
+        return bool(int(value))
+    except Exception:
+        return bool(default)
+
+
+def _parse_nonnegative_int(value, default):
+    try:
+        parsed = int(str(value).strip())
+        if parsed < 0:
+            return int(default)
+        return parsed
+    except Exception:
+        return int(default)
+
+
+def _sanitize_autosave_poll_interval_seconds(value, default=60):
+    try:
+        parsed_default = int(default)
+    except Exception:
+        parsed_default = 60
+    if parsed_default < 1:
+        parsed_default = 60
+    seconds = _parse_nonnegative_int(value, parsed_default)
+    if seconds < 1:
+        seconds = parsed_default
+    if seconds < 1:
+        seconds = 1
+    if seconds > 86400:
+        seconds = 86400
+    return seconds
+
+
+def _get_autosave_poll_interval_seconds(default=60):
+    cfg = _load_config_safe()
+    return _sanitize_autosave_poll_interval_seconds(
+        cfg.get("autosave_poll_interval_seconds", default),
+        default=default,
+    )
+
+
+def _sleep_with_stop_event(stop_event, seconds):
+    total = _sanitize_autosave_poll_interval_seconds(seconds, default=1)
+    for _ in range(total):
+        if stop_event.is_set():
+            break
+        time.sleep(1)
+
+
+def _read_backup_limits_from_config(default_backups=20, default_autobackups=50):
+    cfg = _load_config_safe()
+    max_backups = _parse_nonnegative_int(cfg.get("max_backups", default_backups), default_backups)
+    max_autobackups = _parse_nonnegative_int(cfg.get("max_autobackups", default_autobackups), default_autobackups)
+    return max_backups, max_autobackups
+
+
+def _cleanup_backup_history(backup_dir, max_backups=20, max_autobackups=50):
+    if not backup_dir or not os.path.isdir(backup_dir):
+        return
+
+    try:
+        all_entries = sorted(os.listdir(backup_dir))
+    except Exception:
+        return
+
+    normal_backups = [n for n in all_entries if n.startswith("backup-")]
+    auto_backups = [n for n in all_entries if n.startswith("autobackup-")]
+
+    if max_backups > 0 and len(normal_backups) > max_backups:
+        to_delete = normal_backups[:len(normal_backups) - max_backups]
+        for old in to_delete:
+            old_path = os.path.join(backup_dir, old)
+            try:
+                if os.path.isdir(old_path):
+                    shutil.rmtree(old_path)
+                else:
+                    os.remove(old_path)
+            except Exception:
+                pass
+        print(f"[Backup] Removed {len(to_delete)} old normal backup(s)")
+
+    if max_autobackups > 0 and len(auto_backups) > max_autobackups:
+        to_delete = auto_backups[:len(auto_backups) - max_autobackups]
+        for old in to_delete:
+            old_path = os.path.join(backup_dir, old)
+            try:
+                if os.path.isdir(old_path):
+                    shutil.rmtree(old_path)
+                else:
+                    os.remove(old_path)
+            except Exception:
+                pass
+        print(f"[Autosave] Removed {len(to_delete)} old autobackup(s)")
+
+
+def _create_timestamped_full_backup(save_dir, prefix="backup"):
+    """
+    Create a timestamped full backup folder under <save_dir>/backup.
+    Returns (backup_dir, full_dir, copied_count).
+    """
+    if not save_dir or not os.path.isdir(save_dir):
+        raise ValueError("save directory is missing or invalid")
+
+    timestamp = datetime.now().strftime(f"{prefix}-%d.%m.%Y %H-%M-%S")
+    backup_dir = os.path.join(save_dir, "backup")
+    os.makedirs(backup_dir, exist_ok=True)
+
+    full_dir = os.path.join(backup_dir, timestamp + "_full")
+    os.makedirs(full_dir, exist_ok=True)
+
+    copied = 0
+    backup_dir_abs = os.path.abspath(backup_dir)
+    for root, _, files in os.walk(save_dir):
+        if os.path.abspath(root).startswith(backup_dir_abs):
+            continue
+        for file in files:
+            if not file.lower().endswith((".cfg", ".dat")):
+                continue
+            src_path = os.path.join(root, file)
+            rel_path = os.path.relpath(src_path, save_dir)
+            dst_path = os.path.join(full_dir, rel_path)
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+            copied += 1
+
+    return backup_dir, full_dir, copied
+
+
+def _run_powershell_command(ps_command):
+    """
+    Execute a PowerShell command using either powershell or pwsh.
+    Raises RuntimeError when execution fails on all supported shells.
+    """
+    last_error = ""
+    for exe in ("powershell", "pwsh"):
+        try:
+            result = subprocess.run(
+                [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            last_error = f"{exe} not found"
+            continue
+        if result.returncode == 0:
+            return True
+        last_error = (result.stderr or result.stdout or "").strip()
+
+    raise RuntimeError(last_error or "PowerShell command failed")
+
+
+def _ps_quote(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _is_windows_startup_supported():
+    return platform.system() == "Windows"
+
+
+def _windows_startup_shortcut_path():
+    appdata = os.environ.get("APPDATA", "")
+    if not appdata:
+        return ""
+    startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+    return os.path.join(startup_dir, "SnowRunner Editor.lnk")
+
+
+def _startup_launch_target_and_args():
+    if getattr(sys, "frozen", False):
+        target = os.path.abspath(sys.executable)
+        args = ""
+        workdir = os.path.dirname(target)
+    else:
+        target = os.path.abspath(sys.executable)
+        script = os.path.abspath(sys.argv[0])
+        args = f"\"{script}\"".strip()
+        workdir = os.path.dirname(script)
+    return target, args, workdir
+
+
+def _startup_registration_metadata():
+    target, args, workdir = _startup_launch_target_and_args()
+    return {
+        "start_with_windows_registered_version": int(APP_VERSION),
+        "start_with_windows_registered_target": str(target),
+        "start_with_windows_registered_args": str(args),
+        "start_with_windows_registered_workdir": str(workdir),
+    }
+
+
+def _norm_path_compare(value):
+    txt = str(value or "").strip()
+    if not txt:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(txt))
+    except Exception:
+        return txt
+
+
+def _sync_windows_startup_registration_if_needed():
+    """
+    Keep startup shortcut pinned to the currently running build when startup is enabled.
+    This lets users update from v100 -> v101 and have startup move to v101 after first launch.
+    """
+    if not _is_windows_startup_supported():
+        return
+
+    cfg = _load_config_safe()
+    if not _cfg_bool(cfg.get("start_with_windows", False), default=False):
+        return
+
+    expected = _startup_registration_metadata()
+    shortcut_path = _windows_startup_shortcut_path()
+    shortcut_exists = bool(shortcut_path and os.path.exists(shortcut_path))
+
+    registered_version = _parse_nonnegative_int(cfg.get("start_with_windows_registered_version", 0), 0)
+    registered_target = _norm_path_compare(cfg.get("start_with_windows_registered_target", ""))
+    registered_args = str(cfg.get("start_with_windows_registered_args", "") or "").strip()
+    registered_workdir = _norm_path_compare(cfg.get("start_with_windows_registered_workdir", ""))
+
+    expected_version = int(expected["start_with_windows_registered_version"])
+    expected_target = _norm_path_compare(expected["start_with_windows_registered_target"])
+    expected_args = str(expected["start_with_windows_registered_args"] or "").strip()
+    expected_workdir = _norm_path_compare(expected["start_with_windows_registered_workdir"])
+
+    needs_refresh = (
+        (not shortcut_exists)
+        or (registered_version != expected_version)
+        or (registered_target != expected_target)
+        or (registered_args != expected_args)
+        or (registered_workdir != expected_workdir)
+    )
+    if not needs_refresh:
+        return
+
+    ok, msg = _apply_startup_mode(True)
+    if not ok:
+        print(f"[Startup] auto-refresh failed: {msg}")
+        return
+
+    _update_config_values(expected)
+    print(
+        "[Startup] startup shortcut refreshed to current build "
+        f"(v{expected_version}, target='{expected['start_with_windows_registered_target']}')."
+    )
+
+
+def _set_windows_startup_enabled(enabled):
+    """
+    Enable or disable startup shortcut registration on Windows.
+    """
+    if not _is_windows_startup_supported():
+        raise RuntimeError("Windows startup registration is only supported on Windows.")
+
+    enabled = bool(enabled)
+
+    shortcut_path = _windows_startup_shortcut_path()
+    if not shortcut_path:
+        raise RuntimeError("Could not resolve Windows Startup folder.")
+
+    startup_dir = os.path.dirname(shortcut_path)
+    os.makedirs(startup_dir, exist_ok=True)
+
+    if not enabled:
+        try:
+            if os.path.exists(shortcut_path):
+                os.remove(shortcut_path)
+        except Exception as e:
+            raise RuntimeError(f"Failed to remove startup shortcut: {e}") from e
+        return "Startup launch disabled."
+
+    target, args, workdir = _startup_launch_target_and_args()
+    ps = (
+        "$W = New-Object -ComObject WScript.Shell; "
+        f"$S = $W.CreateShortcut({_ps_quote(shortcut_path)}); "
+        f"$S.TargetPath = {_ps_quote(target)}; "
+        f"$S.Arguments = {_ps_quote(args)}; "
+        f"$S.WorkingDirectory = {_ps_quote(workdir)}; "
+        f"$S.IconLocation = {_ps_quote(target)}; "
+        "$S.Save()"
+    )
+    _run_powershell_command(ps)
+    return "Startup launch enabled."
+
+
+def _apply_startup_mode(enabled):
+    """
+    Apply startup mode on this OS. Non-Windows platforms keep config only.
+    Returns (ok: bool, message: str).
+    """
+    if not _is_windows_startup_supported():
+        return False, "Startup launch integration is currently only available on Windows."
+    try:
+        msg = _set_windows_startup_enabled(enabled)
+        return True, msg
+    except Exception as e:
+        return False, str(e)
 
 
 # Theme palettes and color remapping for runtime dark/light switching.
@@ -3708,6 +4241,11 @@ def _create_autobackup(save_dir, full_backup_mode=None):
                         print(f"[Autosave] copy failed {src_path} -> {dst_path}: {e}")
         print(f"[Autosave] Created autobackup at: {full_dir}")
         set_app_status(f"Autosave backup created: {os.path.basename(full_dir)}", timeout_ms=5000)
+        try:
+            max_backups, max_autobackups = _read_backup_limits_from_config()
+            _cleanup_backup_history(backup_dir, max_backups=max_backups, max_autobackups=max_autobackups)
+        except Exception:
+            pass
     except Exception as e:
         print("[Autosave] Failed:", e, flush=True)
         set_app_status(f"Autosave backup failed: {e}", timeout_ms=9000)
@@ -3733,25 +4271,30 @@ def _scan_folder_mtimes(save_dir):
 
 def _autosave_monitor_loop(stop_event, poll_interval=60):
     """
-    Monitor loop (one-minute cadence):
-      - If autosave disabled -> sleep poll_interval between checks (so toggle is checked every minute).
+    Monitor loop (configurable cadence):
+      - If autosave disabled -> sleep poll_interval between checks.
       - If save folder invalid -> sleep poll_interval and re-check.
-      - If game not running -> reset baseline and sleep poll_interval (only check again after interval).
+      - If game not running -> reset baseline and sleep poll_interval.
+      - Optional: when game transitions from running -> not running, create one final full backup.
       - If game running -> check folder mtimes every poll_interval seconds and create autobackup on change.
     """
     last_seen_mtimes = {}
+    was_running = False
     while not stop_event.is_set():
         try:
             enabled, full_backup_mode, cached_save_path = _get_autosave_runtime_state()
+            cfg = _load_config_safe()
+            backup_on_game_exit = _cfg_bool(cfg.get("autosave_backup_on_game_exit", False), default=False)
+            poll_interval = _sanitize_autosave_poll_interval_seconds(
+                cfg.get("autosave_poll_interval_seconds", poll_interval),
+                default=poll_interval,
+            )
 
             # Respect the poll interval consistently
             if not enabled:
                 print(f"[Autosave] disabled - will re-check every {poll_interval}s.", flush=True)
-                # Sleep full interval before checking again
-                for _ in range(poll_interval):
-                    if stop_event.is_set():
-                        break
-                    time.sleep(1)
+                was_running = False
+                _sleep_with_stop_event(stop_event, poll_interval)
                 continue
 
             # Read cached path mirrored from Tk variables on the main thread.
@@ -3776,10 +4319,8 @@ def _autosave_monitor_loop(stop_event, poll_interval=60):
 
             if not save_dir or not os.path.isdir(save_dir):
                 print(f"[Autosave] save dir missing or invalid: '{save_dir}'. Will retry in {poll_interval}s.", flush=True)
-                for _ in range(poll_interval):
-                    if stop_event.is_set():
-                        break
-                    time.sleep(1)
+                was_running = False
+                _sleep_with_stop_event(stop_event, poll_interval)
                 continue
 
             # Check whether SnowRunner is running (once per interval)
@@ -3788,6 +4329,21 @@ def _autosave_monitor_loop(stop_event, poll_interval=60):
 
             # If not running -> reset baseline and wait one interval before checking again
             if not running:
+                if was_running and backup_on_game_exit:
+                    try:
+                        backup_dir, full_dir, copied = _create_timestamped_full_backup(save_dir, prefix="backup")
+                        print(f"[Autosave] game exit detected -> final full backup: {full_dir} ({copied} files)", flush=True)
+                        set_app_status(
+                            f"Game closed: full backup created ({os.path.basename(full_dir)}).",
+                            timeout_ms=7000,
+                        )
+                        max_backups, max_autobackups = _read_backup_limits_from_config()
+                        _cleanup_backup_history(backup_dir, max_backups=max_backups, max_autobackups=max_autobackups)
+                    except Exception as e:
+                        print(f"[Autosave] failed to create game-exit backup: {e}", flush=True)
+                        set_app_status(f"Game-exit backup failed: {e}", timeout_ms=9000)
+
+                was_running = False
                 last_seen_mtimes = _scan_folder_mtimes(save_dir)
                 if last_seen_mtimes:
                     most_recent_file, mt = max(last_seen_mtimes.items(), key=lambda it: it[1])
@@ -3798,11 +4354,12 @@ def _autosave_monitor_loop(stop_event, poll_interval=60):
                     print(f"[Autosave] baseline set (not running). most recent file: {most_recent_file} @ {most_recent}", flush=True)
                 else:
                     print("[Autosave] baseline set (not running). no files found.", flush=True)
-                for _ in range(poll_interval):
-                    if stop_event.is_set():
-                        break
-                    time.sleep(1)
+                _sleep_with_stop_event(stop_event, poll_interval)
                 continue
+
+            if not was_running:
+                print("[Autosave] game session detected (process became running).", flush=True)
+            was_running = True
 
             # Game is running — scan folder mtimes now
             current_mtimes = _scan_folder_mtimes(save_dir)
@@ -3819,11 +4376,7 @@ def _autosave_monitor_loop(stop_event, poll_interval=60):
             # If first time seeing the folder while running, initialise baseline and wait one interval
             if not last_seen_mtimes:
                 last_seen_mtimes = current_mtimes
-                print(f"[Autosave] initialized baseline while running; next check in {poll_interval}s", flush=True)
-                for _ in range(poll_interval):
-                    if stop_event.is_set():
-                        break
-                    time.sleep(1)
+                print("[Autosave] initialized baseline while running; re-checking immediately.", flush=True)
                 continue
 
             # detect changes: new file, removed file, or modified mtime
@@ -3846,18 +4399,12 @@ def _autosave_monitor_loop(stop_event, poll_interval=60):
                 print("[Autosave] no changes detected.", flush=True)
 
             # Wait exactly poll_interval seconds (split into 1s steps so stop_event wakes quickly)
-            for _ in range(poll_interval):
-                if stop_event.is_set():
-                    break
-                time.sleep(1)
+            _sleep_with_stop_event(stop_event, poll_interval)
 
         except Exception as e:
             print("[Autosave] monitor exception:", e, flush=True)
             # On error, sleep one interval before retrying
-            for _ in range(poll_interval):
-                if stop_event.is_set():
-                    break
-                time.sleep(1)
+            _sleep_with_stop_event(stop_event, poll_interval)
 
     print("[Autosave] monitor exiting", flush=True)
 
@@ -3866,14 +4413,15 @@ def start_autosave_monitor():
     global _AUTOSAVE_THREAD, _AUTOSAVE_STOP_EVENT
     if _AUTOSAVE_THREAD and _AUTOSAVE_THREAD.is_alive():
         return
+    current_poll = _get_autosave_poll_interval_seconds(default=60)
     _AUTOSAVE_STOP_EVENT = threading.Event()
     _AUTOSAVE_THREAD = threading.Thread(
         target=_autosave_monitor_loop,
-        args=(_AUTOSAVE_STOP_EVENT,),
+        args=(_AUTOSAVE_STOP_EVENT, current_poll),
         daemon=True,
     )
     _AUTOSAVE_THREAD.start()
-    print("[Autosave] monitor started")
+    print(f"[Autosave] monitor started (interval {current_poll}s)")
 
 
 def stop_autosave_monitor():
@@ -3890,7 +4438,7 @@ def stop_autosave_monitor():
     print("[Autosave] monitor stopped")
 
 
-def make_backup_if_enabled(path):
+def make_backup_if_enabled(path, force_full=False):
     try:
         if not os.path.exists(path):
             print("[Backup] Skipped (path invalid).")
@@ -3902,25 +4450,21 @@ def make_backup_if_enabled(path):
         backup_dir = os.path.join(save_dir, "backup")
         os.makedirs(backup_dir, exist_ok=True)
 
+        full_mode_selected = bool(force_full)
+        if not full_mode_selected:
+            try:
+                full_mode_selected = bool(full_backup_var.get())
+            except Exception:
+                full_mode_selected = False
+
         # FULL BACKUP: copy all .cfg/.dat files (skip backup folder itself)
-        if full_backup_var.get():
-            full_dir = os.path.join(backup_dir, timestamp + "_full")
-            os.makedirs(full_dir, exist_ok=True)
-            for root, _, files in os.walk(save_dir):
-                if os.path.abspath(root).startswith(os.path.abspath(backup_dir)):
-                    continue  # skip backups of backups
-                for file in files:
-                    if file.lower().endswith((".cfg", ".dat")):
-                        src_path = os.path.join(root, file)
-                        rel_path = os.path.relpath(src_path, save_dir)
-                        dst_path = os.path.join(full_dir, rel_path)
-                        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-                        shutil.copy2(src_path, dst_path)
-            print(f"[Backup] Full backup created at: {full_dir}")
+        if full_mode_selected:
+            backup_dir, full_dir, copied = _create_timestamped_full_backup(save_dir, prefix="backup")
+            print(f"[Backup] Full backup created at: {full_dir} ({copied} files)")
             set_app_status(f"Full backup created: {os.path.basename(full_dir)}", timeout_ms=5000)
 
         # SINGLE BACKUP: only current save
-        elif make_backup_var.get():
+        elif bool(make_backup_var.get() if make_backup_var is not None else False):
             single_dir = os.path.join(backup_dir, timestamp)
             os.makedirs(single_dir, exist_ok=True)
             backup_file_path = os.path.join(single_dir, os.path.basename(path))
@@ -3941,41 +4485,7 @@ def make_backup_if_enabled(path):
         except Exception:
             max_autobackups = 50
 
-        # list contents in backup_dir, keep them sorted (oldest first because name contains date)
-        all_entries = sorted(os.listdir(backup_dir))
-
-        # normal backups: names starting with "backup-"
-        normal_backups = [n for n in all_entries if n.startswith("backup-")]
-        # autobackups: names starting with "autobackup-"
-        auto_backups = [n for n in all_entries if n.startswith("autobackup-")]
-
-        # delete oldest normal backups if over limit
-        if max_backups > 0 and len(normal_backups) > max_backups:
-            to_delete = normal_backups[:len(normal_backups) - max_backups]
-            for old in to_delete:
-                old_path = os.path.join(backup_dir, old)
-                try:
-                    if os.path.isdir(old_path):
-                        shutil.rmtree(old_path)
-                    else:
-                        os.remove(old_path)
-                except Exception:
-                    pass
-            print(f"[Backup] Removed {len(to_delete)} old normal backup(s)")
-
-        # delete oldest autobackups if over limit
-        if max_autobackups > 0 and len(auto_backups) > max_autobackups:
-            to_delete = auto_backups[:len(auto_backups) - max_autobackups]
-            for old in to_delete:
-                old_path = os.path.join(backup_dir, old)
-                try:
-                    if os.path.isdir(old_path):
-                        shutil.rmtree(old_path)
-                    else:
-                        os.remove(old_path)
-                except Exception:
-                    pass
-            print(f"[Autosave] Removed {len(to_delete)} old autobackup(s)")
+        _cleanup_backup_history(backup_dir, max_backups=max_backups, max_autobackups=max_autobackups)
 
     except Exception as e:
         print(f"[Backup Error] Failed to create backup: {e}")
@@ -4250,6 +4760,334 @@ def save_path(path):
     if "dont_remember_path_var" in globals() and dont_remember_path_var.get():
         return
     _update_config_values({"last_save_path": path})
+
+
+# =============================================================================
+# SECTION: Optional Improve Upload Helpers
+# Used In: Save File tab ("Make editor better" checkbox)
+# =============================================================================
+def get_improve_upload_endpoint():
+    return str(IMPROVE_UPLOAD_ENDPOINT or "").strip()
+
+
+def is_improve_upload_endpoint_configured(endpoint_override=None):
+    endpoint = str(endpoint_override or get_improve_upload_endpoint()).strip()
+    if not re.match(r"^https://[^ ]+$", endpoint, flags=re.IGNORECASE):
+        return False
+    if re.search(r"your-worker\.workers\.dev|example\.workers\.dev", endpoint, flags=re.IGNORECASE):
+        return False
+    return True
+
+
+def collect_improve_share_entries(folder_path: str):
+    """Collect top-level save files from folder matching allowed prefixes."""
+    if not folder_path or not os.path.isdir(folder_path):
+        return []
+
+    entries = []
+    allowed_prefixes = ("commonsslsave", "completesave")
+
+    try:
+        names = sorted(os.listdir(folder_path), key=lambda n: str(n).lower())
+    except Exception:
+        return []
+
+    for name in names:
+        name_lower = str(name).lower()
+        if not name_lower.startswith(allowed_prefixes):
+            continue
+        abs_path = os.path.join(folder_path, name)
+        if not os.path.isfile(abs_path):
+            continue
+
+        try:
+            size = int(os.path.getsize(abs_path))
+        except Exception:
+            continue
+
+        entries.append(
+            {
+                "name": str(name),
+                "path": abs_path,
+                "size": size,
+            }
+        )
+
+    return entries
+
+
+def get_improve_share_signature(folder_path: str, entries):
+    if not entries:
+        return ""
+    parts = []
+    for entry in entries:
+        try:
+            name = str(entry.get("name", "")).lower()
+            size = int(entry.get("size", 0))
+            parts.append(f"{name}:{size}")
+        except Exception:
+            continue
+    parts.sort()
+    base = os.path.abspath(str(folder_path or "")).lower()
+    payload = f"{base}|{'|'.join(parts)}"
+    return hashlib.sha1(payload.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _encode_multipart_form_data(fields, files):
+    boundary = "----SnowRunnerEditorBoundary" + uuid.uuid4().hex
+    body = bytearray()
+
+    for key, value in (fields or {}).items():
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+
+    for item in files or []:
+        field_name = str(item.get("field", "files"))
+        filename = str(item.get("filename", "file.bin")).replace('"', "")
+        content_type = str(item.get("content_type", "application/octet-stream"))
+        data = item.get("data", b"")
+        if not isinstance(data, (bytes, bytearray)):
+            data = bytes(data)
+
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            f'Content-Disposition: form-data; name="{field_name}"; filename="{filename}"\r\n'.encode("utf-8")
+        )
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+        body.extend(data)
+        body.extend(b"\r\n")
+
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    content_type_header = f"multipart/form-data; boundary={boundary}"
+    return bytes(body), content_type_header
+
+
+def upload_improve_samples_from_entries(entries, endpoint=None, source="snowrunner-save-editor-desktop", folder_root=""):
+    target = str(endpoint or get_improve_upload_endpoint()).strip()
+    if not is_improve_upload_endpoint_configured(target):
+        raise RuntimeError("Worker URL is not configured.")
+
+    valid_entries = []
+
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "")).strip()
+        path = str(entry.get("path", "")).strip()
+        if not name or not path or not os.path.isfile(path):
+            continue
+        valid_entries.append({"name": name, "path": path})
+
+    if not valid_entries:
+        raise RuntimeError("No readable top-level files were available for upload.")
+
+    try:
+        max_files_per_request = max(1, int(IMPROVE_UPLOAD_MAX_FILES_PER_REQUEST))
+    except Exception:
+        max_files_per_request = 6
+    try:
+        chunk_pause_seconds = max(0.0, float(IMPROVE_UPLOAD_BETWEEN_CHUNKS_MS) / 1000.0)
+    except Exception:
+        chunk_pause_seconds = 0.0
+    timeout_seconds = max(1.0, float(IMPROVE_UPLOAD_TIMEOUT_MS) / 1000.0)
+
+    base_headers = {
+        "User-Agent": "SnowRunnerEditor/1.0",
+        "Accept": "application/json",
+    }
+    origin_header = str(IMPROVE_UPLOAD_ORIGIN_HEADER or "").strip()
+    referer_header = str(IMPROVE_UPLOAD_REFERER_HEADER or "").strip()
+    if origin_header:
+        base_headers["Origin"] = origin_header
+    if referer_header:
+        base_headers["Referer"] = referer_header
+
+    def _post_worker_chunk(body_bytes, content_type_header, chunk_label):
+        headers = dict(base_headers)
+        headers["Content-Type"] = content_type_header
+        req = urllib.request.Request(
+            target,
+            data=body_bytes,
+            headers=headers,
+            method="POST",
+        )
+        raw_body = ""
+        status = 0
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+                status = int(getattr(resp, "status", 0) or resp.getcode() or 0)
+                raw_body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as http_err:
+            http_body = ""
+            try:
+                http_body = http_err.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+            payload = None
+            if http_body:
+                try:
+                    payload = json.loads(http_body)
+                except Exception:
+                    payload = None
+
+            if isinstance(payload, dict) and payload.get("error"):
+                raise RuntimeError(f"{chunk_label}: {payload.get('error')}")
+            if http_body:
+                raise RuntimeError(f"{chunk_label}: {http_body}")
+            raise RuntimeError(f"{chunk_label}: HTTP {getattr(http_err, 'code', 'error')}")
+        except Exception as err:
+            message = str(err or "Unknown error")
+            if "timed out" in message.lower():
+                raise RuntimeError(f"{chunk_label}: Request timed out.")
+            raise RuntimeError(message)
+
+        payload = None
+        if raw_body:
+            try:
+                payload = json.loads(raw_body)
+            except Exception:
+                payload = None
+
+        if status < 200 or status >= 300:
+            if isinstance(payload, dict) and payload.get("error"):
+                raise RuntimeError(f"{chunk_label}: {payload.get('error')}")
+            if raw_body:
+                raise RuntimeError(f"{chunk_label}: {raw_body}")
+            raise RuntimeError(f"{chunk_label}: HTTP {status}")
+
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{chunk_label}: Worker did not return JSON.")
+
+        return payload
+
+    total = len(valid_entries)
+    total_chunks = max(1, (total + max_files_per_request - 1) // max_files_per_request)
+    batch_id = "desktop-" + uuid.uuid4().hex
+    uploaded = []
+    ignored = []
+    failed = []
+    uploaded_count = 0
+    ignored_count = 0
+    failed_count = 0
+
+    for chunk_index in range(total_chunks):
+        start = chunk_index * max_files_per_request
+        end = min(start + max_files_per_request, total)
+        chunk_entries = valid_entries[start:end]
+        chunk_label = f"Upload chunk {chunk_index + 1}/{total_chunks}"
+
+        file_parts = []
+        for entry in chunk_entries:
+            name = str(entry.get("name", "")).strip()
+            path = str(entry.get("path", "")).strip()
+            if not name or not path or not os.path.isfile(path):
+                continue
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except Exception:
+                continue
+
+            file_parts.append(
+                {
+                    "field": "files",
+                    "filename": name,
+                    "content_type": "application/octet-stream",
+                    "data": data,
+                }
+            )
+
+        if not file_parts:
+            continue
+
+        fields = {
+            "source": str(source or "snowrunner-save-editor-desktop"),
+            "folderRoot": str(folder_root or ""),
+            "uploadedAt": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "batchId": batch_id,
+            "chunkIndex": str(chunk_index + 1),
+            "chunkTotal": str(total_chunks),
+        }
+        body, content_type_header = _encode_multipart_form_data(fields, file_parts)
+        try:
+            payload = _post_worker_chunk(body, content_type_header, chunk_label)
+        except Exception as err:
+            failed.append(
+                {
+                    "name": f"[chunk {chunk_index + 1}]",
+                    "reason": str(err or "Chunk upload error"),
+                }
+            )
+            failed_count += 1
+            if (chunk_index + 1) < total_chunks and chunk_pause_seconds > 0:
+                time.sleep(chunk_pause_seconds)
+            continue
+
+        returned_batch_id = str(payload.get("batchId") or payload.get("id") or "").strip()
+        if returned_batch_id:
+            batch_id = returned_batch_id
+
+        chunk_uploaded = payload.get("uploaded")
+        chunk_ignored = payload.get("ignored")
+        chunk_failed = payload.get("failed")
+        if isinstance(chunk_uploaded, list):
+            uploaded.extend(chunk_uploaded)
+        if isinstance(chunk_ignored, list):
+            ignored.extend(chunk_ignored)
+        if isinstance(chunk_failed, list):
+            failed.extend(chunk_failed)
+
+        try:
+            uploaded_count += int(payload.get("uploadedCount", 0))
+        except Exception:
+            uploaded_count += len(chunk_uploaded) if isinstance(chunk_uploaded, list) else 0
+        try:
+            ignored_count += int(payload.get("ignoredCount", 0))
+        except Exception:
+            ignored_count += len(chunk_ignored) if isinstance(chunk_ignored, list) else 0
+        try:
+            failed_count += int(payload.get("failedCount", 0))
+        except Exception:
+            failed_count += len(chunk_failed) if isinstance(chunk_failed, list) else 0
+
+        if (chunk_index + 1) < total_chunks and chunk_pause_seconds > 0:
+            time.sleep(chunk_pause_seconds)
+
+    if uploaded_count <= 0 and not uploaded:
+        first_error = ""
+        if failed and isinstance(failed[0], dict):
+            first_error = str(failed[0].get("reason") or "").strip()
+        if first_error:
+            raise RuntimeError(f"No files were uploaded. First error: {first_error}")
+        raise RuntimeError("No files were uploaded.")
+
+    if uploaded_count <= 0:
+        uploaded_count = len(uploaded)
+    if ignored_count < len(ignored):
+        ignored_count = len(ignored)
+    if failed_count < len(failed):
+        failed_count = len(failed)
+
+    first_error = ""
+    if failed and isinstance(failed[0], dict):
+        first_error = str(failed[0].get("reason") or "").strip()
+
+    return {
+        "success": uploaded_count > 0,
+        "error": first_error,
+        "id": batch_id,
+        "batchId": batch_id,
+        "uploadedCount": uploaded_count,
+        "ignoredCount": ignored_count,
+        "failedCount": failed_count,
+        "uploaded": uploaded,
+        "ignored": ignored,
+        "failed": failed,
+    }
 
 # -----------------------------------------------------------------------------
 # END SECTION: Save-File IO + Version Safety
@@ -5956,6 +6794,65 @@ DEBUG: bool = True
 # Reduce log spam from high-frequency Objectives+ scrolling unless explicitly enabled.
 DEBUG_OBJECTIVES_SCROLL: bool = False
 _APP_START: Optional[float] = None
+
+
+def _objectives_prefetch_snapshot() -> Dict[str, Any]:
+    with _OBJECTIVES_PREFETCH_LOCK:
+        return dict(_OBJECTIVES_PREFETCH_STATE)
+
+
+def _set_objectives_prefetch_state(**updates):
+    with _OBJECTIVES_PREFETCH_LOCK:
+        _OBJECTIVES_PREFETCH_STATE.update(updates)
+
+
+def start_objectives_prefetch_background(force: bool = False) -> bool:
+    """
+    Start Objectives+ latest-data refresh in background at app startup.
+    Returns True when a new worker thread is started.
+    """
+    state = _objectives_prefetch_snapshot()
+    if state.get("inflight"):
+        return False
+    if state.get("completed") and (not force):
+        return False
+
+    _set_objectives_prefetch_state(
+        started=True,
+        inflight=True,
+        completed=False,
+        built=False,
+        error="",
+    )
+
+    def _worker():
+        cache_csv = _objectives_cache_csv_path()
+        built = False
+        err = ""
+        try:
+            built = _mr_build_csv(cache_csv)
+        except Exception as e:
+            built = False
+            err = str(e)
+
+        _set_objectives_prefetch_state(
+            inflight=False,
+            completed=True,
+            built=bool(built),
+            error=str(err or ""),
+            last_completed_ts=float(time.time()),
+        )
+
+        if built:
+            set_app_status("Objectives+ latest data cached in background.", timeout_ms=4500)
+        else:
+            # Keep this informational (non-fatal); cached/bundled data is still usable.
+            set_app_status("Objectives+ background refresh failed; cached data will be used.", timeout_ms=5000)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
+
+
 def _now_ms() -> float:
     global _APP_START
     if _APP_START is None:
@@ -5978,7 +6875,10 @@ def log(msg: str) -> None:
         except Exception:
             pass
 def default_parquet_path() -> str:
-    base = os.path.dirname(resource_path(""))
+    try:
+        base = get_editor_data_dir()
+    except Exception:
+        base = os.path.dirname(resource_path(""))
     return os.path.join(base, "maprunner_data.parquet")
 def extract_json_block_by_key(s: str, key: str):
     m = re.search(rf'"{re.escape(key)}"\s*:\s*{{', s)
@@ -6057,11 +6957,16 @@ _MR_TIMEOUT_SECONDS = 20
 _MR_CANONICAL_NAMES = {"data": "data.js", "desc": "desc.js"}
 _MR_IN_MEM_FILES: Dict[str, bytes] = {}
 _MR_IN_MEM_META: Dict[str, Dict[str, Any]] = {}
-_MR_CHUNK_MAX = 80
+_MR_CHUNK_MAX = 220
 _MR_ENGLISH_TARGET = 20000
 _MR_DATA_SIGNATURE = "const _=JSON.parse('[{\"name\":\"RU_02_01_SERVHUB_GAS\""
 _MR_DESC_SIGNATURE = "const t={UI_TRUCK_TYPE_HEAVY_DUTY:{t:0,b:{t:2,i:[{t:3}],s:\"HEAVY DUTY\""
 _MR_DEBUG = False
+_MR_SAFE_FALLBACK_URLS = [
+    "https://raw.githubusercontent.com/MrBoxik/SnowRunner-Save-Editor/main/app/objectives/CKSuO70b.js",
+    "https://raw.githubusercontent.com/MrBoxik/SnowRunner-Save-Editor/main/app/objectives/ChUX6nGL.js",
+]
+_MR_SAFE_FALLBACK_ERROR = ""
 
 # Language preference helpers (favor English when multiple locales exist)
 _MR_ENGLISH_WORDS = {
@@ -6071,6 +6976,155 @@ _MR_ENGLISH_WORDS = {
     "watchtower", "explore", "exploration", "mission"
 }
 _MR_DIACRITICS = set("ąćęłńóśźżĄĆĘŁŃÓŚŹŻàáâäãåæçèéêëìíîïñòóôöõøùúûüýÿßčďěňřšťůž")
+_MR_ENGLISH_SAMPLE_MAX = 240
+# Avg English score threshold for localization files (higher = stricter)
+_MR_ENGLISH_AVG_MIN = 2.5
+# Minimum distinct English hits required in localization sample
+_MR_ENGLISH_HITS_MIN = 12
+# Allow near-top localization files within this score delta of the best
+_MR_ENGLISH_AVG_DELTA = 0.5
+# If we already have a strong English localization of this size, stop scanning more
+_MR_ENGLISH_MIN_ENTRIES = 12000
+# Max JS files to parse when auto-detecting localization language
+_MR_LOCALIZATION_CANDIDATE_MAX = 40
+# Tracks which localization files were selected (used to filter lazy lookups)
+_MR_LAST_LOCALIZATION_FILES: List[str] = []
+_MR_LAST_LOCALIZATION_BLOCKED = False
+# Minimum localization size required to proceed with CSV build.
+_MR_MIN_LOCALIZATION_ENTRIES = 2000
+# Heuristics to exclude non-English localization files
+_MR_FORBIDDEN_LANG_WORDS = {
+    "palivo", "verlassene", "naturelle", "opuszczone", "privacidad",
+    "perduto", "deslizamento",
+    # Common Polish stems/words seen in MapRunner objectives
+    "zatopion", "ciezarowk", "pojazd", "narzedz", "rolnicz", "zniw",
+    "odbudow", "zagubion", "garaz", "wieza", "cysterna", "przyczep",
+    "utkn", "zaginion", "blokada", "naprawa", "osuwisk", "osusz",
+    "wzgorz", "rozrywka", "swierk",
+}
+_MR_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+_MR_NON_ASCII_RATIO_MAX = 0.03
+_MR_VALUE_ENGLISH_MIN_SCORE = 0.6
+
+# Objectives+ safe fallback mode (thread-safe, config-backed)
+_OBJECTIVES_SAFE_FALLBACK_MODE = False
+_OBJECTIVES_SAFE_FALLBACK_MODE_LOCK = threading.Lock()
+_OBJECTIVES_SAFE_FALLBACK_MODE_SET = False
+
+def _set_objectives_safe_fallback_mode(enabled: bool) -> None:
+    global _OBJECTIVES_SAFE_FALLBACK_MODE, _OBJECTIVES_SAFE_FALLBACK_MODE_SET
+    try:
+        with _OBJECTIVES_SAFE_FALLBACK_MODE_LOCK:
+            _OBJECTIVES_SAFE_FALLBACK_MODE = bool(enabled)
+            _OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
+    except Exception:
+        _OBJECTIVES_SAFE_FALLBACK_MODE = bool(enabled)
+        _OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
+
+def _get_objectives_safe_fallback_mode() -> bool:
+    global _OBJECTIVES_SAFE_FALLBACK_MODE, _OBJECTIVES_SAFE_FALLBACK_MODE_SET
+    try:
+        with _OBJECTIVES_SAFE_FALLBACK_MODE_LOCK:
+            if not _OBJECTIVES_SAFE_FALLBACK_MODE_SET:
+                try:
+                    cfg = load_config() or {}
+                    val = cfg.get("objectives_use_safe_fallback", None)
+                    if val is None:
+                        # Backward compatibility with older backup setting
+                        val = cfg.get("objectives_use_backup", False)
+                    _OBJECTIVES_SAFE_FALLBACK_MODE = bool(val)
+                except Exception:
+                    _OBJECTIVES_SAFE_FALLBACK_MODE = False
+                _OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
+            return bool(_OBJECTIVES_SAFE_FALLBACK_MODE)
+    except Exception:
+        return bool(_OBJECTIVES_SAFE_FALLBACK_MODE)
+
+# Language detection helpers (best-effort / heuristic)
+_MR_LANG_DIACRITICS = {
+    "Polish": set("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ"),
+    "Czech/Slovak": set("áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ"),
+    "German": set("äöüßÄÖÜ"),
+    "French": set("àâäçéèêëîïôöùûüÿœæÀÂÄÇÉÈÊËÎÏÔÖÙÛÜŸŒÆ"),
+    "Spanish": set("áéíñóúüÁÉÍÑÓÚÜ"),
+    "Portuguese": set("áàâãçéêíóôõúüÁÀÂÃÇÉÊÍÓÔÕÚÜ"),
+    "Italian": set("àèéìíîòóùúÀÈÉÌÍÎÒÓÙÚ"),
+    "Turkish": set("çğıöşüÇĞİÖŞÜ"),
+    "Romanian": set("ăâîșşțţĂÂÎȘŞȚŢ"),
+}
+_MR_LANG_STOPWORDS = {
+    "English": ["the", "and", "of", "to", "in", "for", "with", "from", "on"],
+    "Polish": ["i", "oraz", "na", "do", "z", "w", "jest", "nie", "się"],
+    "Czech/Slovak": ["a", "na", "je", "se", "pro", "kter", "nen", "neni"],
+    "German": ["und", "der", "die", "das", "nicht", "mit", "für", "von", "auf", "zu"],
+    "French": ["et", "le", "la", "les", "des", "de", "pour", "avec", "dans"],
+    "Spanish": ["el", "la", "los", "las", "de", "que", "y", "para", "con", "en"],
+    "Portuguese": ["de", "e", "que", "para", "com", "em", "nao", "uma", "um"],
+    "Italian": ["il", "la", "e", "che", "per", "con", "del", "della"],
+    "Turkish": ["ve", "bir", "ile", "icin", "de", "da", "bu"],
+    "Romanian": ["si", "in", "de", "la", "cu", "pentru", "este"],
+    "Russian": ["и", "в", "на", "что", "с", "для", "по", "из"],
+}
+
+def _mr_guess_language_from_values(values: List[str], english_avg: Optional[float] = None) -> str:
+    try:
+        if english_avg is not None and english_avg >= _MR_ENGLISH_AVG_MIN:
+            return "English"
+    except Exception:
+        pass
+    if not values:
+        return "Unknown"
+    sample = " ".join(values[:120])
+    if not sample:
+        return "Unknown"
+    # Script detection
+    try:
+        if re.search(r"[\u0400-\u04FF]", sample):
+            return "Russian"
+        if re.search(r"[\u4E00-\u9FFF]", sample):
+            return "Chinese"
+        if re.search(r"[\u3040-\u30FF]", sample):
+            return "Japanese"
+        if re.search(r"[\uAC00-\uD7AF]", sample):
+            return "Korean"
+    except Exception:
+        pass
+
+    scores: Dict[str, float] = {}
+    for lang, chars in _MR_LANG_DIACRITICS.items():
+        try:
+            count = sum(sample.count(ch) for ch in chars)
+        except Exception:
+            count = 0
+        if count:
+            scores[lang] = scores.get(lang, 0.0) + float(count) * 2.0
+
+    lower = sample.lower()
+    # normalize to spaces
+    try:
+        lower_norm = re.sub(r"[^a-z\u00c0-\u017f\u0400-\u04ff]+", " ", lower)
+    except Exception:
+        lower_norm = lower
+    lower_norm = f" {lower_norm} "
+    for lang, words in _MR_LANG_STOPWORDS.items():
+        for w in words:
+            try:
+                if f" {w} " in lower_norm:
+                    scores[lang] = scores.get(lang, 0.0) + 1.0
+            except Exception:
+                continue
+
+    if scores:
+        best_lang = max(scores, key=scores.get)
+        if scores.get(best_lang, 0.0) >= 3.0:
+            return best_lang
+
+    try:
+        if english_avg is not None and english_avg >= 1.0:
+            return "Mixed"
+    except Exception:
+        pass
+    return "Unknown"
 
 def _mr_text_english_score(s: Any) -> float:
     try:
@@ -6101,10 +7155,263 @@ def _mr_text_english_score(s: Any) -> float:
     for w in _MR_ENGLISH_WORDS:
         if w in lower:
             score += 0.6
+    # Hard penalties for known non-English markers
+    for w in _MR_FORBIDDEN_LANG_WORDS:
+        if w in lower:
+            score -= 6.0
+    if _MR_CYRILLIC_RE.search(s):
+        score -= 8.0
     # Penalize ID-like strings
     if re.fullmatch(r"[A-Z0-9_]+", s):
         score -= 2.0
     return score
+
+def _mr_sample_values(values: List[str], max_samples: int = _MR_ENGLISH_SAMPLE_MAX) -> List[str]:
+    if not values:
+        return []
+    n = len(values)
+    if n <= max_samples:
+        return values
+    step = max(1, n // max_samples)
+    out: List[str] = []
+    for i in range(0, n, step):
+        out.append(values[i])
+        if len(out) >= max_samples:
+            break
+    return out
+
+def _mr_localization_avg_score(loc: Dict[str, str]) -> float:
+    if not loc:
+        return -999.0
+    try:
+        values = list(loc.values())
+    except Exception:
+        return -999.0
+    sample = _mr_sample_values(values, _MR_ENGLISH_SAMPLE_MAX)
+    if not sample:
+        return -999.0
+    total = 0.0
+    for v in sample:
+        total += _mr_text_english_score(v)
+    return total / max(1, len(sample))
+
+def _mr_localization_sample_flags(values: List[str]) -> Dict[str, Any]:
+    if not values:
+        return {
+            "has_cyrillic": False,
+            "forbidden_hits": [],
+            "non_ascii_ratio": 0.0,
+            "non_ascii_heavy": False,
+            "english_hits": 0,
+        }
+
+    # Scan full list for forbidden words / cyrillic (early-exit when found).
+    has_cyrillic = False
+    forbidden_hits = set()
+    for v in values:
+        if not v:
+            continue
+        try:
+            s = v if isinstance(v, str) else str(v)
+        except Exception:
+            s = ""
+        if not s:
+            continue
+        if not has_cyrillic and _MR_CYRILLIC_RE.search(s):
+            has_cyrillic = True
+        if not forbidden_hits:
+            low = s.lower()
+            for w in _MR_FORBIDDEN_LANG_WORDS:
+                if w in low:
+                    forbidden_hits.add(w)
+                    break
+        if has_cyrillic or forbidden_hits:
+            break
+
+    # Use a bounded sample for non-ASCII ratio to keep cost low.
+    sample_vals = _mr_sample_values(values, _MR_ENGLISH_SAMPLE_MAX)
+    sample = " ".join(sample_vals or [])
+    letters = sum(1 for ch in sample if ch.isalpha())
+    non_ascii_letters = sum(1 for ch in sample if ch.isalpha() and not ch.isascii())
+    non_ascii_ratio = (non_ascii_letters / letters) if letters else 0.0
+    non_ascii_heavy = bool(letters >= 80 and non_ascii_ratio > _MR_NON_ASCII_RATIO_MAX)
+    english_hits = 0
+    try:
+        lower = sample.lower()
+        lower_norm = re.sub(r"[^a-z0-9]+", " ", lower)
+        lower_norm = f" {lower_norm} "
+        for w in _MR_LANG_STOPWORDS.get("English", []):
+            if f" {w} " in lower_norm:
+                english_hits += 1
+        for w in _MR_ENGLISH_WORDS:
+            if f" {w} " in lower_norm:
+                english_hits += 1
+    except Exception:
+        english_hits = 0
+    return {
+        "has_cyrillic": has_cyrillic,
+        "forbidden_hits": sorted(list(forbidden_hits)),
+        "non_ascii_ratio": non_ascii_ratio,
+        "non_ascii_heavy": non_ascii_heavy,
+        "english_hits": english_hits,
+    }
+
+def _mr_strings_look_non_english(values: List[str]) -> bool:
+    if not values:
+        return False
+    try:
+        sample_vals = _mr_sample_values(values, 200)
+    except Exception:
+        sample_vals = values[:200]
+    flags = _mr_localization_sample_flags(sample_vals)
+    if flags.get("has_cyrillic") or flags.get("forbidden_hits"):
+        return True
+    if flags.get("non_ascii_heavy"):
+        return True
+    return False
+
+def _mr_localization_looks_english(avg: float, flags: Optional[Dict[str, Any]] = None) -> bool:
+    try:
+        if avg < _MR_ENGLISH_AVG_MIN:
+            return False
+    except Exception:
+        return False
+    if flags:
+        if flags.get("has_cyrillic") or flags.get("forbidden_hits") or flags.get("non_ascii_heavy"):
+            return False
+        if flags.get("english_hits", 0) < _MR_ENGLISH_HITS_MIN:
+            return False
+    return True
+
+def _mr_desc_bytes_look_english(bs: Optional[bytes]) -> bool:
+    try:
+        txt = _mr_decode_bytes_to_text(bs) or ""
+    except Exception:
+        txt = ""
+    if not txt:
+        return False
+    parsed = _mr_parse_localization_from_desc_text(txt)
+    if not parsed or len(parsed) < _MR_MIN_LOCALIZATION_ENTRIES:
+        return False
+    avg = _mr_localization_avg_score(parsed)
+    try:
+        sample_vals = _mr_sample_values(list(parsed.values()), _MR_ENGLISH_SAMPLE_MAX)
+    except Exception:
+        sample_vals = []
+    flags = _mr_localization_sample_flags(sample_vals)
+    return _mr_localization_looks_english(avg, flags)
+
+def _mr_value_allowed(val: Any) -> bool:
+    if val is None:
+        return False
+    try:
+        s = val if isinstance(val, str) else str(val)
+    except Exception:
+        return False
+    if not s:
+        return False
+    low = s.lower()
+    for w in _MR_FORBIDDEN_LANG_WORDS:
+        if w in low:
+            return False
+    if _MR_CYRILLIC_RE.search(s):
+        return False
+    return True
+
+def _mr_normalize_mojibake_text(value: Any) -> str:
+    """
+    Normalize common mojibake/escaped text artifacts from remote MapRunner sources.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        try:
+            s = value.decode("utf-8", errors="replace")
+        except Exception:
+            s = str(value)
+    else:
+        s = str(value)
+    if not s:
+        return ""
+
+    if "\\x" in s:
+        try:
+            s = codecs.decode(s, "unicode_escape")
+        except Exception:
+            pass
+
+    candidates: List[str] = []
+
+    def _push(v: Any) -> None:
+        if v is None:
+            return
+        if isinstance(v, bytes):
+            try:
+                t = v.decode("utf-8", errors="replace")
+            except Exception:
+                t = str(v)
+        else:
+            t = str(v)
+        if t and t not in candidates:
+            candidates.append(t)
+
+    _push(s)
+
+    if "\\" in s:
+        try:
+            _push(codecs.decode(s, "unicode_escape"))
+        except Exception:
+            pass
+        try:
+            ue = codecs.decode(s, "unicode_escape")
+            _push(ue.encode("latin-1", errors="replace").decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+
+    for base in list(candidates):
+        try:
+            _push(base.encode("latin-1", errors="replace").decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+        try:
+            _push(base.encode("cp1252", errors="replace").decode("utf-8", errors="replace"))
+        except Exception:
+            pass
+
+    def _polish(txt: str) -> str:
+        t = str(txt or "")
+        t = t.replace("â€”", " - ")
+        t = t.replace("â€“", " - ")
+        t = t.replace("\u00e2\u0080\u0094", " - ")
+        t = t.replace("\u00e2\u0080\u0093", " - ")
+        t = t.replace("—", " - ")
+        t = t.replace("–", " - ")
+        t = t.replace("â€˜", "'").replace("â€™", "'")
+        t = t.replace("â€œ", "\"").replace("â€�", "\"")
+        t = t.replace("Ã—", "x")
+        # Some locales render the mojibake dash artifact as standalone "à".
+        t = re.sub(r"(?<=[A-Za-z0-9])\s+à\s+(?=[A-Za-z0-9])", " - ", t)
+        # Another common artifact is a literal '?' replacing a dash between words.
+        t = re.sub(r"(?<=[A-Za-z0-9])\?(?=[A-Za-z0-9])", " - ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
+
+    polished = [_polish(c) for c in candidates if c]
+    if not polished:
+        return ""
+
+    def _score(txt: str):
+        bad = 0
+        bad += txt.count("�") * 8
+        bad += txt.count("\\x") * 3
+        bad += txt.count("Ã") * 3
+        bad += txt.count("Â") * 3
+        bad += txt.count("â") * 2
+        if re.search(r"(?<=[A-Za-z0-9])\s+à\s+(?=[A-Za-z0-9])", txt):
+            bad += 4
+        return (bad, len(txt))
+
+    return min(polished, key=_score)
 
 def _mr_log(msg: str) -> None:
     return
@@ -6511,6 +7818,7 @@ def _mr_expand_chunks_from_bundle() -> None:
     # Pick a bundle that actually contains chunk references.
     primary = None
     primary_url = None
+    primary_text = None
     chunk_names: List[str] = []
     max_chunks = 0
     try:
@@ -6528,6 +7836,7 @@ def _mr_expand_chunks_from_bundle() -> None:
                 primary = name
                 primary_url = url
                 chunk_names = names
+                primary_text = text
     except Exception:
         pass
 
@@ -6550,8 +7859,22 @@ def _mr_expand_chunks_from_bundle() -> None:
     except Exception:
         sig_found = {"data": False, "desc": False}
 
+    # Extract locale chunk mapping from the primary bundle to prioritize English locales.
+    english_locale_chunks: List[str] = []
+    if primary_text:
+        try:
+            pattern = re.compile(r'key:\"(locale_[^\"]+)\"[^\\n]*?import\\(\"\\.\\/([A-Za-z0-9_-]+\\.js)\"\\)')
+            locale_items = pattern.findall(primary_text)
+            if locale_items:
+                english_locale_chunks = sorted({
+                    chunk for key, chunk in locale_items
+                    if key.startswith("locale_en_") or "english" in key
+                })
+        except Exception:
+            english_locale_chunks = []
+
     # Probe all chunks lightly to find localization candidates.
-    loc_candidates: List[str] = []
+    loc_candidates: List[tuple] = []
     data_candidates: List[str] = []
     desc_candidates: List[str] = []
     for ch in chunk_names:
@@ -6564,7 +7887,17 @@ def _mr_expand_chunks_from_bundle() -> None:
         if ("_DESC_DESC" in head) or ("_DESC\"" in head) or ("_DESC'" in head):
             desc_candidates.append(ch)
         if ("s:\"" in head) or ("s:'" in head) or ("const t=" in head) or ("const t={" in head):
-            loc_candidates.append(ch)
+            score = _mr_text_english_score(head)
+            try:
+                low = head.lower()
+                for w in _MR_FORBIDDEN_LANG_WORDS:
+                    if w in low:
+                        score -= 5.0
+                if _MR_CYRILLIC_RE.search(head):
+                    score -= 8.0
+            except Exception:
+                pass
+            loc_candidates.append((score, ch))
         # Limit probe list to a reasonable size
         if len(loc_candidates) >= 120 and len(data_candidates) >= 3:
             break
@@ -6574,12 +7907,25 @@ def _mr_expand_chunks_from_bundle() -> None:
     best_desc_score = 0
     english_entries = 0
     english_chunks = 0
+    best_loc_name = None
+    best_loc_avg = -999.0
+    best_loc_count = 0
     downloaded = 0
     ok = 0
     fail = 0
 
     # Prioritize localization + description candidates (likely contain strings)
-    download_queue = desc_candidates + loc_candidates + [ch for ch in chunk_names if ch not in loc_candidates and ch not in desc_candidates]
+    try:
+        loc_candidates_sorted = [c for _, c in sorted(loc_candidates, key=lambda x: x[0], reverse=True)]
+    except Exception:
+        loc_candidates_sorted = [c for _, c in loc_candidates]
+    # Prioritize known English locale chunks, then desc/loc candidates, then the rest.
+    download_queue = (
+        english_locale_chunks
+        + desc_candidates
+        + loc_candidates_sorted
+        + [ch for ch in chunk_names if ch not in loc_candidates_sorted and ch not in desc_candidates and ch not in english_locale_chunks]
+    )
     for i, ch in enumerate(download_queue):
         if ch in _MR_IN_MEM_FILES:
             continue
@@ -6603,21 +7949,28 @@ def _mr_expand_chunks_from_bundle() -> None:
                     try:
                         parsed = _mr_parse_localization_from_desc_text(txt)
                         if parsed:
-                            sample_vals = list(parsed.values())[:120]
-                            if sample_vals:
-                                avg = sum(_mr_text_english_score(v) for v in sample_vals) / max(1, len(sample_vals))
-                            else:
-                                avg = -999.0
-                            if avg >= 1.0:
+                            try:
+                                sample_vals = _mr_sample_values(list(parsed.values()), _MR_ENGLISH_SAMPLE_MAX)
+                            except Exception:
+                                sample_vals = list(parsed.values())[:120]
+                            avg = _mr_localization_avg_score(parsed)
+                            flags = _mr_localization_sample_flags(sample_vals)
+                            looks_english = _mr_localization_looks_english(avg, flags)
+                            if looks_english:
                                 english_chunks += 1
                                 english_entries += len(parsed)
+                                if (avg > best_loc_avg) or (avg == best_loc_avg and len(parsed) > best_loc_count):
+                                    best_loc_name = ch
+                                    best_loc_avg = avg
+                                    best_loc_count = len(parsed)
                                 if _MR_DEBUG:
                                     _mr_log(f"expand_chunks: english_chunk={ch} entries={len(parsed)} avg={avg:.2f}")
                     except Exception:
                         pass
                 if _MR_DEBUG and (ds >= 10 or cs >= 10):
                     _mr_log(f"expand_chunks: {ch} ds={ds} cs={cs}")
-                if english_chunks >= 2 and english_entries >= _MR_ENGLISH_TARGET:
+                have_data = (_MR_CANONICAL_NAMES.get("data") in _MR_IN_MEM_FILES) or (best_data_score >= 20)
+                if best_loc_name and best_loc_count >= _MR_ENGLISH_MIN_ENTRIES and have_data:
                     break
         except Exception:
             fail += 1
@@ -6627,6 +7980,15 @@ def _mr_expand_chunks_from_bundle() -> None:
     if _MR_DEBUG:
         _mr_log(f"expand_chunks: downloaded ok={ok} fail={fail} english_chunks={english_chunks} english_entries={english_entries}")
     _mr_choose_best_js_roles()
+    # If we identified a strong English localization chunk, prefer it as desc.js.
+    if best_loc_name and best_loc_name in _MR_IN_MEM_FILES:
+        try:
+            meta_url = _MR_IN_MEM_META.get(best_loc_name, {}).get("url")
+            _mr_store_in_memory(_MR_CANONICAL_NAMES["desc"], _MR_IN_MEM_FILES[best_loc_name], meta_url)
+            if _MR_DEBUG:
+                _mr_log(f"expand_chunks: forced desc={best_loc_name} avg={best_loc_avg:.2f} entries={best_loc_count}")
+        except Exception:
+            pass
 
 def _mr_identify_js_role(text: str) -> Optional[str]:
     if not text:
@@ -6701,19 +8063,86 @@ def _mr_try_direct_js_endpoints() -> bool:
             continue
     return ("data.js" in _MR_IN_MEM_FILES) and ("desc.js" in _MR_IN_MEM_FILES)
 
+def _mr_download_safe_fallback_js() -> bool:
+    """
+    Download known-good English JS files from the GitHub safe fallback.
+    Returns True if both data.js and desc.js are available after loading.
+    """
+    global _MR_SAFE_FALLBACK_ERROR
+    _MR_SAFE_FALLBACK_ERROR = ""
+    _MR_IN_MEM_FILES.clear()
+    _MR_IN_MEM_META.clear()
+    ok = 0
+    data_ok = False
+    desc_ok = False
+    for url in _MR_SAFE_FALLBACK_URLS:
+        try:
+            data, headers = _mr_http_get(url, timeout=20)
+            filename = os.path.basename(urlparse(url).path) or None
+            if filename:
+                _mr_store_in_memory(filename, data, url)
+            try:
+                txt = _mr_decode_bytes_to_text(data) or ""
+                if _mr_score_data_js(txt) > 0:
+                    data_ok = True
+                if _mr_score_desc_js(txt) > 0:
+                    desc_ok = True
+            except Exception:
+                pass
+            ok += 1
+        except Exception:
+            continue
+    # Identify and promote canonical data/desc roles from downloaded files.
+    _mr_choose_best_js_roles()
+    has_data = ("data.js" in _MR_IN_MEM_FILES) and data_ok
+    has_desc = ("desc.js" in _MR_IN_MEM_FILES) and desc_ok
+    if not has_data or not has_desc:
+        missing = []
+        if not has_data:
+            missing.append("data.js")
+        if not has_desc:
+            missing.append("desc.js")
+        _MR_SAFE_FALLBACK_ERROR = (
+            "Safe fallback failed: missing "
+            + ", ".join(missing)
+            + " in GitHub files."
+        )
+        return False
+    return ok > 0
+
 def _mr_download_js_step() -> None:
     _MR_IN_MEM_FILES.clear()
     _MR_IN_MEM_META.clear()
     found = set()
+
+    # Safe fallback: load known-good GitHub files instead of MapRunner.
+    try:
+        if _get_objectives_safe_fallback_mode():
+            if _mr_download_safe_fallback_js():
+                _mr_persist_canonical_js_cache(allow_desc=True)
+            else:
+                _mr_load_cached_canonical_js_to_mem()
+            return
+    except Exception:
+        pass
 
     # Fast-path: try known endpoints directly (no Playwright needed)
     try:
         if _MR_DEBUG:
             _mr_log("download_js_step: trying direct endpoints")
         if _mr_try_direct_js_endpoints():
+            # Ensure the direct localization looks English; otherwise keep searching.
+            try:
+                desc_bs = _mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["desc"])
+            except Exception:
+                desc_bs = None
+            if _mr_desc_bytes_look_english(desc_bs):
+                _mr_persist_canonical_js_cache(allow_desc=True)
+                if _MR_DEBUG:
+                    _mr_log("download_js_step: direct endpoints success")
+                return
             if _MR_DEBUG:
-                _mr_log("download_js_step: direct endpoints success")
-            return
+                _mr_log("download_js_step: direct endpoints not English; continuing fallback")
     except Exception:
         if _MR_DEBUG:
             _mr_log_exc("download_js_step: direct endpoints failed")
@@ -6726,10 +8155,16 @@ def _mr_download_js_step() -> None:
         _mr_fallback_download_candidates_to_mem(_MR_URL, html)
         _mr_choose_best_js_roles()
         _mr_expand_chunks_from_bundle()
+        try:
+            desc_ok = _mr_desc_bytes_look_english(_mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["desc"]))
+        except Exception:
+            desc_ok = False
+        _mr_persist_canonical_js_cache(allow_desc=bool(desc_ok))
         if _MR_DEBUG:
             _mr_log(f"download_js_step: fallback html ok; mem_files={list(_MR_IN_MEM_FILES.keys())[:6]}")
         return
     except Exception:
+        _mr_load_cached_canonical_js_to_mem()
         if _MR_DEBUG:
             _mr_log_exc("download_js_step: fallback html failed")
         return
@@ -6745,10 +8180,16 @@ def _mr_collect_localization(desc_js_file: Optional[str]) -> Dict[str, str]:
     Build a localization dictionary by parsing one or more JS files that contain
     localization strings (s:"..."). This merges results across multiple chunks.
     """
+    global _MR_LAST_LOCALIZATION_FILES, _MR_LAST_LOCALIZATION_BLOCKED
     merged: Dict[str, str] = {}
     seen_files: Set[str] = set()
+    candidates: List[Dict[str, Any]] = []
+    _MR_LAST_LOCALIZATION_FILES = []
+    _MR_LAST_LOCALIZATION_BLOCKED = False
 
     def _merge_value(key: str, val: str) -> None:
+        if not _mr_value_allowed(val):
+            return
         if key not in merged:
             merged[key] = val
             return
@@ -6759,33 +8200,67 @@ def _mr_collect_localization(desc_js_file: Optional[str]) -> Dict[str, str]:
         if new_score > old_score + 0.2:
             merged[key] = val
 
-    def _add_from_text(txt: Optional[str]) -> None:
-        if not txt:
+    def _add_candidate(name: Optional[str], txt: Optional[str]) -> None:
+        if not name or not txt:
             return
         # quick filter to avoid heavy parsing for unrelated files
         if ("s:\"") not in txt and ("s:'") not in txt and ("s :") not in txt:
             return
         parsed = _mr_parse_localization_from_desc_text(txt)
-        if parsed:
-            for k, v in parsed.items():
-                _merge_value(k, v)
+        if not parsed:
+            return
+        avg = _mr_localization_avg_score(parsed)
+        try:
+            all_vals = list(parsed.values())
+        except Exception:
+            all_vals = []
+        try:
+            sample_vals = _mr_sample_values(all_vals, _MR_ENGLISH_SAMPLE_MAX)
+        except Exception:
+            sample_vals = []
+        flags = _mr_localization_sample_flags(sample_vals)
+        lang_guess = _mr_guess_language_from_values(sample_vals, avg)
+        candidates.append({
+            "name": name,
+            "loc": parsed,
+            "avg": avg,
+            "count": len(parsed),
+            "lang": lang_guess,
+            "flags": flags,
+        })
 
     # First try the chosen desc file (if any)
     if desc_js_file:
         try:
             txt = _mr_decode_bytes_to_text(_mr_get_file_bytes_or_mem(desc_js_file))
-            _add_from_text(txt)
+            _add_candidate(desc_js_file, txt)
             if desc_js_file:
                 seen_files.add(desc_js_file)
         except Exception:
             pass
 
     # Then scan other in-memory JS files likely to contain localization.
+    other_files: List[tuple] = []
     for name, bs in list(_MR_IN_MEM_FILES.items()):
         if name in seen_files:
             continue
         if not name.lower().endswith(".js"):
             continue
+        if name.lower() == _MR_CANONICAL_NAMES.get("data", "data.js"):
+            continue
+        other_files.append((name, bs))
+
+    try:
+        other_files.sort(
+            key=lambda item: len(item[1]) if isinstance(item[1], (bytes, bytearray)) else 0,
+            reverse=True,
+        )
+    except Exception:
+        pass
+
+    for name, bs in other_files:
+        if _MR_LOCALIZATION_CANDIDATE_MAX > 0 and len(candidates) >= _MR_LOCALIZATION_CANDIDATE_MAX:
+            break
         try:
             txt = _mr_decode_bytes_to_text(bs)
         except Exception:
@@ -6795,15 +8270,104 @@ def _mr_collect_localization(desc_js_file: Optional[str]) -> Dict[str, str]:
         if ("EXP_" not in txt) and ("_DESC_DESC" not in txt) and ("_NAME" not in txt and "_DESC" not in txt):
             # Skip chunks unlikely to contain localization
             continue
-        _add_from_text(txt)
+        _add_candidate(name, txt)
         seen_files.add(name)
-        # stop early if we already have a large localization table
-        if len(merged) >= 12000:
-            break
+
+    if not candidates:
+        if _MR_DEBUG:
+            try:
+                _mr_log("collect_localization: no candidates found")
+            except Exception:
+                pass
+        return merged
+
+    # Per-value filters handle language exclusion; keep all candidates here.
+
+    # Avoid tiny localization files (can be high-scoring but useless).
+    best_count = max(c.get("count", 0) for c in candidates)
+    min_count = max(200, int(best_count * 0.6))
+    if best_count >= 2000:
+        min_count = max(min_count, 2000)
+    try:
+        if any(c.get("count", 0) >= _MR_ENGLISH_MIN_ENTRIES for c in candidates):
+            min_count = max(min_count, int(_MR_ENGLISH_MIN_ENTRIES))
+    except Exception:
+        pass
+    pool = [c for c in candidates if c.get("count", 0) >= min_count]
+    if pool:
+        candidates = pool
+
+    # If English-looking localization exists, only use those candidates.
+    english_candidates = [
+        c for c in candidates
+        if _mr_localization_looks_english(float(c.get("avg", -999.0)), c.get("flags") or {})
+    ]
+    if english_candidates:
+        candidates = english_candidates
+    else:
+        _MR_LAST_LOCALIZATION_BLOCKED = True
+        if _MR_DEBUG:
+            try:
+                _mr_log("collect_localization: no English candidates found; blocking refresh")
+            except Exception:
+                pass
+        return merged
+
+    # Prefer English-looking localization files when multiple locales exist.
+    candidates.sort(key=lambda c: (c.get("avg", -999.0), c.get("count", 0)), reverse=True)
+    selected = candidates
+    best = candidates[0]
+    try:
+        if best.get("avg", -999.0) >= _MR_ENGLISH_AVG_MIN:
+            cutoff = max(_MR_ENGLISH_AVG_MIN, float(best.get("avg", 0.0)) - _MR_ENGLISH_AVG_DELTA)
+            selected = [c for c in candidates if float(c.get("avg", -999.0)) >= cutoff]
+            if not selected:
+                selected = [best]
+        else:
+            best_lang = str(best.get("lang") or "").strip()
+            if best_lang:
+                selected = [c for c in candidates if str(c.get("lang") or "").strip() == best_lang]
+                if not selected:
+                    selected = [best]
+            else:
+                selected = [best]
+    except Exception:
+        selected = candidates
+
+    # Merge selected candidates first.
+    _MR_LAST_LOCALIZATION_FILES = []
+    for cand in selected:
+        loc = cand.get("loc") or {}
+        for k, v in loc.items():
+            _merge_value(k, v)
+        if cand.get("name"):
+            _MR_LAST_LOCALIZATION_FILES.append(str(cand.get("name")))
+    # Preserve the best English localization file as canonical desc.js for caching.
+    try:
+        best_name = best.get("name")
+        if best_name and best_name in _MR_IN_MEM_FILES:
+            meta_url = _MR_IN_MEM_META.get(best_name, {}).get("url")
+            _mr_store_in_memory(_MR_CANONICAL_NAMES["desc"], _MR_IN_MEM_FILES[best_name], meta_url)
+    except Exception:
+        pass
+
+    # If still too small, expand with remaining unblocked candidates.
+    if len(merged) < 2000 and len(candidates) > len(selected):
+        for cand in candidates:
+            if cand in selected:
+                continue
+            loc = cand.get("loc") or {}
+            for k, v in loc.items():
+                _merge_value(k, v)
+            if cand.get("name"):
+                _MR_LAST_LOCALIZATION_FILES.append(str(cand.get("name")))
 
     if _MR_DEBUG:
         try:
-            _mr_log(f"collect_localization: files={len(seen_files)} entries={len(merged)}")
+            _mr_log(
+                f"collect_localization: files={len(_MR_LAST_LOCALIZATION_FILES)} "
+                f"entries={len(merged)} best_avg={best.get('avg')}"
+            )
         except Exception:
             pass
     return merged
@@ -6894,12 +8458,13 @@ def _mr_build_csv(out_path: str) -> bool:
                     return 999999
                 return x.count("�") + x.count("Ã") + x.count("Â") + x.count("\ufffd")
             best = min(candidates, key=score)
-            return best.strip()
+            return _mr_normalize_mojibake_text(best.strip())
 
         def _collect_desc_text_blobs(current_desc: Optional[str]) -> List[str]:
             blobs: List[str] = []
             seen: Set[str] = set()
-            if current_desc:
+            allowed = set(_MR_LAST_LOCALIZATION_FILES) if _MR_LAST_LOCALIZATION_FILES else None
+            if current_desc and (allowed is None or current_desc in allowed):
                 try:
                     txt = _mr_decode_bytes_to_text(_mr_get_file_bytes_or_mem(current_desc))
                     if txt:
@@ -6908,6 +8473,8 @@ def _mr_build_csv(out_path: str) -> bool:
                 except Exception:
                     pass
             for name, bs in list(_MR_IN_MEM_FILES.items()):
+                if allowed is not None and name not in allowed:
+                    continue
                 if name in seen:
                     continue
                 if not name.lower().endswith(".js"):
@@ -6941,6 +8508,12 @@ def _mr_build_csv(out_path: str) -> bool:
                 desc_text_blobs = _collect_desc_text_blobs(desc_js_file)
             except Exception:
                 pass
+        if _MR_LAST_LOCALIZATION_BLOCKED:
+            log("Maprunner localization blocked by language filters; using cached/bundled data.")
+            return False
+        if localization and len(localization) < _MR_MIN_LOCALIZATION_ENTRIES:
+            log("Maprunner localization too small; using cached/bundled data.")
+            return False
         if _MR_DEBUG:
             try:
                 _mr_log(f"build_csv: localization size={len(localization) if localization else 0}")
@@ -7454,7 +9027,66 @@ def _objectives_cache_csv_path() -> str:
         cfg_dir = os.getcwd()
     return os.path.join(cfg_dir, ".snowrunner_editor_maprunner_data.csv")
 
-def _load_csv_to_simpleframe(csv_path: str) -> Optional[SimpleFrame]:
+def _objectives_cache_js_path(role: str) -> str:
+    try:
+        cfg_dir = os.path.dirname(CONFIG_FILE)
+    except Exception:
+        try:
+            cfg_dir = os.path.expanduser("~")
+        except Exception:
+            cfg_dir = ""
+    if not cfg_dir:
+        cfg_dir = os.getcwd()
+    role_key = str(role or "").strip().lower()
+    if role_key == "desc":
+        name = ".snowrunner_editor_maprunner_desc.js"
+    else:
+        name = ".snowrunner_editor_maprunner_data.js"
+    return os.path.join(cfg_dir, name)
+
+def _mr_persist_canonical_js_cache(allow_desc: bool = True) -> None:
+    for role, canon in _MR_CANONICAL_NAMES.items():
+        if role == "desc" and not allow_desc:
+            continue
+        bs = _MR_IN_MEM_FILES.get(canon)
+        if not isinstance(bs, (bytes, bytearray)) or not bs:
+            continue
+        out_path = _objectives_cache_js_path(role)
+        tmp_path = out_path + ".tmp"
+        try:
+            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        try:
+            with open(tmp_path, "wb") as f:
+                f.write(bytes(bs))
+            os.replace(tmp_path, out_path)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+def _mr_load_cached_canonical_js_to_mem() -> Dict[str, str]:
+    loaded: Dict[str, str] = {}
+    for role, canon in _MR_CANONICAL_NAMES.items():
+        if canon in _MR_IN_MEM_FILES:
+            continue
+        path = _objectives_cache_js_path(role)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+            if data:
+                _mr_store_in_memory(canon, data, f"cache:{path}")
+                loaded[role] = path
+        except Exception:
+            continue
+    return loaded
+
+def _load_csv_to_simpleframe(csv_path: str, skip_non_english: bool = False) -> Optional[SimpleFrame]:
     if not csv_path:
         return None
     log(f"Starting CSV load: {csv_path}")
@@ -7468,6 +9100,14 @@ def _load_csv_to_simpleframe(csv_path: str) -> Optional[SimpleFrame]:
             for r in reader:
                 normalized = {str(k).strip().lower(): (v if v != "" else None) for k, v in r.items()}
                 rows.append(normalized)
+        # Optionally skip cached CSVs that are clearly non-English.
+        if skip_non_english:
+            try:
+                if _mr_strings_look_non_english([r.get("displayname") for r in rows if isinstance(r, dict)]):
+                    log("CSV appears non-English; skipping this candidate.")
+                    return None
+            except Exception:
+                pass
         log(f"CSV read complete: {len(rows)} rows")
         return SimpleFrame(rows)
     except Exception as e:
@@ -7508,10 +9148,22 @@ def _load_parquet_safe(parquet_path: Optional[str] = None, allow_build: bool = T
         if p and p not in candidates:
             candidates.append(p)
 
+    bundled_exists = bool(bundled_csv and os.path.exists(bundled_csv))
     for path in candidates:
-        df = _load_csv_to_simpleframe(path)
+        skip_non_english = bool(bundled_exists and path != bundled_csv)
+        df = _load_csv_to_simpleframe(path, skip_non_english=skip_non_english)
         if df is not None:
             return df
+
+    # Last resort: use cached CSV even if it is non-English when no bundled fallback exists.
+    try:
+        if cache_csv and os.path.exists(cache_csv):
+            df = _load_csv_to_simpleframe(cache_csv, skip_non_english=False)
+            if df is not None:
+                log("Using cached CSV despite language filter (no English fallback found).")
+                return df
+    except Exception:
+        pass
 
     log("Objectives+ CSV load failed: no usable CSV found.")
     return None
@@ -7571,6 +9223,16 @@ class VirtualObjectivesFast:
         self.type_var = tk.StringVar()
         self.region_var = tk.StringVar()
         self.category_var = tk.StringVar()
+        # Objectives+ data source controls
+        try:
+            self.safe_fallback_var = (
+                objectives_safe_fallback_var
+                if objectives_safe_fallback_var is not None
+                else tk.BooleanVar(value=False)
+            )
+        except Exception:
+            self.safe_fallback_var = tk.BooleanVar(value=False)
+        self.safe_fallback_cb = None
 
         # Status / refresh UI
         self.status_var = tk.StringVar(value="")
@@ -7585,6 +9247,8 @@ class VirtualObjectivesFast:
         # Tooltip placeholders
         self._tip = None
         self._tip_label = None
+        self._tooltip_after_id = None
+        self._tooltip_pending_item = None
 
         # Lock for thread-safety
         self._lock = threading.Lock()
@@ -7732,6 +9396,10 @@ class VirtualObjectivesFast:
         if self._tip is None or not tk.Toplevel.winfo_exists(self._tip):
             self._tip = tk.Toplevel(self.parent)
             self._tip.wm_overrideredirect(True)
+            try:
+                self._tip.withdraw()
+            except Exception:
+                pass
             self._tip_label = tk.Label(
                 self._tip,
                 text=tip,
@@ -7751,6 +9419,46 @@ class VirtualObjectivesFast:
             self._tip.deiconify()
         except Exception:
             pass
+
+    def _cancel_tooltip_schedule(self):
+        after_id = getattr(self, "_tooltip_after_id", None)
+        if after_id is not None and hasattr(self.parent, "after_cancel"):
+            try:
+                self.parent.after_cancel(after_id)
+            except Exception:
+                pass
+        self._tooltip_after_id = None
+        self._tooltip_pending_item = None
+
+    def _schedule_tooltip_for_item(self, item: Dict[str, Any], event=None, delay_ms: int = 260):
+        self._cancel_tooltip_schedule()
+        self._tooltip_pending_item = item
+
+        def _show_later():
+            self._tooltip_after_id = None
+            pending = self._tooltip_pending_item
+            self._tooltip_pending_item = None
+            if pending is None:
+                return
+            try:
+                x_root, y_root = self.parent.winfo_pointerxy()
+            except Exception:
+                x_root, y_root = (
+                    int(getattr(event, "x_root", 0) if event is not None else 0),
+                    int(getattr(event, "y_root", 0) if event is not None else 0),
+                )
+            ev = type("TooltipEvent", (), {"x_root": x_root, "y_root": y_root})()
+            self._show_tooltip_for_item(pending, ev)
+
+        try:
+            self._tooltip_after_id = self.parent.after(max(50, int(delay_ms)), _show_later)
+        except Exception:
+            self._tooltip_after_id = None
+            self._tooltip_pending_item = None
+            try:
+                self._show_tooltip_for_item(item, event)
+            except Exception:
+                pass
 
     def _clear_full_rows(self):
         for r in self._full_rows:
@@ -7809,7 +9517,7 @@ class VirtualObjectivesFast:
                 except Exception:
                     pass
 
-            info.bind("<Enter>", lambda e, it=item: self._show_tooltip_for_item(it, e))
+            info.bind("<Enter>", lambda e, it=item: self._schedule_tooltip_for_item(it, e))
             info.bind("<Leave>", lambda e: self._hide_tooltip())
 
             self._full_rows.append({"frame": f, "cb": cb, "cb_var": cb_var, "item_id": item_id})
@@ -7891,6 +9599,11 @@ class VirtualObjectivesFast:
             return
         self._refresh_inflight = True
         base_text = "Fetching newer data" if self.items else "Fetching data"
+        try:
+            if _get_objectives_safe_fallback_mode():
+                base_text = "Fetching safe fallback data"
+        except Exception:
+            pass
         self._start_loading_animation(base_text)
         cache_csv = _objectives_cache_csv_path()
 
@@ -7906,13 +9619,19 @@ class VirtualObjectivesFast:
                 self._stop_loading_animation()
                 if built or not self.items:
                     # reload from cache/bundled without blocking
-                    self.load_data_thread(allow_build=False, preserve_changes=True, keep_existing_items=True)
+                    self.load_data_thread(allow_build=False, preserve_changes=True, keep_existing_items=True, show_loading=False)
                 if built:
                     self._set_status_temp("Updated to latest data", 2000)
                 else:
                     if self.items:
                         self._set_status_temp("Update failed — using cached data", 3000)
                     else:
+                        try:
+                            if _get_objectives_safe_fallback_mode() and _MR_SAFE_FALLBACK_ERROR:
+                                self._set_status_temp(_MR_SAFE_FALLBACK_ERROR, 5000)
+                                return
+                        except Exception:
+                            pass
                         self._set_status_temp("No data available (offline)", 3000)
 
             try:
@@ -7924,6 +9643,21 @@ class VirtualObjectivesFast:
                 finish()
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _on_safe_fallback_toggle(self) -> None:
+        try:
+            enabled = bool(self.safe_fallback_var.get())
+        except Exception:
+            enabled = False
+        _set_objectives_safe_fallback_mode(enabled)
+        _update_config_values({"objectives_use_safe_fallback": bool(enabled)})
+        try:
+            if enabled:
+                self._set_status_temp("Safe fallback enabled — using GitHub data", 4000)
+            else:
+                self._set_status_temp("Safe fallback disabled — refresh to update", 3000)
+        except Exception:
+            pass
 
     # ---------------- UI builder ----------------
     def build_ui(self):
@@ -7954,6 +9688,13 @@ class VirtualObjectivesFast:
         cb3.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
 
         ttk.Button(self.topbar, text="Reload Save", command=self.reload_checked_from_save).pack(side="right", padx=4)
+        self.safe_fallback_cb = ttk.Checkbutton(
+            self.topbar,
+            text="Use safe fallback (English)",
+            variable=self.safe_fallback_var,
+            command=self._on_safe_fallback_toggle,
+        )
+        self.safe_fallback_cb.pack(side="right", padx=(6, 10))
 
         holder = tk.Frame(self.frame, bg=STRIPE_B)
         holder.pack(fill="both", expand=True, padx=6, pady=(0,6))
@@ -8039,6 +9780,7 @@ class VirtualObjectivesFast:
         ttk.Button(bottom, text="Check filtered", command=self.check_filtered).pack(side="right", padx=4)
         ttk.Button(bottom, text="Uncheck filtered", command=self.uncheck_filtered).pack(side="right", padx=4)
         ttk.Button(bottom, text="Apply Changes", command=self.apply_changes_thread).pack(side="right")
+        ttk.Button(bottom, text="Accept Tasks", command=self.accept_tasks_thread).pack(side="right", padx=(0, 4))
 
     # ---------------- canvas & virtual pool management ----------------
     def _on_canvas_configure(self, event):
@@ -8171,7 +9913,7 @@ class VirtualObjectivesFast:
                 info.pack(side="right", padx=6)
 
                 def enter(e, pool_index=i):
-                    self._show_tooltip_for_pool(pool_index, e)
+                    self._schedule_tooltip_for_pool(pool_index, e)
                 def leave(e):
                     self._hide_tooltip()
 
@@ -8495,7 +10237,19 @@ class VirtualObjectivesFast:
         item = self.items[real_idx]
         self._show_tooltip_for_item(item, event)
 
+    def _schedule_tooltip_for_pool(self, pool_index, event):
+        if pool_index < 0 or pool_index >= len(self.pool):
+            return
+        p = self.pool[pool_index]
+        item_idx = p.get("item_index")
+        if item_idx is None:
+            return
+        real_idx = self.filtered[item_idx]
+        item = self.items[real_idx]
+        self._schedule_tooltip_for_item(item, event)
+
     def _hide_tooltip(self):
+        self._cancel_tooltip_schedule()
         if self._tip is not None and tk.Toplevel.winfo_exists(self._tip):
             try:
                 self._tip.withdraw()
@@ -8503,7 +10257,28 @@ class VirtualObjectivesFast:
                 pass
 
     # ---------------- data loading & filtering ----------------
-    def load_data_thread(self, allow_build: bool = True, preserve_changes: bool = False, keep_existing_items: bool = False):
+    def load_data_thread(
+        self,
+        allow_build: bool = True,
+        preserve_changes: bool = False,
+        keep_existing_items: bool = False,
+        show_loading: bool = True,
+    ):
+        try:
+            if _get_objectives_safe_fallback_mode():
+                cache_csv = _objectives_cache_csv_path()
+                if not cache_csv or not os.path.exists(cache_csv):
+                    allow_build = True
+        except Exception:
+            pass
+        started_loading = False
+        try:
+            if show_loading and not self._loading_active:
+                base_text = "Loading data" if allow_build else "Loading cached data"
+                self._start_loading_animation(base_text)
+                started_loading = True
+        except Exception:
+            started_loading = False
         if not keep_existing_items:
             self.items = []
             self.filtered = []
@@ -8535,7 +10310,7 @@ class VirtualObjectivesFast:
                             pass
                     return "" if v is None else str(v)
                 key = g("key") or g("id") or g("name") or f"ITEM_{idx}"
-                display = g("displayname") or g("name") or key
+                display = _mr_normalize_mojibake_text(g("displayname") or g("name") or key)
                 if not display.strip() or display.startswith("---"):
                     continue
                 excel_type = g("type")
@@ -8562,7 +10337,7 @@ class VirtualObjectivesFast:
                     "money": g("money"),
                     "xp": g("experience"),
                     "cargo": g("cargo_needed"),
-                    "desc": g("descriptiontext") or "",
+                    "desc": _mr_normalize_mojibake_text(g("descriptiontext") or ""),
                     "source": raw_source
                 }
                 all_items.append(item)
@@ -8580,7 +10355,11 @@ class VirtualObjectivesFast:
             def finish():
                 self.items = all_items
                 self.original_checked = pre
-                self.session_locked = set(pre)
+                self.session_locked = {
+                    str(it.get("id", "")).strip()
+                    for it in all_items
+                    if str(it.get("id", "")).strip() in pre and (str(it.get("type", "")).upper() != "TASK")
+                }
                 if preserve_changes:
                     try:
                         valid_ids = {it.get("id") for it in all_items if it.get("id")}
@@ -8614,6 +10393,11 @@ class VirtualObjectivesFast:
                     pass
                 log(f"Scheduling finish: items={len(self.items)} original_checked={len(self.original_checked)})")
                 self.apply_filters()
+                if started_loading:
+                    try:
+                        self._stop_loading_animation(final_text="")
+                    except Exception:
+                        pass
             try:
                 if hasattr(self.parent, "after"):
                     self.parent.after(10, finish)
@@ -8675,6 +10459,8 @@ class VirtualObjectivesFast:
         with self._lock:
             for idx in self.filtered:
                 iid = self.items[idx]["id"]
+                if iid in self.session_locked:
+                    continue
                 self.selected_changes[iid] = True
                 cnt += 1
         log(f"Check filtered: marked {cnt} items (matching current filters)")
@@ -8688,6 +10474,8 @@ class VirtualObjectivesFast:
         with self._lock:
             for idx in self.filtered:
                 iid = self.items[idx]["id"]
+                if iid in self.session_locked:
+                    continue
                 self.selected_changes[iid] = False
                 cnt += 1
         log(f"Uncheck filtered: marked {cnt} items (matching current filters)")
@@ -8713,6 +10501,7 @@ class VirtualObjectivesFast:
         with self._lock:
             changes = dict(self.selected_changes)
             self.selected_changes.clear()
+            original_checked_snapshot = set(self.original_checked)
 
         if not changes:
             log("ApplyChanges: nothing to do")
@@ -8721,25 +10510,52 @@ class VirtualObjectivesFast:
         log(f"ApplyChanges: batch-applying {len(changes)} changes")
 
         def worker():
+            mission_changes = {}
+            contest_changes = {}
+            task_reaccept_ids = []
+            unexpected_uncheck_ids = []
             try:
                 id_to_type = {it["id"]: (it.get("type") or "TASK").upper() for it in self.items}
-                contest_changes = {k: v for k, v in changes.items() if id_to_type.get(k, "TASK") == "CONTEST"}
-                mission_changes = {k: v for k, v in changes.items() if id_to_type.get(k, "TASK") != "CONTEST"}
+                for oid, new_value in changes.items():
+                    oid_s = str(oid)
+                    old_checked = oid_s in original_checked_snapshot
+                    now_checked = bool(new_value)
+                    kind = id_to_type.get(oid_s, "TASK")
 
-                if not sp or not os.path.exists(sp):
-                    log("[BATCH WRITE] no save file; printing planned changes:")
-                    log(f"  contests: {len(contest_changes)} missions: {len(mission_changes)}")
-                else:
+                    if (not old_checked) and now_checked:
+                        if kind == "CONTEST":
+                            contest_changes[oid_s] = True
+                        else:
+                            mission_changes[oid_s] = True
+                    elif old_checked and (not now_checked):
+                        if kind == "TASK":
+                            task_reaccept_ids.append(oid_s)
+                        else:
+                            unexpected_uncheck_ids.append(oid_s)
+
+                task_reaccept_ids = _experiments_dedupe_ids(task_reaccept_ids)
+
+                if task_reaccept_ids:
+                    try:
+                        _experiments_load_js_objective_sources(force_reload=True)
+                    except Exception:
+                        pass
+                    _experiments_reaccept_finished_tasks(
+                        sp,
+                        task_reaccept_ids,
+                        add_discovered=True,
+                        seed_states=True,
+                        seed_stage_mode="placeholder",
+                        reset_to_unfinished=True,
+                        touch_existing_states=False,
+                        remove_from_viewed=True,
+                        track_first=False,
+                        trust_ids_as_tasks=True,
+                    )
+
+                if sp and os.path.exists(sp) and (mission_changes or contest_changes):
                     with open(sp, "r", encoding="utf-8") as f:
                         content = f.read()
-                        
-                    # Use central folder-based backup instead of creating a .bak file
-                    try:
-                        if 'make_backup_if_enabled' in globals() and callable(make_backup_if_enabled):
-                            make_backup_if_enabled(sp)
-                    except Exception:
-                        log("[BATCH WRITE] folder backup failed/ignored")
-
 
                     if mission_changes:
                         start = content.find('"objectiveStates"')
@@ -8750,11 +10566,11 @@ class VirtualObjectivesFast:
                                     obj_states = json.loads(block)
                                 except Exception:
                                     obj_states = {}
-                                for kid, kval in mission_changes.items():
+                                for kid in mission_changes.keys():
                                     cur = obj_states.get(kid)
                                     if not isinstance(cur, dict):
                                         cur = {}
-                                    cur["isFinished"] = bool(kval)
+                                    cur["isFinished"] = True
                                     obj_states[kid] = cur
                                 new_block = json.dumps(obj_states, indent=4, ensure_ascii=False)
                                 content = content[:bs] + new_block + content[be:]
@@ -8765,28 +10581,22 @@ class VirtualObjectivesFast:
 
                     if contest_changes:
                         try:
-                            # collect global contestTimes entries that we add while patching CompleteSave blocks
                             global_contest_times_new = {}
                             added_total = 0
                             removed_total = 0
 
-                            # Find all CompleteSave* occurrences and process each (use reversed so replacing doesn't break earlier offsets)
                             matches = list(re.finditer(r'"(CompleteSave\d*)"\s*:\s*{', content))
                             for match in reversed(matches):
                                 save_key = match.group(1)
                                 try:
-                                    # extract the value block ({ ... }) after the key
                                     value_block_str, val_block_start, val_block_end = extract_brace_block(content, match.end() - 1)
                                     try:
                                         value_data = json.loads(value_block_str)
                                     except Exception:
-                                        # skip malformed block
                                         continue
 
-                                    # SslValue may be directly present or nested
                                     ssl = value_data.get("SslValue") or value_data.get(save_key, {}).get("SslValue") or {}
 
-                                    # Normalize finishedObjs shape
                                     orig_finished = ssl.get("finishedObjs", [])
                                     finished_is_dict = isinstance(orig_finished, dict)
                                     if isinstance(orig_finished, dict):
@@ -8796,7 +10606,6 @@ class VirtualObjectivesFast:
                                     else:
                                         finished_set = set()
 
-                                    # Ensure contestTimes is a dict
                                     contest_times = ssl.get("contestTimes", {})
                                     if not isinstance(contest_times, dict):
                                         contest_times = {}
@@ -8804,23 +10613,14 @@ class VirtualObjectivesFast:
                                     added_here = []
                                     removed_here = []
 
-                                    # Apply the explicit contest_changes mapping (key -> bool)
-                                    for k, v in contest_changes.items():
-                                        if v:
-                                            if k not in finished_set:
-                                                finished_set.add(k)
-                                                added_here.append(k)
-                                            if k not in contest_times:
-                                                contest_times[k] = 1
-                                                global_contest_times_new[k] = 1
-                                        else:
-                                            if k in finished_set:
-                                                finished_set.remove(k)
-                                                removed_here.append(k)
-                                            if k in contest_times:
-                                                del contest_times[k]
+                                    for k in contest_changes.keys():
+                                        if k not in finished_set:
+                                            finished_set.add(k)
+                                            added_here.append(k)
+                                        if k not in contest_times:
+                                            contest_times[k] = 1
+                                            global_contest_times_new[k] = 1
 
-                                    # If anything changed for this block, write it back
                                     if added_here or removed_here:
                                         if finished_is_dict:
                                             ssl["finishedObjs"] = {kk: True for kk in finished_set}
@@ -8833,24 +10633,19 @@ class VirtualObjectivesFast:
                                         if isinstance(viewed, list) and added_here:
                                             ssl["viewedUnactivatedObjectives"] = [v for v in viewed if v not in added_here]
 
-                                        # Put SslValue back and replace the value block in content
                                         value_data["SslValue"] = ssl
                                         new_value_block_str = json.dumps(value_data, separators=(",", ":"))
                                         content = content[:val_block_start] + new_value_block_str + content[val_block_end:]
 
                                         added_total += len(added_here)
                                         removed_total += len(removed_here)
-
                                 except Exception:
-                                    # skip this CompleteSave block on any unexpected error
                                     continue
 
-                            # Merge new contestTimes entries into any other contestTimes blocks in the file
                             if global_contest_times_new and 'update_all_contest_times_blocks' in globals():
                                 try:
                                     content = update_all_contest_times_blocks(content, global_contest_times_new)
                                 except Exception:
-                                    # non-fatal: ignore if merge fails
                                     pass
 
                             log(f"[BATCH WRITE] Contests updated: +{added_total} / -{removed_total}")
@@ -8860,7 +10655,10 @@ class VirtualObjectivesFast:
                     try:
                         with open(sp, "w", encoding="utf-8") as f:
                             f.write(content)
-                        log(f"[BATCH WRITE] applied {len(changes)} changes to {sp}")
+                        log(
+                            f"[BATCH WRITE] applied complete={len(mission_changes) + len(contest_changes)} "
+                            f"reaccept={len(task_reaccept_ids)} to {sp}"
+                        )
                     except Exception as e:
                         log(f"[BATCH WRITE] write failed: {e}")
             except Exception as ex:
@@ -8871,16 +10669,38 @@ class VirtualObjectivesFast:
             except Exception:
                 new_checked = set()
             self.original_checked = new_checked
+            self.session_locked = {
+                str(it.get("id", "")).strip()
+                for it in self.items
+                if str(it.get("id", "")).strip() in new_checked and (str(it.get("type", "")).upper() != "TASK")
+            }
             log(f"ApplyChanges: finished; original_checked now {len(self.original_checked)} items")
 
             self._refresh_visible_checkbox_vars()
             self._update_visible_rows()
 
             try:
-                if changes:
+                apply_complete = len(mission_changes) + len(contest_changes)
+                apply_reaccept = len(task_reaccept_ids)
+                apply_total = apply_complete + apply_reaccept
+                if unexpected_uncheck_ids:
+                    messagebox.showerror(
+                        "Objectives+",
+                        (
+                            "Unexpected\n\n"
+                            f"Non-task checked->unchecked transitions detected: {len(unexpected_uncheck_ids)}\n"
+                            f"Applied completions: {apply_complete}\n"
+                            f"Applied task re-accepts: {apply_reaccept}"
+                        ),
+                    )
+                elif apply_total > 0:
                     show_info(
                         "Objectives+",
-                        f"Successfully applied {len(changes)} change(s) to your save file."
+                        (
+                            f"Successfully applied {apply_total} change(s) to your save file.\n\n"
+                            f"Completions: {apply_complete}\n"
+                            f"Task re-accepts: {apply_reaccept}"
+                        ),
                     )
                 else:
                     show_info(
@@ -8889,6 +10709,100 @@ class VirtualObjectivesFast:
                     )
             except Exception as e:
                 log(f"[BATCH WRITE][POPUP ERROR] {e}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def accept_tasks_thread(self):
+        sp = self.tk_var_get(self.save_var)
+        if not sp or not os.path.exists(sp):
+            try:
+                show_info("Info", "No valid save file provided.")
+            except Exception:
+                pass
+            return
+
+        id_to_type = {it.get("id"): (it.get("type") or "").upper() for it in self.items}
+        with self._lock:
+            # Use Objectives+ current pending selections, but accept only checked TASK entries.
+            task_ids = [
+                oid
+                for oid, should_apply in self.selected_changes.items()
+                if bool(should_apply) and id_to_type.get(oid, "") == "TASK"
+            ]
+            # Keep non-task and uncheck edits untouched for regular "Apply Changes".
+            for oid in task_ids:
+                self.selected_changes.pop(oid, None)
+
+        task_ids = _experiments_dedupe_ids(task_ids)
+        if not task_ids:
+            try:
+                show_info("Objectives+", "No selected TASK entries to accept.")
+            except Exception:
+                pass
+            return
+
+        try:
+            if "make_backup_if_enabled" in globals() and callable(make_backup_if_enabled):
+                make_backup_if_enabled(sp)
+        except Exception:
+            pass
+
+        def worker():
+            try:
+                try:
+                    _experiments_load_js_objective_sources(force_reload=True)
+                except Exception:
+                    pass
+                stats = _experiments_accept_objectives(
+                    sp,
+                    task_ids,
+                    add_discovered=True,
+                    seed_states=True,
+                    seed_stage_mode="placeholder",
+                    reset_to_unfinished=True,
+                    touch_existing_states=False,
+                    remove_from_finished=False,
+                    remove_from_viewed=True,
+                    track_first=False,
+                    trust_ids_as_tasks=True,
+                )
+            except Exception as ex:
+                stats = None
+                log(f"[ACCEPT TASKS][ERROR] {ex}")
+
+            try:
+                new_checked = _read_finished_contests(sp) | _read_finished_missions(sp) if sp and os.path.exists(sp) else set()
+            except Exception:
+                new_checked = set()
+            self.original_checked = new_checked
+            self.session_locked = {
+                str(it.get("id", "")).strip()
+                for it in self.items
+                if str(it.get("id", "")).strip() in new_checked and (str(it.get("type", "")).upper() != "TASK")
+            }
+
+            self._refresh_visible_checkbox_vars(force=True)
+            self._update_visible_rows()
+
+            try:
+                if isinstance(stats, dict):
+                    touched = int(stats.get("states_touched", 0))
+                    seeded = int(stats.get("states_seeded", 0))
+                    skipped_finished = int(stats.get("ids_skipped_finished", 0))
+                    skipped_non_tasks = int(stats.get("ids_skipped_non_tasks", 0))
+                    msg = (
+                        f"Accept Tasks finished.\n\n"
+                        f"Task IDs requested: {len(task_ids)}\n"
+                        f"States touched: {touched}\n"
+                        f"States seeded: {seeded}\n"
+                        f"Skipped already finished: {skipped_finished}\n"
+                        f"Skipped non-tasks: {skipped_non_tasks}"
+                    )
+                    show_info("Objectives+", msg)
+                else:
+                    show_info("Objectives+", "Accept Tasks finished.")
+            except Exception as e:
+                log(f"[ACCEPT TASKS][POPUP ERROR] {e}")
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -8902,7 +10816,11 @@ class VirtualObjectivesFast:
             new_checked = set()
 
         self.original_checked = new_checked
-        self.session_locked = set(new_checked)
+        self.session_locked = {
+            str(it.get("id", "")).strip()
+            for it in self.items
+            if str(it.get("id", "")).strip() in new_checked and (str(it.get("type", "")).upper() != "TASK")
+        }
         self.selected_changes.clear()
 
         for item in self.items:
@@ -8953,9 +10871,7 @@ def create_backups_tab(tab_backups, save_path_var):
 
     def open_backup_settings():
         """
-        Robust Backup Settings popup: uses globals if present, otherwise local fallbacks.
-        Persists settings into CONFIG_FILE via save_config(). Ensures the global autosave_var
-        is used (so toggles take effect immediately) and attaches a single trace to it.
+        Robust Backup Settings popup with autosave/backup settings and startup integration.
         """
         # Determine parent safely
         try:
@@ -8965,7 +10881,7 @@ def create_backups_tab(tab_backups, save_path_var):
 
         win = _create_themed_toplevel(parent)
         win.title("Backup Settings")
-        win.geometry("480x260")
+        win.geometry("580x500")
         win.resizable(False, False)
         try:
             if parent:
@@ -9013,6 +10929,109 @@ def create_backups_tab(tab_backups, save_path_var):
         except Exception:
             autosave_var = tk.BooleanVar(win, value=bool(cfg.get("autosave", False)))
 
+        autosave_backup_on_game_exit_var = tk.BooleanVar(
+            win,
+            value=_cfg_bool(cfg.get("autosave_backup_on_game_exit", False), default=False),
+        )
+        autosave_poll_interval_var = tk.StringVar(
+            win,
+            value=str(_sanitize_autosave_poll_interval_seconds(cfg.get("autosave_poll_interval_seconds", 60), default=60)),
+        )
+        startup_with_windows_var = tk.BooleanVar(
+            win,
+            value=_cfg_bool(cfg.get("start_with_windows", False), default=False),
+        )
+
+        startup_supported = _is_windows_startup_supported()
+
+        def _autosave_toggled(*_):
+            """Start/stop autosave monitor when checkbox changes."""
+            try:
+                _refresh_autosave_runtime_state_from_vars()
+            except Exception:
+                pass
+            try:
+                if autosave_var.get():
+                    start_autosave_monitor()
+                else:
+                    stop_autosave_monitor()
+            except Exception as e:
+                print("[Autosave] toggle error:", e)
+
+        def _on_startup_normal_toggle():
+            # checkbox state is already the desired final state
+            return
+
+        def _attach_hover_tooltip(anchor_widget, tooltip_text):
+            tip_state = {"win": None, "job": None}
+
+            def _cancel_job():
+                job = tip_state.get("job")
+                if job is not None:
+                    try:
+                        anchor_widget.after_cancel(job)
+                    except Exception:
+                        pass
+                    tip_state["job"] = None
+
+            def _hide(_event=None):
+                _cancel_job()
+                tip = tip_state.get("win")
+                if tip is not None:
+                    try:
+                        tip.destroy()
+                    except Exception:
+                        pass
+                    tip_state["win"] = None
+
+            def _show_now():
+                _hide()
+                try:
+                    tip = tk.Toplevel(anchor_widget)
+                    tip.wm_overrideredirect(True)
+                    try:
+                        tip.withdraw()
+                    except Exception:
+                        pass
+                    try:
+                        tip.attributes("-topmost", True)
+                    except Exception:
+                        pass
+                    x = int(anchor_widget.winfo_rootx() + anchor_widget.winfo_width() + 8)
+                    y = int(anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 6)
+                    tip.geometry(f"+{x}+{y}")
+                    tk.Label(
+                        tip,
+                        text=str(tooltip_text or ""),
+                        justify="left",
+                        wraplength=500,
+                        bg="#fffbe6",
+                        fg="black",
+                        relief="solid",
+                        bd=1,
+                        padx=8,
+                        pady=6,
+                    ).pack()
+                    tip_state["win"] = tip
+                    try:
+                        tip.deiconify()
+                    except Exception:
+                        pass
+                except Exception:
+                    _hide()
+
+            def _schedule_show(_event=None):
+                _cancel_job()
+                try:
+                    tip_state["job"] = anchor_widget.after(260, _show_now)
+                except Exception:
+                    _show_now()
+
+            anchor_widget.bind("<Enter>", _schedule_show, add="+")
+            anchor_widget.bind("<Leave>", _hide, add="+")
+            anchor_widget.bind("<ButtonPress>", _hide, add="+")
+            anchor_widget.bind("<FocusOut>", _hide, add="+")
+
         # Build UI
         frm = ttk.Frame(win, padding=10)
         frm.pack(fill="both", expand=True)
@@ -9031,7 +11050,44 @@ def create_backups_tab(tab_backups, save_path_var):
             ttk.Checkbutton(frm, text="Full Backup (entire save folder) Recommended").pack(anchor="w", pady=(0,8))
 
         # Autosave checkbox bound to the global var so it affects the monitor immediately
-        ttk.Checkbutton(frm, text="Enable Autosave (create autobackup when game autosaves)", variable=autosave_var).pack(anchor="w", pady=(0,8))
+        ttk.Checkbutton(
+            frm,
+            text="Enable Autosave (create autobackup when game autosaves)",
+            variable=autosave_var,
+            command=_autosave_toggled,
+        ).pack(anchor="w", pady=(0,6))
+        ttk.Checkbutton(
+            frm,
+            text="When SnowRunner closes, create one final full backup",
+            variable=autosave_backup_on_game_exit_var,
+        ).pack(anchor="w", pady=(0,8))
+
+        scan_row = ttk.Frame(frm)
+        scan_row.pack(fill="x", pady=(2, 8))
+        ttk.Label(scan_row, text="Scan for SnowRunner every").pack(side="left")
+        ttk.Entry(scan_row, textvariable=autosave_poll_interval_var, width=8).pack(side="left", padx=(6, 6))
+        ttk.Label(scan_row, text="seconds").pack(side="left")
+
+        scan_info_badge = tk.Label(
+            scan_row,
+            text="i",
+            width=2,
+            relief="ridge",
+            bd=1,
+            highlightthickness=0,
+            cursor="question_arrow",
+            bg=_theme_color_literal("#e9e9e9", role="button_bg"),
+            fg=_theme_color_literal("black", role="fg"),
+        )
+        scan_info_badge.pack(side="left", padx=(8, 0))
+        _attach_hover_tooltip(
+            scan_info_badge,
+            "SnowRunner checks are important: this sets how often the editor checks for SnowRunner and save-file changes.\n\n"
+            "Lower values are safer and detect things faster, but use more CPU.\n"
+            "Higher values improve performance but can miss short changes or delay the final backup after game close.\n\n"
+            "Even at 1 second, autobackups are still triggered by actual save-file changes (not every second).",
+        )
+
         # small red help text under the autosave checkbox
         tk.Label(frm,
                  text="Autosaves work only if the editor is running in the background",
@@ -9059,19 +11115,28 @@ def create_backups_tab(tab_backups, save_path_var):
             tmp_ab_val = tk.StringVar(win, value=str(cfg.get("max_autobackups", "50")))
             ttk.Entry(row2, textvariable=tmp_ab_val, width=8).pack(side="left", padx=(8, 0))
 
+        ttk.Separator(frm, orient="horizontal").pack(fill="x", pady=(12, 8))
+        ttk.Label(frm, text="Startup", font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 6))
+
+        startup_normal_cb = ttk.Checkbutton(
+            frm,
+            text="Start editor with Windows",
+            variable=startup_with_windows_var,
+            command=_on_startup_normal_toggle,
+        )
+        startup_normal_cb.pack(anchor="w", pady=(0, 2))
+
+        if not startup_supported:
+            startup_normal_cb.configure(state="disabled")
+            ttk.Label(
+                frm,
+                text="Windows startup integration is unavailable on this platform.",
+                style="Warning.TLabel",
+            ).pack(anchor="w", pady=(2, 6))
+
         # Buttons
         btn_row = ttk.Frame(frm)
         btn_row.pack(fill="x", pady=(14, 0))
-
-        def _cfg_bool(v):
-            if isinstance(v, bool):
-                return v
-            if isinstance(v, str):
-                return v.strip().lower() in ("1", "true", "yes", "on")
-            try:
-                return bool(int(v))
-            except Exception:
-                return False
 
         def _save_and_close():
             # push local popup values back into globals if they exist, and persist to config
@@ -9097,7 +11162,7 @@ def create_backups_tab(tab_backups, save_path_var):
                 pass
             try:
                 if 'autosave_var' in globals() and autosave_var is not None:
-                    autosave_var.set(_cfg_bool(autosave_var.get()))
+                    autosave_var.set(_cfg_bool(autosave_var.get(), default=False))
             except Exception:
                 pass
 
@@ -9106,12 +11171,30 @@ def create_backups_tab(tab_backups, save_path_var):
                 new_cfg = load_config() or {}
             except Exception:
                 new_cfg = {}
+
+            startup_normal = bool(startup_with_windows_var.get())
+
             try:
-                new_cfg["make_backup"] = _cfg_bool(make_backup_var_local.get())
-                new_cfg["full_backup"] = _cfg_bool(full_backup_var_local.get())
-                new_cfg["max_backups"] = int(max_backups_var_local.get()) if str(max_backups_var_local.get()).isdigit() else int(new_cfg.get("max_backups", 20))
-                new_cfg["max_autobackups"] = int(max_autobackups_var_local.get()) if str(max_autobackups_var_local.get()).isdigit() else int(new_cfg.get("max_autobackups", 50))
-                new_cfg["autosave"] = _cfg_bool(autosave_var.get())
+                new_cfg["make_backup"] = _cfg_bool(make_backup_var_local.get(), default=True)
+                new_cfg["full_backup"] = _cfg_bool(full_backup_var_local.get(), default=False)
+                new_cfg["max_backups"] = _parse_nonnegative_int(max_backups_var_local.get(), _parse_nonnegative_int(new_cfg.get("max_backups", 20), 20))
+                new_cfg["max_autobackups"] = _parse_nonnegative_int(max_autobackups_var_local.get(), _parse_nonnegative_int(new_cfg.get("max_autobackups", 50), 50))
+                new_cfg["autosave"] = _cfg_bool(autosave_var.get(), default=False)
+                new_cfg["autosave_backup_on_game_exit"] = _cfg_bool(autosave_backup_on_game_exit_var.get(), default=False)
+                new_cfg["autosave_poll_interval_seconds"] = _sanitize_autosave_poll_interval_seconds(
+                    autosave_poll_interval_var.get(),
+                    default=_sanitize_autosave_poll_interval_seconds(new_cfg.get("autosave_poll_interval_seconds", 60), default=60),
+                )
+                autosave_poll_interval_var.set(str(new_cfg["autosave_poll_interval_seconds"]))
+                new_cfg["start_with_windows"] = bool(startup_normal)
+                new_cfg["start_with_windows_hidden"] = False
+                if startup_normal:
+                    new_cfg.update(_startup_registration_metadata())
+                else:
+                    new_cfg.pop("start_with_windows_registered_version", None)
+                    new_cfg.pop("start_with_windows_registered_target", None)
+                    new_cfg.pop("start_with_windows_registered_args", None)
+                    new_cfg.pop("start_with_windows_registered_workdir", None)
             except Exception:
                 # fallbacks
                 new_cfg.setdefault("max_backups", 20)
@@ -9121,7 +11204,45 @@ def create_backups_tab(tab_backups, save_path_var):
             except Exception as e:
                 print("[Backup Settings] Failed to save config:", e)
 
-            show_info("Settings", "Backup settings saved.")
+            if startup_supported:
+                ok, startup_msg = _apply_startup_mode(startup_normal)
+                if not ok:
+                    print(f"[Startup] apply failed: {startup_msg}")
+                    if startup_normal:
+                        _delete_config_keys(
+                            [
+                                "start_with_windows_registered_version",
+                                "start_with_windows_registered_target",
+                                "start_with_windows_registered_args",
+                                "start_with_windows_registered_workdir",
+                            ]
+                        )
+                    set_app_status(f"Backup settings saved. Startup setting could not be applied: {startup_msg}", timeout_ms=9000)
+                else:
+                    if startup_normal:
+                        _update_config_values(_startup_registration_metadata())
+                    else:
+                        _delete_config_keys(
+                            [
+                                "start_with_windows_registered_version",
+                                "start_with_windows_registered_target",
+                                "start_with_windows_registered_args",
+                                "start_with_windows_registered_workdir",
+                            ]
+                        )
+                    show_info("Settings", "Backup settings saved.")
+            else:
+                show_info("Settings", "Backup settings saved.")
+
+            try:
+                stop_autosave_monitor()
+            except Exception:
+                pass
+            try:
+                _autosave_toggled()
+            except Exception:
+                pass
+
             try:
                 win.destroy()
             except Exception:
@@ -9135,48 +11256,6 @@ def create_backups_tab(tab_backups, save_path_var):
 
         ttk.Button(btn_row, text="Cancel", command=_cancel).pack(side="right", padx=(6,0))
         ttk.Button(btn_row, text="Save", command=_save_and_close).pack(side="right")
-
-        # ---- autosave toggle wiring: remove old traces and attach a single one ----
-        def _autosave_toggled(*a):
-            """Start/stop the autosave monitor to match the checkbox state."""
-            try:
-                if autosave_var.get():
-                    start_autosave_monitor()
-                else:
-                    stop_autosave_monitor()
-            except Exception as e:
-                print("[Autosave] toggle error:", e)
-
-        # --- remove any previous traces to avoid duplication (handle different trace_info shapes) ---
-        try:
-            traces = autosave_var.trace_info() or []
-            for t in traces:
-                try:
-                    # trace_info entries vary by Tk version. Try common tuple shapes.
-                    if isinstance(t, (list, tuple)):
-                        if len(t) >= 2:
-                            autosave_var.trace_vdelete(t[0], t[1])
-                        else:
-                            # older shape: single token
-                            autosave_var.trace_vdelete("w", t[0])
-                    else:
-                        # fallback: attempt to remove write traces
-                        autosave_var.trace_vdelete("w", t)
-                except Exception:
-                    # ignore failures to delete an individual trace
-                    pass
-        except Exception:
-            pass
-
-        # --- add trace (use trace_add when available) ---
-        try:
-            autosave_var.trace_add("write", _autosave_toggled)
-        except Exception:
-            try:
-                autosave_var.trace("w", _autosave_toggled)
-            except Exception:
-                # if we can't attach the callback, still try to set monitor to current state below
-                pass
 
         # Ensure monitor state matches checkbox now (no restart needed)
         try:
@@ -9201,13 +11280,16 @@ def create_backups_tab(tab_backups, save_path_var):
     recall_btn = ttk.Button(top_row, text="Recall Selected", state="disabled")
     recall_btn.pack(side="right", padx=(6, 0))
 
+    make_full_backup_btn = ttk.Button(top_row, text="Make Full Backup")
+    make_full_backup_btn.pack(side="right", padx=(6, 0))
+
     # --- treeview / table with additional columns and matching colours and size ---
-    # Use exact hex colours you chose for Objectives+ so visuals line up
     even_bg = STRIPE_B
     odd_bg = STRIPE_A
+    empty_bg = "#f0f0f0"
 
     # Use a plain tk.Frame so the visible background behind the Treeview rows matches exactly
-    tree_frame = tk.Frame(container, bg=even_bg)
+    tree_frame = tk.Frame(container, bg=empty_bg)
     tree_frame.pack(fill="both", expand=True, padx=4, pady=4)
 
     # Determine the app's default font so Treeview text matches Objectives+ labels.
@@ -9227,15 +11309,15 @@ def create_backups_tab(tab_backups, save_path_var):
     try:
         # Optionally force a theme that respects colours (uncomment to try): style.theme_use('clam')
         style.configure("Backups.Treeview",
-                        background=even_bg,
-                        fieldbackground=even_bg,
-                        bordercolor=even_bg,
+                        background=empty_bg,
+                        fieldbackground=empty_bg,
+                        bordercolor=empty_bg,
                         relief="flat",
                         borderwidth=0,
                         rowheight=30,       # match Objectives+ row height
                         font=item_font)     # MATCH Objectives+ font size
         style.configure("Backups.Treeview.Heading",
-                        background=even_bg,
+                        background=empty_bg,
                         relief="flat",
                         borderwidth=0,
                         font=heading_font)
@@ -9266,6 +11348,7 @@ def create_backups_tab(tab_backups, save_path_var):
     try:
         tree.tag_configure("even", background=even_bg, font=item_font)
         tree.tag_configure("odd", background=odd_bg, font=item_font)
+        tree.tag_configure("filler", background=empty_bg, font=item_font)
     except Exception:
         # some ttk themes ignore tag styling — that's harmless; rows will still show something
         pass
@@ -9282,6 +11365,38 @@ def create_backups_tab(tab_backups, save_path_var):
         backup_dir = os.path.join(save_dir, "backup")
         return backup_dir
 
+    def _add_backups_filler_rows(real_count: int):
+        """Paint remaining visible area with forced #f0f0f0 rows (theme fallback)."""
+        try:
+            row_h = 30
+            view_h = int(tree.winfo_height() or 0)
+            visible_rows = max(0, int(view_h / row_h) + 1)
+            filler_needed = max(0, visible_rows - int(real_count))
+            for i in range(filler_needed):
+                tree.insert(
+                    "",
+                    "end",
+                    iid=f"filler_{i}",
+                    values=("", ""),
+                    tags=("filler",),
+                )
+        except Exception:
+            pass
+
+    def _refresh_backups_filler_only():
+        try:
+            children = list(tree.get_children())
+        except Exception:
+            return
+        real_ids = [iid for iid in children if not str(iid).startswith("filler_")]
+        for iid in children:
+            if str(iid).startswith("filler_"):
+                try:
+                    tree.delete(iid)
+                except Exception:
+                    pass
+        _add_backups_filler_rows(len(real_ids))
+
     def list_backup_folders():
         """Populate the backups treeview with folders from the backup directory.
         Rows get alternating 'even'/'odd' tags so the Treeview can display two-tone rows.
@@ -9292,6 +11407,7 @@ def create_backups_tab(tab_backups, save_path_var):
         backup_dir = _get_backup_dir()
         if not backup_dir or not os.path.exists(backup_dir):
             tree.insert("", "end", values=("No backups found (set save path or create backups first)", ""))
+            _add_backups_filler_rows(1)
             recall_btn.config(state="disabled")
             return
 
@@ -9299,6 +11415,7 @@ def create_backups_tab(tab_backups, save_path_var):
             items = sorted(os.listdir(backup_dir), reverse=True)
             if not items:
                 tree.insert("", "end", values=("No backups found", ""))
+                _add_backups_filler_rows(1)
                 recall_btn.config(state="disabled")
                 return
 
@@ -9312,6 +11429,7 @@ def create_backups_tab(tab_backups, save_path_var):
                 # some ttk themes or environments may not allow tag styling — ignore safely
                 pass
 
+            real_count = 0
             for idx, name in enumerate(items):
                 p = os.path.join(backup_dir, name)
                 label = name + ("/" if os.path.isdir(p) else "")
@@ -9336,12 +11454,16 @@ def create_backups_tab(tab_backups, save_path_var):
 
                 tag = "even" if (idx % 2 == 0) else "odd"
                 tree.insert("", "end", values=(label, time_str), tags=(tag,))
+                real_count += 1
+
+            _add_backups_filler_rows(real_count)
 
             # operate in folder-only mode; ensure recall disabled until selection
             recall_btn.config(state="disabled")
 
         except Exception as e:
             tree.insert("", "end", values=(f"Error listing backups: {e}", ""))
+            _add_backups_filler_rows(1)
             recall_btn.config(state="disabled")
 
 
@@ -9352,8 +11474,14 @@ def create_backups_tab(tab_backups, save_path_var):
         sel = tree.selection()
         if not sel:
             return None
+        iid = sel[0]
+        if str(iid).startswith("filler_"):
+            return None
         vals = tree.item(sel[0], "values")
         if not vals:
+            return None
+        first = str(vals[0] or "")
+        if (not first.strip()) or first.startswith("No backups found") or first.startswith("Error listing backups:"):
             return None
         return vals[0]  # relname or folder label
 
@@ -9366,8 +11494,16 @@ def create_backups_tab(tab_backups, save_path_var):
         if not sel:
             recall_btn.config(state="disabled")
             return
+        iid = sel[0]
+        if str(iid).startswith("filler_"):
+            recall_btn.config(state="disabled")
+            return
         vals = tree.item(sel[0], "values")
         if not vals:
+            recall_btn.config(state="disabled")
+            return
+        first = str(vals[0] or "")
+        if (not first.strip()) or first.startswith("No backups found") or first.startswith("Error listing backups:"):
             recall_btn.config(state="disabled")
             return
         # Only folder-level rows are shown; enable recall when an item is selected
@@ -9376,7 +11512,17 @@ def create_backups_tab(tab_backups, save_path_var):
     def on_refresh():
         # Always show folder-level listing; disable drilling into backup folders.
         list_backup_folders()
-    
+
+    def on_make_full_backup():
+        path = str(save_path_var.get() if save_path_var is not None else "").strip()
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Backup", "Save file not found. Select a valid save file first.")
+            return
+        try:
+            make_backup_if_enabled(path, force_full=True)
+            list_backup_folders()
+        except Exception as e:
+            messagebox.showerror("Backup", f"Failed to create full backup:\n{e}")
 
     def on_recall_selected():
         """
@@ -9422,10 +11568,27 @@ def create_backups_tab(tab_backups, save_path_var):
         # refresh listing
         list_backup_folders()
 
+    _backups_resize_job = {"id": None}
+    def _schedule_backups_resize_refresh(_event=None):
+        try:
+            if _backups_resize_job.get("id") is not None:
+                tree.after_cancel(_backups_resize_job["id"])
+        except Exception:
+            pass
+        try:
+            _backups_resize_job["id"] = tree.after(
+                70,
+                lambda: (_backups_resize_job.__setitem__("id", None), _refresh_backups_filler_only()),
+            )
+        except Exception:
+            _refresh_backups_filler_only()
+
     # Bindings
     tree.bind("<Double-1>", on_tree_double_click)
     tree.bind("<<TreeviewSelect>>", on_tree_select)
+    tree.bind("<Configure>", _schedule_backups_resize_refresh)
     refresh_btn.config(command=on_refresh)
+    make_full_backup_btn.config(command=on_make_full_backup)
     # back_btn removed — no command to bind
     recall_btn.config(command=on_recall_selected)
 
@@ -9450,12 +11613,7 @@ def create_backups_tab(tab_backups, save_path_var):
 
     try:
         # remove any previous traces to avoid duplication (best-effort)
-        if hasattr(save_path_var, "trace_info"):
-            for t in (save_path_var.trace_info() or []):
-                try:
-                    save_path_var.trace_vdelete(t[0], t[1])
-                except Exception:
-                    pass
+        _remove_var_traces(save_path_var)
     except Exception:
         pass
 
@@ -9497,9 +11655,54 @@ def create_objectives_tab(tab, save_path_var):
 
         try:
             # Quick load from cached/bundled CSV first (no blocking build)
-            v.load_data_thread(allow_build=False, preserve_changes=False, keep_existing_items=False)
-            # Kick off background refresh to fetch newer data
-            v.refresh_data_async()
+            v.load_data_thread(allow_build=False, preserve_changes=False, keep_existing_items=False, show_loading=True)
+            try:
+                if _get_objectives_safe_fallback_mode():
+                    v._set_status_temp("Safe fallback enabled — using GitHub data", 3500)
+            except Exception:
+                pass
+            prefetch_state = _objectives_prefetch_snapshot()
+
+            if prefetch_state.get("inflight"):
+                try:
+                    v._set_status_temp("Background refresh already running...", 2500)
+                except Exception:
+                    pass
+
+                # If user opens Objectives+ while startup refresh is still running,
+                # reload once the background worker finishes so newest cache appears.
+                def _wait_for_prefetch_then_reload(remaining=120):
+                    try:
+                        st = _objectives_prefetch_snapshot()
+                        if st.get("inflight") and remaining > 0:
+                            if hasattr(tab, "after"):
+                                tab.after(1000, lambda: _wait_for_prefetch_then_reload(remaining - 1))
+                            return
+                        if st.get("built"):
+                            v.load_data_thread(allow_build=False, preserve_changes=True, keep_existing_items=True, show_loading=False)
+                            try:
+                                v._set_status_temp("Updated to latest data", 2000)
+                            except Exception:
+                                pass
+                        else:
+                            # Background refresh ended without fresh data: try regular tab refresh path.
+                            v.refresh_data_async()
+                    except Exception:
+                        pass
+
+                try:
+                    if hasattr(tab, "after"):
+                        tab.after(1000, _wait_for_prefetch_then_reload)
+                except Exception:
+                    pass
+            elif prefetch_state.get("completed") and prefetch_state.get("built"):
+                try:
+                    v._set_status_temp("Using latest startup-cached data", 2000)
+                except Exception:
+                    pass
+            else:
+                # Kick off background refresh to fetch newer data
+                v.refresh_data_async()
         except Exception as e:
             try:
                 messagebox.showwarning("Objectives+ loader error", f"Failed to start data loader:\n{e}")
@@ -11388,37 +13591,4850 @@ def create_garages_tab(tab, save_path_var):
         justify="left"
     ).pack(pady=(6, 0), padx=12)
 
-# ---------- FACTOR_RULE_DEFINITIONS (use your exact names/keys) ----------
+# =============================================================================
+# SECTION: Vehicles Tab (STS object editing)
+# Used In: launch_gui -> Vehicles
+# =============================================================================
+_KNOWN_TRUCK_IDS_DEFAULT = sorted({
+    "ank_mk38",
+    "ank_mk38_ht",
+    "azov_4220_antarctic",
+    "azov_43_191_sprinter",
+    "azov_5319",
+    "azov_64131",
+    "azov_670963n",
+    "azov_73210",
+    "boar_45318",
+    "cat_745c",
+    "cat_ct680",
+    "chevrolet_ck1500",
+    "chevrolet_kodiakc70",
+    "dan_96320",
+    "derry_longhorn_3194",
+    "derry_longhorn_4520",
+    "don_71",
+    "femm_37at",
+    "ford_clt9000",
+    "freightliner_114sd",
+    "freightliner_m916a1",
+    "futom_7290ra",
+    "gmc_9500",
+    "hummer_h2",
+    "international_fleetstar_f2070a",
+    "international_loadstar_1700",
+    "international_paystar_5070",
+    "international_scout_800",
+    "international_transtar_4070a",
+    "jangsu_rx600",
+    "jeep_cj7_renegade",
+    "jeep_wrangler",
+    "kenworth_c500",
+    "khan_lo4f",
+    "kolob_74760",
+    "kolob_74941",
+    "mack_defense_m917",
+    "navistar_5000_mv",
+    "pacific_p12w",
+    "pacific_p16",
+    "rezvani_hercules_6x6",
+    "royal_bm17",
+    "step_310e",
+    "tatra_t813",
+    "tatra_t815_7",
+    "tayga_6436",
+    "tuz_166",
+    "tuz_420_tatarin",
+    "voron_ae4380",
+    "voron_d53233",
+    "voron_grad",
+    "ws_4964_white",
+    "ws_6900xd_twin",
+    "yar_87",
+    "zikz_5368",
+    "zikz_612h_mastodont",
+})
+
+_VEHICLE_BRAND_HINTS = {
+    "ank", "azov", "boar", "cat", "chevrolet", "dan", "derry", "don", "femm", "ford",
+    "freightliner", "futom", "gmc", "hummer", "international", "jangsu", "jeep", "kenworth",
+    "khan", "kolob", "krs", "land", "mack", "navistar", "pacific", "rezvani", "royal", "step", "tatra",
+    "tayga", "tuz", "voron", "western", "chevy", "ws", "yar", "zikz",
+    # Extra mod/season brands seen in saves/static id lists.
+    "aac", "aramatsu", "ankatra", "avenhorn", "burlak", "earthroamer", "kirovets",
+    "mercer", "mtb", "neo", "padera", "plad", "sleiter",
+}
+
+_VEHICLE_ID_BLOCKLIST_PARTS = (
+    "engine", "gearbox", "suspension", "wheels", "rim_", "tires", "tire", "transferbox",
+    "diff_lock", "bumper", "snorkel", "roofrack", "gabarite", "headlight", "horn", "paint",
+    "addon", "cabin", "grill", "cargo_", "bone", "sticker", "stuff_", "airfreshener",
+)
+
+# STS scanning guardrail:
+# these are usually component/customization ids, not movable world objects.
+_STS_COMPONENT_TYPE_BLOCKLIST_PARTS = (
+    "_default",
+    "_fender_",
+    "exhaust",
+    "threshold",
+    "treshhold",
+    "spotlight",
+    "lightbar",
+    "wheel_addon",
+    "wheel_default",
+    "diff_lock",
+    "mudguard",
+    "mud_guards",
+    "bumper_",
+    "paint_",
+    "decal_",
+)
+
+
+def _vehicle_humanize_id(raw: Any) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if value.startswith("{") and value.endswith("}"):
+        return value
+
+    base = value.split("/", 1)[0]
+    parts = [p for p in re.split(r"[_\-]+", base) if p]
+    out = []
+    for p in parts:
+        if p.isdigit():
+            out.append(p)
+        elif re.fullmatch(r"\d+[a-z]", p):
+            out.append(p[:-1] + p[-1].upper())
+        elif re.fullmatch(r"[a-z]\d+[a-z]?", p):
+            if p[-1].isalpha():
+                out.append(p[0].upper() + p[1:-1] + p[-1].upper())
+            else:
+                out.append(p[0].upper() + p[1:])
+        elif len(p) <= 3 and p.isalpha():
+            out.append(p.upper())
+        else:
+            out.append(p.capitalize())
+    return " ".join(out) if out else value
+
+
+_VEHICLE_REAL_NAME_MAP_CACHE = None
+_VEHICLE_MAP_DISPLAY_INDEX_CACHE = None
+_VEHICLE_METADATA_CACHE_INFO = None
+_VEHICLE_METADATA_CACHE_LOCK = threading.Lock()
+_VEHICLE_STATIC_ID_SOURCE_CACHE = None
+_VEHICLE_STATIC_ID_SOURCE_LOCK = threading.Lock()
+
+
+def _vehicle_static_ids_file_path() -> str:
+    candidates = []
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base_dir = os.getcwd()
+    candidates.append(os.path.join(base_dir, "experiments", "truck_trailer_ids.txt"))
+    candidates.append(os.path.join(os.getcwd(), "experiments", "truck_trailer_ids.txt"))
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+    return candidates[0]
+
+
+def _vehicle_load_static_id_source(force_reload: bool = False) -> Dict[str, Any]:
+    global _VEHICLE_STATIC_ID_SOURCE_CACHE
+
+    if (not force_reload) and isinstance(_VEHICLE_STATIC_ID_SOURCE_CACHE, dict):
+        return _VEHICLE_STATIC_ID_SOURCE_CACHE
+
+    with _VEHICLE_STATIC_ID_SOURCE_LOCK:
+        if (not force_reload) and isinstance(_VEHICLE_STATIC_ID_SOURCE_CACHE, dict):
+            return _VEHICLE_STATIC_ID_SOURCE_CACHE
+
+        path = _vehicle_static_ids_file_path()
+        out = {
+            "path": path,
+            "name_map": {},
+            "truck_ids": [],
+            "trailer_ids": [],
+            "truck_ids_lower": set(),
+            "trailer_ids_lower": set(),
+            "all_ids_lower": set(),
+            "base_ids_lower": set(),
+            "truck_base_ids_lower": set(),
+            "trailer_base_ids_lower": set(),
+        }
+        if not path or (not os.path.exists(path)):
+            _VEHICLE_STATIC_ID_SOURCE_CACHE = out
+            return _VEHICLE_STATIC_ID_SOURCE_CACHE
+
+        name_map = {}
+        truck_ids = set()
+        trailer_ids = set()
+        all_ids_lower = set()
+        base_ids_lower = set()
+        truck_base_ids_lower = set()
+        trailer_base_ids_lower = set()
+        section = ""
+
+        def _looks_like_map_or_task_id(tl: str) -> bool:
+            if re.match(r"^[a-z]{2}_\d{2}_", tl):
+                return True
+            if any(tok in tl for tok in ("_trial_", "_tsk_", "_task_", "_contract_")):
+                return True
+            return False
+
+        def _is_canonical_truck_static_id(raw: str) -> bool:
+            t0 = str(raw or "").strip()
+            if not t0:
+                return False
+            tl = t0.lower()
+            if t0 != tl:
+                return False
+            if "trailer" in tl:
+                return False
+            if not re.fullmatch(r"[a-z0-9_\-./]+", tl):
+                return False
+            if _looks_like_map_or_task_id(tl):
+                return False
+            if any(tok in tl for tok in ("_old_engine_", "skin_")):
+                return False
+            parts = [p for p in re.split(r"[_\-]+", tl) if p]
+            if not parts:
+                return False
+            return parts[0] in _VEHICLE_BRAND_HINTS
+
+        def _is_canonical_trailer_static_id(raw: str) -> bool:
+            t0 = str(raw or "").strip()
+            if not t0:
+                return False
+            tl = t0.lower()
+            if t0 != tl:
+                return False
+            if not re.fullmatch(r"[a-z0-9_\-./]+", tl):
+                return False
+            if _looks_like_map_or_task_id(tl):
+                return False
+            return ("trailer" in tl) or (tl in {"generator", "cultivator", "harvester", "planter", "driller"})
+
+        try:
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                for raw_line in f:
+                    line = str(raw_line or "").strip()
+                    if not line:
+                        continue
+
+                    upper = line.upper()
+                    if upper.startswith("TRUCK IDS"):
+                        section = "truck"
+                        continue
+                    if upper.startswith("TRAILER IDS"):
+                        section = "trailer"
+                        continue
+                    if "=" not in line:
+                        continue
+
+                    left, right = line.split("=", 1)
+                    type_id = str(left or "").strip()
+                    display_name = str(right or "").strip()
+                    if not type_id:
+                        continue
+                    if not display_name:
+                        display_name = _vehicle_humanize_id(type_id)
+                    if not display_name:
+                        display_name = type_id
+
+                    # Keep multiple key casings for robust lookup in STS/save variants.
+                    for key in {type_id, type_id.lower(), type_id.upper()}:
+                        k = str(key or "").strip()
+                        if not k:
+                            continue
+                        if k not in name_map:
+                            name_map[k] = display_name
+
+                    tl = type_id.lower()
+                    all_ids_lower.add(tl)
+                    if section == "truck":
+                        truck_ids.add(type_id)
+                        if _is_canonical_truck_static_id(type_id):
+                            base_ids_lower.add(tl)
+                            truck_base_ids_lower.add(tl)
+                    elif section == "trailer":
+                        trailer_ids.add(type_id)
+                        if _is_canonical_trailer_static_id(type_id):
+                            base_ids_lower.add(tl)
+                            trailer_base_ids_lower.add(tl)
+        except Exception:
+            pass
+
+        out["name_map"] = name_map
+        out["truck_ids"] = sorted(truck_ids, key=lambda x: str(x).lower())
+        out["trailer_ids"] = sorted(trailer_ids, key=lambda x: str(x).lower())
+        out["truck_ids_lower"] = {str(x).strip().lower() for x in truck_ids if str(x).strip()}
+        out["trailer_ids_lower"] = {str(x).strip().lower() for x in trailer_ids if str(x).strip()}
+        out["all_ids_lower"] = all_ids_lower
+        out["base_ids_lower"] = base_ids_lower
+        out["truck_base_ids_lower"] = truck_base_ids_lower
+        out["trailer_base_ids_lower"] = trailer_base_ids_lower
+
+        _VEHICLE_STATIC_ID_SOURCE_CACHE = out
+        return _VEHICLE_STATIC_ID_SOURCE_CACHE
+
+
+def _vehicle_static_name_map(force_reload: bool = False) -> Dict[str, str]:
+    data = _vehicle_load_static_id_source(force_reload=force_reload)
+    name_map = data.get("name_map", {}) if isinstance(data, dict) else {}
+    return dict(name_map) if isinstance(name_map, dict) else {}
+
+
+def _vehicle_static_truck_ids(force_reload: bool = False) -> List[str]:
+    data = _vehicle_load_static_id_source(force_reload=force_reload)
+    vals = data.get("truck_base_ids_lower", set()) if isinstance(data, dict) else set()
+    if not isinstance(vals, (set, list, tuple)):
+        return []
+    return sorted({str(v).strip().lower() for v in vals if str(v).strip()})
+
+
+def _vehicle_is_static_truck_id(raw_type_id: Any) -> bool:
+    t = str(raw_type_id or "").strip().lower()
+    if not t:
+        return False
+    s = set(_vehicle_static_truck_ids(force_reload=False))
+    return t in s
+
+
+def _vehicle_metadata_cache_path(kind: str) -> str:
+    try:
+        cfg_dir = os.path.dirname(CONFIG_FILE)
+    except Exception:
+        cfg_dir = ""
+    if not cfg_dir:
+        try:
+            cfg_dir = os.path.expanduser("~")
+        except Exception:
+            cfg_dir = ""
+    if not cfg_dir:
+        cfg_dir = os.getcwd()
+
+    k = str(kind or "").strip().lower()
+    if k == "maps":
+        name = ".snowrunner_editor_vehicle_map_index.json"
+    else:
+        name = ".snowrunner_editor_vehicle_name_map.json"
+    return os.path.join(cfg_dir, name)
+
+
+def _vehicle_read_json_cache(path: str) -> Dict[str, Any]:
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def _vehicle_write_json_cache(path: str, payload: Dict[str, Any]) -> None:
+    if not path or not isinstance(payload, dict):
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except Exception:
+        pass
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _vehicle_collect_maprunner_js_texts(allow_online: bool = False) -> List[str]:
+    """
+    Collect JS text blobs using the same MapRunner pipeline as Objectives+:
+      - in-memory canonical roles
+      - cached canonical JS files
+      - optional online refresh with random chunk role detection
+    """
+    try:
+        _mr_choose_best_js_roles()
+    except Exception:
+        pass
+
+    try:
+        _mr_load_cached_canonical_js_to_mem()
+    except Exception:
+        pass
+
+    if allow_online:
+        try:
+            _mr_download_js_step()
+        except Exception:
+            pass
+
+    try:
+        _mr_choose_best_js_roles()
+    except Exception:
+        pass
+
+    texts: List[str] = []
+    seen_texts = set()
+
+    def _add_text(raw: Any) -> None:
+        try:
+            txt = _mr_decode_bytes_to_text(raw) if raw is not None else None
+        except Exception:
+            txt = None
+        if not txt or not isinstance(txt, str):
+            return
+        if txt in seen_texts:
+            return
+        seen_texts.add(txt)
+        texts.append(txt)
+
+    try:
+        _add_text(_mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["data"]))
+    except Exception:
+        pass
+    try:
+        _add_text(_mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["desc"]))
+    except Exception:
+        pass
+
+    try:
+        for name, bs in list(_MR_IN_MEM_FILES.items()):
+            if not str(name or "").lower().endswith(".js"):
+                continue
+            _add_text(bs)
+    except Exception:
+        pass
+
+    return texts
+
+
+def _vehicle_extract_metadata_from_js_texts(
+    texts: List[str], localization_seed: Optional[Dict[str, str]] = None
+) -> (Dict[str, str], Dict[str, Dict[str, str]]):
+    localization = {}
+    if isinstance(localization_seed, dict) and localization_seed:
+        for k, v in localization_seed.items():
+            key = str(k or "").strip()
+            val = str(v or "").strip()
+            if key and val:
+                localization[key] = val
+    id_to_token = {}
+    level_tokens = {}
+    level_slugs = {}
+
+    pat_name_key = re.compile(
+        r'"name"\s*:\s*"(UI_(?:VEHICLE|TRAILER)_[A-Z0-9_]+)"\s*,\s*"key"\s*:\s*"([a-z0-9_./-]+)"',
+        flags=re.IGNORECASE,
+    )
+    pat_key_name = re.compile(
+        r'"key"\s*:\s*"([a-z0-9_./-]+)"\s*,\s*"name"\s*:\s*"(UI_(?:VEHICLE|TRAILER)_[A-Z0-9_]+)"',
+        flags=re.IGNORECASE,
+    )
+    pat_level_levelname = re.compile(
+        r'"level"\s*:\s*"level_([a-z0-9_]+)"\s*,\s*"levelName"\s*:\s*"([^"]+)"',
+        flags=re.IGNORECASE,
+    )
+    pat_levelname_level = re.compile(
+        r'"levelName"\s*:\s*"([^"]+)"\s*,\s*"level"\s*:\s*"level_([a-z0-9_]+)"',
+        flags=re.IGNORECASE,
+    )
+    pat_level_map_slug = re.compile(
+        r'"level"\s*:\s*"level_([a-z0-9_]+)"[\s\S]{0,220}?"map"\s*:\s*"([^"]+)"',
+        flags=re.IGNORECASE,
+    )
+
+    for text in texts or []:
+        if not text:
+            continue
+
+        # If localization seed is missing/incomplete, keep filling from scanned JS.
+        try:
+            parsed_loc = _mr_parse_localization_from_desc_text(text) or {}
+        except Exception:
+            parsed_loc = {}
+        if parsed_loc:
+            for k, v in parsed_loc.items():
+                if k not in localization:
+                    localization[k] = v
+
+        try:
+            for m in pat_name_key.finditer(text):
+                token = str(m.group(1) or "").strip()
+                type_id = str(m.group(2) or "").strip()
+                if not token or not type_id:
+                    continue
+                if not _sts_is_vehicle_or_trailer_type(type_id, ""):
+                    continue
+                id_to_token.setdefault(type_id, token)
+            for m in pat_key_name.finditer(text):
+                type_id = str(m.group(1) or "").strip()
+                token = str(m.group(2) or "").strip()
+                if not token or not type_id:
+                    continue
+                if not _sts_is_vehicle_or_trailer_type(type_id, ""):
+                    continue
+                id_to_token.setdefault(type_id, token)
+        except Exception:
+            pass
+
+        try:
+            for m in pat_level_levelname.finditer(text):
+                level = _map_normalize_id(m.group(1))
+                token = str(m.group(2) or "").strip()
+                if level and token:
+                    level_tokens.setdefault(level, set()).add(token)
+            for m in pat_levelname_level.finditer(text):
+                token = str(m.group(1) or "").strip()
+                level = _map_normalize_id(m.group(2))
+                if level and token:
+                    level_tokens.setdefault(level, set()).add(token)
+            for m in pat_level_map_slug.finditer(text):
+                level = _map_normalize_id(m.group(1))
+                slug = str(m.group(2) or "").strip()
+                if level and slug and level not in level_slugs:
+                    level_slugs[level] = slug
+        except Exception:
+            pass
+
+    name_map = {}
+    for type_id, token in id_to_token.items():
+        name = _experiments_translate_token(token, localization) if isinstance(localization, dict) and localization else token
+        name = _experiments_clean_text(name) if name else ""
+        if (not name) or _experiments_is_likely_token(name):
+            name = _vehicle_humanize_id(type_id)
+        name_map[type_id] = name
+
+    map_index = {}
+    all_levels = set(level_tokens.keys()) | set(level_slugs.keys())
+    for map_id in sorted(all_levels):
+        region_code = _map_region_code_from_map_id(map_id)
+        region_name = _map_region_name_from_code(region_code)
+        map_name = ""
+
+        tokens = sorted(
+            list(level_tokens.get(map_id, set())),
+            key=lambda t: (
+                0 if str(t).upper().endswith("_NAME") else 1,
+                0 if not str(t).upper().startswith("LEVEL_") else 1,
+                len(str(t)),
+            ),
+        )
+        for token in tokens:
+            try:
+                translated = _experiments_translate_token(token, localization)
+            except Exception:
+                translated = token
+            cleaned = _experiments_clean_text(translated) if translated else ""
+            if cleaned and not _experiments_is_likely_token(cleaned):
+                map_name = cleaned
+                break
+
+        if not map_name:
+            slug = level_slugs.get(map_id, "")
+            map_name = _map_humanize_slug(slug)
+
+        if not map_name:
+            map_name = map_id
+
+        map_index[map_id] = {
+            "map_id": map_id,
+            "region_code": region_code,
+            "region_name": region_name,
+            "map_name": map_name,
+        }
+
+    token_map_pat = re.compile(
+        r"^(?:LEVEL_)?((?:US|RU)_\d{2}_\d{2}(?:_(?:NEW|CROP))?|TRIAL_\d{2}_\d{2})_NAME$",
+        flags=re.IGNORECASE,
+    )
+    for token, value in list(localization.items()):
+        m = token_map_pat.match(str(token or "").strip())
+        if not m:
+            continue
+        map_id = _map_normalize_id(m.group(1))
+        cleaned = _experiments_clean_text(value)
+        if not cleaned or _experiments_is_likely_token(cleaned):
+            continue
+
+        entry = map_index.get(map_id)
+        if not isinstance(entry, dict):
+            region_code = _map_region_code_from_map_id(map_id)
+            entry = {
+                "map_id": map_id,
+                "region_code": region_code,
+                "region_name": _map_region_name_from_code(region_code),
+                "map_name": cleaned,
+            }
+            map_index[map_id] = entry
+            continue
+
+        current_name = str(entry.get("map_name", "") or "").strip()
+        if not current_name or current_name == map_id or _experiments_is_likely_token(current_name):
+            entry["map_name"] = cleaned
+
+    return name_map, map_index
+
+
+def _vehicle_normalize_name_map(payload: Any) -> Dict[str, str]:
+    out = {}
+    if not isinstance(payload, dict):
+        return out
+    for raw_k, raw_v in payload.items():
+        key = str(raw_k or "").strip()
+        val = str(raw_v or "").strip()
+        if not key:
+            continue
+        if not val or _experiments_is_likely_token(val):
+            val = _vehicle_humanize_id(key)
+        out[key] = val
+    return out
+
+
+def _vehicle_normalize_map_index(payload: Any) -> Dict[str, Dict[str, str]]:
+    out = {}
+    if not isinstance(payload, dict):
+        return out
+    for raw_mid, raw_entry in payload.items():
+        map_id = _map_normalize_id(raw_mid)
+        if not map_id:
+            continue
+        if isinstance(raw_entry, dict):
+            region_code = str(raw_entry.get("region_code", "") or "").strip().upper()
+            map_name = str(raw_entry.get("map_name", "") or "").strip()
+            region_name = str(raw_entry.get("region_name", "") or "").strip()
+        else:
+            region_code = ""
+            map_name = ""
+            region_name = ""
+        if not region_code:
+            region_code = _map_region_code_from_map_id(map_id)
+        if not region_name:
+            region_name = _map_region_name_from_code(region_code)
+        if not map_name:
+            map_name = map_id
+        out[map_id] = {
+            "map_id": map_id,
+            "region_code": region_code,
+            "region_name": region_name,
+            "map_name": map_name,
+        }
+    return out
+
+
+def _vehicle_name_quality(name: str, type_id: str = "") -> int:
+    text = str(name or "").strip()
+    if not text:
+        return 0
+    low = text.lower()
+    words = [w for w in re.split(r"\s+", text) if w]
+
+    # Broken/unresolved strings should never win merges.
+    if _experiments_is_likely_token(text):
+        return 1
+    if any(mark in text for mark in ("�", "Ð", "Ñ", "Ã", "Â")):
+        return 1
+    if low.startswith(("g ", "w ")):
+        return 1
+    if any(tok in low for tok in (" default", "skin ", " old engine", "deleted")):
+        return 1
+    if any(ch in text for ch in (".", "!", "?", ";", ":")):
+        return 1
+    if len(text) > 60 or len(words) > 8:
+        return 1
+    if low.startswith(("a ", "an ", "the ")) and len(words) >= 5:
+        return 1
+
+    # Humanized id is acceptable fallback, but lower confidence than true names.
+    if type_id and text == _vehicle_humanize_id(type_id):
+        return 2
+
+    score = 3
+    if re.search(r"[A-Z]", text) and (not text.islower()):
+        score += 1
+    if len(words) <= 4:
+        score += 1
+    return min(5, score)
+
+
+def _vehicle_map_name_quality(name: str, map_id: str = "") -> int:
+    text = str(name or "").strip()
+    if not text:
+        return 0
+    if _experiments_is_likely_token(text):
+        return 1
+    if map_id and _map_normalize_id(text) == _map_normalize_id(map_id):
+        return 2
+    return 3
+
+
+def _vehicle_merge_name_maps(base: Dict[str, str], incoming: Dict[str, str]) -> Dict[str, str]:
+    out = dict(base or {})
+    for k, v in (incoming or {}).items():
+        key = str(k or "").strip()
+        if not key:
+            continue
+        new_val = str(v or "").strip()
+        old_val = str(out.get(key, "") or "").strip()
+        if _vehicle_name_quality(new_val, key) >= _vehicle_name_quality(old_val, key):
+            out[key] = new_val
+    return out
+
+
+def _vehicle_merge_map_index(
+    base: Dict[str, Dict[str, str]],
+    incoming: Dict[str, Dict[str, str]],
+) -> Dict[str, Dict[str, str]]:
+    out = dict(base or {})
+    for raw_mid, raw_entry in (incoming or {}).items():
+        map_id = _map_normalize_id(raw_mid)
+        if not map_id:
+            continue
+        old = out.get(map_id, {}) if isinstance(out.get(map_id), dict) else {}
+        new = raw_entry if isinstance(raw_entry, dict) else {}
+
+        old_name = str(old.get("map_name", "") or "").strip()
+        new_name = str(new.get("map_name", "") or "").strip()
+
+        chosen_name = old_name
+        if _vehicle_map_name_quality(new_name, map_id) >= _vehicle_map_name_quality(old_name, map_id):
+            chosen_name = new_name or old_name
+
+        region_code = str(new.get("region_code", "") or old.get("region_code", "") or "").strip().upper()
+        if not region_code:
+            region_code = _map_region_code_from_map_id(map_id)
+        region_name = str(new.get("region_name", "") or old.get("region_name", "") or "").strip()
+        if not region_name:
+            region_name = _map_region_name_from_code(region_code)
+        if not chosen_name:
+            chosen_name = map_id
+
+        out[map_id] = {
+            "map_id": map_id,
+            "region_code": region_code,
+            "region_name": region_name,
+            "map_name": chosen_name,
+        }
+    return out
+
+
+def _vehicle_load_metadata(force_reload: bool = False, allow_online: bool = False):
+    global _VEHICLE_REAL_NAME_MAP_CACHE, _VEHICLE_MAP_DISPLAY_INDEX_CACHE, _VEHICLE_METADATA_CACHE_INFO
+
+    # Quick in-memory hit (lock held only for this tiny section).
+    with _VEHICLE_METADATA_CACHE_LOCK:
+        if (
+            (not force_reload)
+            and isinstance(_VEHICLE_REAL_NAME_MAP_CACHE, dict)
+            and isinstance(_VEHICLE_MAP_DISPLAY_INDEX_CACHE, dict)
+        ):
+            info = _VEHICLE_METADATA_CACHE_INFO if isinstance(_VEHICLE_METADATA_CACHE_INFO, dict) else {}
+            return _VEHICLE_REAL_NAME_MAP_CACHE, _VEHICLE_MAP_DISPLAY_INDEX_CACHE, info
+
+    # Read local backup without holding the lock.
+    name_map = _vehicle_normalize_name_map(_vehicle_read_json_cache(_vehicle_metadata_cache_path("names")))
+    map_index = _vehicle_normalize_map_index(_vehicle_read_json_cache(_vehicle_metadata_cache_path("maps")))
+    source_tags = []
+    if name_map or map_index:
+        source_tags.append("backup")
+
+    # Always merge local static ids/names from experiments/truck_trailer_ids.txt.
+    try:
+        static_map = _vehicle_normalize_name_map(_vehicle_static_name_map(force_reload=force_reload))
+    except Exception:
+        static_map = {}
+    if static_map:
+        name_map = _vehicle_merge_name_maps(name_map, static_map)
+        source_tags.append("local_ids")
+
+    # Fast path for normal UI: use local backup immediately.
+    if (not force_reload) and (not allow_online) and (name_map or map_index):
+        with _VEHICLE_METADATA_CACHE_LOCK:
+            current_names = _VEHICLE_REAL_NAME_MAP_CACHE if isinstance(_VEHICLE_REAL_NAME_MAP_CACHE, dict) else {}
+            current_maps = _VEHICLE_MAP_DISPLAY_INDEX_CACHE if isinstance(_VEHICLE_MAP_DISPLAY_INDEX_CACHE, dict) else {}
+            if current_names:
+                name_map = _vehicle_merge_name_maps(name_map, current_names)
+            if current_maps:
+                map_index = _vehicle_merge_map_index(map_index, current_maps)
+
+            _VEHICLE_REAL_NAME_MAP_CACHE = name_map
+            _VEHICLE_MAP_DISPLAY_INDEX_CACHE = map_index
+            _VEHICLE_METADATA_CACHE_INFO = {
+                "source": ",".join(source_tags) if source_tags else "none",
+                "name_count": len(name_map),
+                "map_count": len(map_index),
+            }
+            return _VEHICLE_REAL_NAME_MAP_CACHE, _VEHICLE_MAP_DISPLAY_INDEX_CACHE, _VEHICLE_METADATA_CACHE_INFO
+
+    # Potentially slow JS discovery/download/parsing; keep lock released.
+    texts = _vehicle_collect_maprunner_js_texts(allow_online=allow_online)
+    if texts:
+        loc_seed = {}
+        try:
+            desc_choice = _mr_choose_first_available([_MR_CANONICAL_NAMES["desc"], "desc.js"])
+        except Exception:
+            desc_choice = None
+        try:
+            loc_seed = _mr_collect_localization(desc_choice) if desc_choice else {}
+        except Exception:
+            loc_seed = {}
+
+        parsed_names, parsed_maps = _vehicle_extract_metadata_from_js_texts(texts, localization_seed=loc_seed)
+        parsed_names = _vehicle_normalize_name_map(parsed_names)
+        parsed_maps = _vehicle_normalize_map_index(parsed_maps)
+        if parsed_names:
+            name_map = _vehicle_merge_name_maps(name_map, parsed_names)
+        if parsed_maps:
+            map_index = _vehicle_merge_map_index(map_index, parsed_maps)
+        if parsed_names or parsed_maps:
+            source_tags.append("online" if allow_online else "objectives_cache")
+            _vehicle_write_json_cache(_vehicle_metadata_cache_path("names"), name_map)
+            _vehicle_write_json_cache(_vehicle_metadata_cache_path("maps"), map_index)
+
+    # Final cache swap under lock.
+    with _VEHICLE_METADATA_CACHE_LOCK:
+        current_names = _VEHICLE_REAL_NAME_MAP_CACHE if isinstance(_VEHICLE_REAL_NAME_MAP_CACHE, dict) else {}
+        current_maps = _VEHICLE_MAP_DISPLAY_INDEX_CACHE if isinstance(_VEHICLE_MAP_DISPLAY_INDEX_CACHE, dict) else {}
+        if current_names:
+            name_map = _vehicle_merge_name_maps(name_map, current_names)
+        if current_maps:
+            map_index = _vehicle_merge_map_index(map_index, current_maps)
+
+        _VEHICLE_REAL_NAME_MAP_CACHE = name_map
+        _VEHICLE_MAP_DISPLAY_INDEX_CACHE = map_index
+        _VEHICLE_METADATA_CACHE_INFO = {
+            "source": ",".join(source_tags) if source_tags else "none",
+            "name_count": len(name_map),
+            "map_count": len(map_index),
+        }
+        return _VEHICLE_REAL_NAME_MAP_CACHE, _VEHICLE_MAP_DISPLAY_INDEX_CACHE, _VEHICLE_METADATA_CACHE_INFO
+
+
+def _vehicle_load_real_name_map(force_reload: bool = False) -> Dict[str, str]:
+    name_map, _, _ = _vehicle_load_metadata(force_reload=force_reload, allow_online=False)
+    return name_map if isinstance(name_map, dict) else {}
+
+
+def _vehicle_display_name(type_id: str) -> str:
+    t = str(type_id or "").strip()
+    if not t:
+        return ""
+    name_map = _vehicle_load_real_name_map()
+    name = ""
+    if isinstance(name_map, dict):
+        name = str(name_map.get(t, "") or "").strip()
+        if not name:
+            name = str(name_map.get(t.lower(), "") or "").strip()
+        if not name:
+            name = str(name_map.get(t.upper(), "") or "").strip()
+    if name:
+        # Reject low-quality labels from noisy metadata (description text, defaults, etc.).
+        if _vehicle_name_quality(name, t) >= 3:
+            return name
+    return _vehicle_humanize_id(t)
+
+
+def _vehicle_display_name_for_entry(type_id: str, object_id: str = "") -> str:
+    t = str(type_id or "").strip()
+    o = str(object_id or "").strip()
+    if not t and not o:
+        return ""
+
+    def _clean_id(raw: str) -> str:
+        x = str(raw or "").strip()
+        if not x:
+            return ""
+        x = re.sub(r"^(?:g_special_|g_|w_)", "", x, flags=re.IGNORECASE)
+        x = re.sub(r"(?:_default|_skin_?\d*|_?\d+)$", "", x, flags=re.IGNORECASE)
+        return x
+
+    ids = []
+    for raw in (t, o):
+        rid = str(raw or "").strip()
+        if not rid:
+            continue
+        ids.append(rid)
+        ids.append(_clean_id(rid))
+        m = re.search(r"(?:^|_)(?:truck|scout)_old_engine_([a-z0-9_]+?)(?:_\d+)?$", rid.lower())
+        if m:
+            model = str(m.group(1) or "").strip()
+            if model:
+                ids.append(model)
+                ids.append(re.sub(r"([a-z])(\d)", r"\1_\2", model))
+                ids.append(re.sub(r"(\d)([a-z])", r"\1_\2", model))
+
+    seen = set()
+    candidates = []
+    for raw in ids:
+        rid = str(raw or "").strip()
+        if not rid:
+            continue
+        lk = rid.lower()
+        if lk in seen:
+            continue
+        seen.add(lk)
+        candidates.append(rid)
+
+    def _score(name: str, cid: str) -> int:
+        s = _vehicle_name_quality(name, cid)
+        low = str(name or "").strip().lower()
+        if not low:
+            return -100
+        if "deleted" in low:
+            s -= 5
+        if any(tok in low for tok in (" default", "skin ", " old engine", " g truck", " w truck", " g scout", " w scout")):
+            s -= 3
+        if low.startswith(("g ", "w ")):
+            s -= 2
+        return s
+
+    best_name = ""
+    best_score = -10000
+    for cid in candidates:
+        nm = _vehicle_display_name(cid)
+        sc = _score(nm, cid)
+        if sc > best_score:
+            best_score = sc
+            best_name = nm
+
+    if best_name:
+        return best_name
+    return _vehicle_display_name(t or o)
+
+
+def _map_normalize_id(raw: Any) -> str:
+    value = str(raw or "").strip().upper()
+    if value.startswith("LEVEL_"):
+        value = value[6:]
+    return value
+
+
+def _map_region_code_from_map_id(map_id: str) -> str:
+    mid = _map_normalize_id(map_id)
+    parts = [p for p in mid.split("_") if p]
+    if len(parts) >= 2 and parts[0] in {"US", "RU"} and parts[1].isdigit():
+        return f"{parts[0]}_{parts[1]}"
+    if parts and parts[0] == "TRIAL":
+        return "TRIALS"
+    return ""
+
+
+def _map_region_name_from_code(region_code: str) -> str:
+    code = str(region_code or "").strip().upper()
+    if not code:
+        return ""
+    if code in REGION_NAME_MAP:
+        return REGION_NAME_MAP.get(code, code)
+    if code == "TRIALS":
+        return "Trials"
+    return code
+
+
+def _map_humanize_slug(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    token = raw.split("/")[-1]
+    token = re.sub(r"[-_]+", " ", token).strip()
+    if not token:
+        return ""
+    return " ".join(w[:1].upper() + w[1:] if w else "" for w in token.split())
+
+
+def _vehicle_load_map_display_index(force_reload: bool = False) -> Dict[str, Dict[str, str]]:
+    _, map_index, _ = _vehicle_load_metadata(force_reload=force_reload, allow_online=False)
+    return map_index if isinstance(map_index, dict) else {}
+
+
+def _map_display_info(map_id: str) -> Dict[str, str]:
+    mid = _map_normalize_id(map_id)
+    index = _vehicle_load_map_display_index()
+    if isinstance(index, dict):
+        found = index.get(mid)
+        if isinstance(found, dict):
+            return {
+                "map_id": _map_normalize_id(found.get("map_id", mid)),
+                "region_code": str(found.get("region_code", "") or "").upper(),
+                "region_name": str(found.get("region_name", "") or "").strip(),
+                "map_name": str(found.get("map_name", "") or "").strip() or mid,
+            }
+
+    region_code = _map_region_code_from_map_id(mid)
+    region_name = _map_region_name_from_code(region_code)
+    return {
+        "map_id": mid,
+        "region_code": region_code,
+        "region_name": region_name,
+        "map_name": mid,
+    }
+
+
+def _detect_complete_save_slot_from_path(path: str) -> int:
+    base = os.path.splitext(os.path.basename(str(path or "")))[0].lower()
+    if base == "completesave":
+        return 1
+    if base == "completesave1":
+        return 2
+    if base == "completesave2":
+        return 3
+    if base == "completesave3":
+        return 4
+    return 1
+
+
+def _slot_to_sts_prefix(slot: int) -> str:
+    try:
+        s = int(slot)
+    except Exception:
+        s = 1
+    return "" if s <= 1 else f"{s - 1}_"
+
+
+def _is_probable_truck_type_id(raw_type_id: Any) -> bool:
+    t = str(raw_type_id or "").strip().lower()
+    if not t:
+        return False
+    if "trailer" in t:
+        return False
+    if not re.fullmatch(r"[a-z0-9_\-./]+", t):
+        return False
+    base = t.split("/", 1)[0]
+    for blocked in _VEHICLE_ID_BLOCKLIST_PARTS:
+        if blocked in base:
+            return False
+    for blocked in _STS_COMPONENT_TYPE_BLOCKLIST_PARTS:
+        if blocked in base:
+            return False
+    parts = [p for p in re.split(r"[_\-]+", base) if p]
+    if t in _KNOWN_TRUCK_IDS_DEFAULT:
+        return True
+    return bool(parts and parts[0] in _VEHICLE_BRAND_HINTS)
+
+
+def _sts_is_vehicle_or_trailer_type(type_id: str, object_id: str = "") -> bool:
+    t = str(type_id or "").strip().lower()
+    if not t:
+        return False
+
+    base = t.split("/", 1)[0]
+    if not re.fullmatch(r"[a-z0-9_\-./]+", t):
+        return False
+    if len(base) < 3:
+        return False
+    if base == "skin" or base.startswith("skin_"):
+        return False
+
+    static_data = _vehicle_load_static_id_source(force_reload=False)
+    static_known = static_data.get("base_ids_lower", set()) if isinstance(static_data, dict) else set()
+    if isinstance(static_known, set) and base in static_known:
+        return True
+
+    # Accept explicit old-engine world prefab ids early.
+    # Example: us_truck_old_engine_avenhorn_a15_0
+    if re.search(r"^(?:[a-z]{2,4}_)?(?:truck|scout)_old_engine_[a-z0-9_]+$", base):
+        return True
+
+    for blocked in _STS_COMPONENT_TYPE_BLOCKLIST_PARTS:
+        if blocked in base:
+            return False
+
+    if "trailer" in t:
+        return True
+
+    for blocked in _VEHICLE_ID_BLOCKLIST_PARTS:
+        if blocked in base:
+            return False
+
+    oid_lower = str(object_id or "").strip().lower()
+    if oid_lower.startswith("bone") or oid_lower.endswith("_cdt"):
+        return False
+    if base.startswith(("g_", "w_")) and base.endswith("_default"):
+        return False
+    if base.startswith("g_special_") and (oid_lower.endswith("_default") or oid_lower.startswith(("w_", "g_"))):
+        return False
+    if isinstance(static_known, set) and oid_lower in static_known:
+        return True
+
+    parts = [p for p in re.split(r"[_\-]+", base) if p]
+    if parts and parts[0] in _VEHICLE_BRAND_HINTS:
+        return True
+    if t in _KNOWN_TRUCK_IDS_DEFAULT:
+        return True
+
+    oid = str(object_id or "").upper()
+    # GUID-style object IDs in STS are commonly used for movable trucks/trailers.
+    # If the type passed blocklists above, accept unknown models too.
+    if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", str(object_id or "").strip()):
+        return True
+    if "TRUCK" in oid or "SCOUT" in oid or "TRAILER" in oid:
+        return True
+
+    return False
+
+
+def _sts_is_denorm_float(value: float) -> bool:
+    try:
+        v = abs(float(value))
+    except Exception:
+        return True
+    return (v > 0.0) and (v < 1e-20)
+
+
+def _sts_has_valid_transform_at(data: bytes, coord_off: int) -> bool:
+    if not isinstance(coord_off, int):
+        return False
+    if coord_off < 32 or (coord_off + 12) > len(data):
+        return False
+    try:
+        vals = struct.unpack_from("<8f", data, coord_off - 32)
+    except Exception:
+        return False
+    if not all(math.isfinite(v) for v in vals):
+        return False
+    n1 = math.sqrt(sum(v * v for v in vals[:4]))
+    n2 = math.sqrt(sum(v * v for v in vals[4:8]))
+    return (0.75 <= n1 <= 1.25) and (0.75 <= n2 <= 1.25)
+
+
+def _sts_parse_guid_vehicle_blocks(data: bytes, source_file: str, existing_objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Parse "type + empty object id + GUID" STS blocks used by player vehicles/trailers.
+    These blocks hold many transforms; we cluster world-space transforms and keep a
+    list of coordinate offsets so move/unstuck can shift the whole block safely.
+    """
+    payload = bytes(data or b"")
+    size = len(payload)
+    if size < 96:
+        return []
+
+    map_info = _map_display_info(_map_id_from_sts_filename(source_file))
+    hits = []
+
+    # Find block starts.
+    for i in range(size - (2 + 3 + 2 + 1 + 2 + 3)):
+        try:
+            type_len = struct.unpack_from("<H", payload, i)[0]
+        except Exception:
+            continue
+        if type_len < 3 or type_len > 128:
+            continue
+
+        type_beg = i + 2
+        type_end = type_beg + type_len
+        if type_end + 2 + 1 >= size:
+            continue
+        if payload[type_end - 1] != 0:
+            continue
+
+        type_raw = payload[type_beg:type_end - 1]
+        if not type_raw or any((b < 32 or b > 126) for b in type_raw):
+            continue
+        type_id = type_raw.decode("ascii", errors="ignore").strip()
+        if not type_id:
+            continue
+
+        obj_len = struct.unpack_from("<H", payload, type_end)[0]
+        if obj_len != 1:
+            continue
+        obj_beg = type_end + 2
+        obj_end = obj_beg + obj_len
+        if obj_end + 2 >= size or payload[obj_end - 1] != 0:
+            continue
+
+        # GUID is usually the next length-prefixed string.
+        guid_len = struct.unpack_from("<H", payload, obj_end)[0]
+        if guid_len < 3 or guid_len > 80:
+            continue
+        guid_beg = obj_end + 2
+        guid_end = guid_beg + guid_len
+        if guid_end > size or payload[guid_end - 1] != 0:
+            continue
+        guid_raw = payload[guid_beg:guid_end - 1]
+        if not guid_raw or any((b < 32 or b > 126) for b in guid_raw):
+            continue
+        guid = guid_raw.decode("ascii", errors="ignore").strip()
+        if not re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", guid):
+            continue
+        if guid.upper() == "{00000000-0000-0000-0000-000000000000}":
+            continue
+
+        if not _sts_is_vehicle_or_trailer_type(type_id, guid):
+            continue
+
+        hits.append(
+            {
+                "start_off": int(i),
+                "type_id": type_id,
+                "guid": guid,
+                "type_len_off": int(i),
+                "type_len_size": 2,
+                "type_beg": int(type_beg),
+                "type_end": int(type_end),
+                "obj_len_off": int(type_end),
+                "obj_len_size": 2,
+                "obj_beg": int(obj_beg),
+                "obj_end": int(obj_end),
+                "guid_len_off": int(obj_end),
+                "guid_len_size": 2,
+                "guid_beg": int(guid_beg),
+                "guid_end": int(guid_end),
+                "after_guid_off": int(guid_end),
+            }
+        )
+
+    if not hits:
+        return []
+
+    hits.sort(key=lambda h: int(h.get("start_off", 0)))
+    out = []
+    existing = list(existing_objects or [])
+
+    for idx, hit in enumerate(hits):
+        block_start = int(hit.get("after_guid_off", 0))
+        if idx + 1 < len(hits):
+            block_end = int(hits[idx + 1].get("start_off", block_start))
+        else:
+            block_end = min(size, block_start + 24000)
+        if block_end <= block_start + 64:
+            continue
+
+        candidates = []
+        # Byte-wise scan because these transforms are not always 4-byte aligned.
+        for coord_off in range(block_start + 32, min(block_end, size - 12)):
+            try:
+                x, y, z = struct.unpack_from("<fff", payload, coord_off)
+            except Exception:
+                continue
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                continue
+            if max(abs(x), abs(y), abs(z)) > 5000:
+                continue
+            if _sts_is_denorm_float(x) or _sts_is_denorm_float(y) or _sts_is_denorm_float(z):
+                continue
+            # Ignore tiny local/unit vectors; keep only world-like coordinates.
+            if max(abs(x), abs(y), abs(z)) < 20.0:
+                continue
+            if not _sts_has_valid_transform_at(payload, coord_off):
+                continue
+            # Translation row sanity:
+            # [x, y, z, 1.0] and previous row W ~= 0.0
+            # keeps us on real transform anchors, avoids false positives in packed data.
+            if coord_off < 4 or (coord_off + 16) > size:
+                continue
+            try:
+                prev_w = float(struct.unpack_from("<f", payload, coord_off - 4)[0])
+                row_w = float(struct.unpack_from("<f", payload, coord_off + 12)[0])
+            except Exception:
+                continue
+            if not (math.isfinite(prev_w) and math.isfinite(row_w)):
+                continue
+            if abs(prev_w) > 0.25:
+                continue
+            if abs(row_w - 1.0) > 0.25:
+                continue
+            candidates.append((int(coord_off), float(x), float(y), float(z)))
+
+        if not candidates:
+            continue
+
+        # Group by rounded position and pick the densest world-space cluster.
+        # Tie-break by |x|+|z| so local tiny transforms near origin lose.
+        buckets: Dict[Any, List[Any]] = {}
+        for c in candidates:
+            key = (round(c[1], 1), round(c[2], 1), round(c[3], 1))
+            buckets.setdefault(key, []).append(c)
+        best_key = max(
+            buckets.keys(),
+            key=lambda k: (len(buckets.get(k, [])), abs(float(k[0])) + abs(float(k[2]))),
+        )
+        best_bucket = list(buckets.get(best_key, []))
+        if not best_bucket:
+            continue
+
+        # Keep edits bounded to the selected cluster only.
+        anchor = min(
+            best_bucket,
+            key=lambda c: abs(int(c[0]) - int(hit.get("start_off", 0))),
+        )
+        ax, ay, az = float(anchor[1]), float(anchor[2]), float(anchor[3])
+        coord_group = list(best_bucket)
+        anchor_off = int(anchor[0])
+        sorted_unique = sorted({int(c[0]) for c in coord_group})
+        coord_offs = [anchor_off] + [off for off in sorted_unique if off != anchor_off]
+        if not coord_offs:
+            continue
+
+        type_id = str(hit.get("type_id", "") or "")
+        guid = str(hit.get("guid", "") or "")
+
+        # For GUID-style entries, GUID itself is the only safe dedupe key.
+        # Position/type-based dedupe can hide valid trucks parked close together.
+        duplicate = False
+        for ex in existing:
+            ex_oid = str(ex.get("object_id", "") or "").strip()
+            if ex_oid and guid and ex_oid.lower() == guid.lower():
+                duplicate = True
+                break
+        if duplicate:
+            continue
+
+        is_trailer = "trailer" in type_id.lower()
+        obj = {
+            "file": os.path.basename(source_file),
+            "map_id": map_info.get("map_id", ""),
+            "map_name": map_info.get("map_name", ""),
+            "region_code": map_info.get("region_code", ""),
+            "region_name": map_info.get("region_name", ""),
+            "kind": "Trailer" if is_trailer else "Vehicle",
+            "type_id": type_id,
+            "name": _vehicle_display_name_for_entry(type_id, guid),
+            "object_id": guid,
+            "guid": guid,
+            "start_off": int(hit.get("start_off", -1)),
+            "type_len_off": int(hit.get("type_len_off", -1)),
+            "type_len_size": int(hit.get("type_len_size", 0)),
+            "type_beg": int(hit.get("type_beg", -1)),
+            "type_end": int(hit.get("type_end", -1)),
+            "obj_len_off": int(hit.get("obj_len_off", -1)),
+            "obj_len_size": int(hit.get("obj_len_size", 0)),
+            "obj_beg": int(hit.get("obj_beg", -1)),
+            "obj_end": int(hit.get("obj_end", -1)),
+            "guid_len_off": int(hit.get("guid_len_off", -1)),
+            "guid_len_size": int(hit.get("guid_len_size", 0)),
+            "guid_beg": int(hit.get("guid_beg", -1)),
+            "guid_end": int(hit.get("guid_end", -1)),
+            "coord_off": int(anchor_off),
+            "coord_offs": coord_offs,
+            "end_off": int(block_end),
+            "allow_delete": True,
+            "x": float(ax),
+            "y": float(ay),
+            "z": float(az),
+        }
+        out.append(obj)
+        existing.append(obj)
+
+    return out
+
+
+def _sts_parse_movable_objects(payload: bytes, source_file: str) -> List[Dict[str, Any]]:
+    data = bytes(payload or b"")
+    size = len(data)
+    if size < 96:
+        return []
+
+    out = []
+    seen = set()
+    i = 0
+    min_tail = 48 + 12  # x,y,z float32 after id-string + 48 bytes
+    map_info = _map_display_info(_map_id_from_sts_filename(source_file))
+
+    def _try_parse_at(offset: int, len_size: int):
+        if len_size == 2:
+            if offset + 2 + 3 + 2 + 1 + min_tail > size:
+                return None
+            type_len = struct.unpack_from("<H", data, offset)[0]
+        else:
+            if offset + 4 + 3 + 4 + 1 + min_tail > size:
+                return None
+            type_len = struct.unpack_from("<I", data, offset)[0]
+
+        if type_len < 3 or type_len > 128:
+            return None
+
+        type_beg = offset + len_size
+        type_end = type_beg + type_len
+        if type_end + len_size + 1 + min_tail > size:
+            return None
+        if data[type_end - 1] != 0:
+            return None
+
+        type_raw = data[type_beg:type_end - 1]
+        if not type_raw:
+            return None
+        if any((b < 32 or b > 126) for b in type_raw):
+            return None
+        type_id = type_raw.decode("ascii", errors="ignore").strip()
+        if not type_id:
+            return None
+        if type_id.lower().startswith("deleted_"):
+            return None
+
+        if len_size == 2:
+            obj_len = struct.unpack_from("<H", data, type_end)[0]
+        else:
+            obj_len = struct.unpack_from("<I", data, type_end)[0]
+        if obj_len < 1 or obj_len > 196:
+            return None
+
+        obj_beg = type_end + len_size
+        obj_end = obj_beg + obj_len
+        if obj_end + min_tail > size:
+            return None
+        if data[obj_end - 1] != 0:
+            return None
+
+        obj_raw = data[obj_beg:obj_end - 1]
+        if any((b < 32 or b > 126) for b in obj_raw):
+            return None
+        object_id = obj_raw.decode("ascii", errors="ignore").strip()
+        if object_id and (object_id.lower().startswith("bone") or object_id.lower().endswith("_cdt")):
+            return None
+
+        # Optional GUID string (common in classic movable entries).
+        guid_len_off = -1
+        guid_len_size = 0
+        guid_beg = -1
+        guid_end = -1
+        guid_value = ""
+        try:
+            if len_size == 2:
+                guid_len = struct.unpack_from("<H", data, obj_end)[0]
+            else:
+                guid_len = struct.unpack_from("<I", data, obj_end)[0]
+            if 3 <= int(guid_len) <= 80:
+                gb = obj_end + len_size
+                ge = gb + int(guid_len)
+                if ge <= size and data[ge - 1] == 0:
+                    g_raw = data[gb:ge - 1]
+                    if g_raw and all((32 <= b <= 126) for b in g_raw):
+                        g_txt = g_raw.decode("ascii", errors="ignore").strip()
+                        if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", g_txt):
+                            if g_txt.upper() == "{00000000-0000-0000-0000-000000000000}":
+                                g_txt = ""
+                            guid_len_off = int(obj_end)
+                            guid_len_size = int(len_size)
+                            guid_beg = int(gb)
+                            guid_end = int(ge)
+                            guid_value = g_txt
+        except Exception:
+            pass
+
+        object_or_guid = guid_value or object_id
+        if not object_or_guid:
+            return None
+        # Keep showing legacy "deleted_entry_*" rows when a valid GUID still exists,
+        # so user can finalize true deletion.
+        if object_id.lower().startswith("deleted_entry_") and not guid_value:
+            return None
+
+        if not _sts_is_vehicle_or_trailer_type(type_id, object_or_guid):
+            return None
+
+        def _read_valid_coord(off: int):
+            if off < 0 or (off + 12) > size:
+                return None
+            try:
+                x0, y0, z0 = struct.unpack_from("<fff", data, off)
+            except Exception:
+                return None
+            if not (math.isfinite(x0) and math.isfinite(y0) and math.isfinite(z0)):
+                return None
+            if max(abs(x0), abs(y0), abs(z0)) > 5_000_000:
+                return None
+            if _sts_is_denorm_float(x0) or _sts_is_denorm_float(y0) or _sts_is_denorm_float(z0):
+                return None
+            if max(abs(x0), abs(y0), abs(z0)) < 20.0:
+                return None
+            if not _sts_has_valid_transform_at(data, off):
+                return None
+            # Translation row sanity:
+            # [x, y, z, 1.0] and previous row W ~= 0.0
+            # avoids shifted/adjacent float triplets in the same block.
+            if off < 4 or (off + 16) > size:
+                return None
+            try:
+                prev_w = float(struct.unpack_from("<f", data, off - 4)[0])
+                row_w = float(struct.unpack_from("<f", data, off + 12)[0])
+            except Exception:
+                return None
+            if (not math.isfinite(prev_w)) or (not math.isfinite(row_w)):
+                return None
+            if abs(prev_w) > 0.25:
+                return None
+            if abs(row_w - 1.0) > 0.25:
+                return None
+            return (float(x0), float(y0), float(z0))
+
+        coord_off = -1
+        x = y = z = 0.0
+
+        # Fast-path around the legacy fixed offset.
+        base = int(obj_end + 48)
+        for cand in (
+            base,
+            base - 4,
+            base + 4,
+            base - 8,
+            base + 8,
+            base - 12,
+            base + 12,
+            base - 16,
+            base + 16,
+        ):
+            xyz0 = _read_valid_coord(int(cand))
+            if xyz0 is None:
+                continue
+            coord_off = int(cand)
+            x, y, z = xyz0
+            break
+
+        # Fallback for nested/variant classic entries:
+        # search ahead in a bounded window for the first valid world transform.
+        if coord_off < 0:
+            scan_beg = max(32, int(obj_end + 16))
+            scan_end = min(size - 12, int(obj_end + 8192))
+            for cand in range(scan_beg, scan_end):
+                xyz0 = _read_valid_coord(int(cand))
+                if xyz0 is None:
+                    continue
+                coord_off = int(cand)
+                x, y, z = xyz0
+                break
+
+        if coord_off < 0:
+            return None
+
+        return {
+            "type_id": type_id,
+            "object_id": object_id,
+            "start_off": offset,
+            "type_len_off": int(offset),
+            "type_len_size": int(len_size),
+            "type_beg": int(type_beg),
+            "type_end": int(type_end),
+            "obj_len_off": int(type_end),
+            "obj_len_size": int(len_size),
+            "obj_beg": int(obj_beg),
+            "obj_end": int(obj_end),
+            "guid": str(guid_value or ""),
+            "guid_len_off": int(guid_len_off),
+            "guid_len_size": int(guid_len_size),
+            "guid_beg": int(guid_beg),
+            "guid_end": int(guid_end),
+            "coord_off": coord_off,
+            "x": float(x),
+            "y": float(y),
+            "z": float(z),
+            "entry_min_end": int(coord_off + 12),
+            "next_off": obj_end,
+        }
+
+    while i + 2 + 3 + 2 + 1 + min_tail <= size:
+        parsed = _try_parse_at(i, 2)
+        if parsed is None:
+            parsed = _try_parse_at(i, 4)
+        if parsed is None:
+            i += 1
+            continue
+
+        type_id = parsed["type_id"]
+        object_id = parsed["object_id"]
+        coord_off = parsed["coord_off"]
+        x, y, z = parsed["x"], parsed["y"], parsed["z"]
+
+        key = (coord_off, type_id, object_id)
+        if key not in seen:
+            seen.add(key)
+            is_trailer = ("trailer" in type_id.lower()) or ("TRAILER" in object_id.upper())
+            out.append(
+                {
+                    "file": os.path.basename(source_file),
+                    "map_id": map_info.get("map_id", ""),
+                    "map_name": map_info.get("map_name", ""),
+                    "region_code": map_info.get("region_code", ""),
+                    "region_name": map_info.get("region_name", ""),
+                    "kind": "Trailer" if is_trailer else "Vehicle",
+                    "type_id": type_id,
+                    "name": _vehicle_display_name_for_entry(type_id, object_id),
+                    "object_id": object_id,
+                    "start_off": int(parsed.get("start_off", -1)),
+                    "type_len_off": int(parsed.get("type_len_off", -1)),
+                    "type_len_size": int(parsed.get("type_len_size", 0)),
+                    "type_beg": int(parsed.get("type_beg", -1)),
+                    "type_end": int(parsed.get("type_end", -1)),
+                    "obj_len_off": int(parsed.get("obj_len_off", -1)),
+                    "obj_len_size": int(parsed.get("obj_len_size", 0)),
+                    "obj_beg": int(parsed.get("obj_beg", -1)),
+                    "obj_end": int(parsed.get("obj_end", -1)),
+                    "guid": str(parsed.get("guid", "") or ""),
+                    "guid_len_off": int(parsed.get("guid_len_off", -1)),
+                    "guid_len_size": int(parsed.get("guid_len_size", 0)),
+                    "guid_beg": int(parsed.get("guid_beg", -1)),
+                    "guid_end": int(parsed.get("guid_end", -1)),
+                    "coord_off": coord_off,
+                    "coord_offs": [int(coord_off)],
+                    "end_off": int(parsed.get("entry_min_end", coord_off + 12)),
+                    "allow_delete": True,
+                    "x": x,
+                    "y": y,
+                    "z": z,
+                }
+            )
+
+        i = max(i + 1, int(parsed.get("next_off", i + 1)))
+
+    # Merge additional vehicle/trailer blocks (GUID-style entries used by player vehicles).
+    try:
+        extras = _sts_parse_guid_vehicle_blocks(data, source_file, out)
+        if extras:
+            out.extend(extras)
+    except Exception:
+        pass
+
+    # Collapse duplicate representations of the same world object.
+    # Some STS files include component/default aliases pointing to the same transform.
+    # Keep the best-looking row per GUID or per position cluster.
+    try:
+        def _entry_quality(obj: Dict[str, Any]) -> int:
+            type_id = str(obj.get("type_id", "") or "").strip().lower()
+            object_id = str(obj.get("object_id", "") or "").strip().lower()
+            name = str(obj.get("name", "") or "").strip().lower()
+            score = 0
+            if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", str(obj.get("guid", "") or "")):
+                score += 8
+            if ("trailer" in type_id) or _is_probable_truck_type_id(type_id):
+                score += 4
+            score += int(_vehicle_name_quality(name, type_id))
+            if any(tok in type_id for tok in ("_default", "skin", "deleted")):
+                score -= 4
+            if "_old_engine_" in type_id:
+                score -= 3
+            if type_id.startswith("g_special_"):
+                score -= 3
+            if any(tok in object_id for tok in ("_default", "skin", "deleted")):
+                score -= 3
+            if any(tok in name for tok in (" default", "skin ", "deleted", " old engine")):
+                score -= 2
+            if type_id.startswith(("g_", "w_")):
+                score -= 3
+            return score
+
+        chosen = {}
+        order = []
+        for obj in out:
+            if not isinstance(obj, dict):
+                continue
+            kind = str(obj.get("kind", "") or "").strip().lower()
+            guid = str(obj.get("guid", "") or "").strip().lower()
+            try:
+                x = round(float(obj.get("x", 0.0)), 2)
+                y = round(float(obj.get("y", 0.0)), 2)
+                z = round(float(obj.get("z", 0.0)), 2)
+            except Exception:
+                x = y = z = 0.0
+
+            if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", guid):
+                key = ("guid", guid)
+            else:
+                key = ("pos", kind, x, y, z)
+
+            prev = chosen.get(key)
+            if prev is None:
+                chosen[key] = obj
+                order.append(key)
+                continue
+            if _entry_quality(obj) > _entry_quality(prev):
+                chosen[key] = obj
+
+        out = [chosen[k] for k in order if k in chosen]
+
+        # Second pass: collapse leftovers that still share the same position.
+        # This catches GUID/non-GUID aliases of the same visible object.
+        chosen2 = {}
+        order2 = []
+        for obj in out:
+            if not isinstance(obj, dict):
+                continue
+            kind = str(obj.get("kind", "") or "").strip().lower()
+            try:
+                x = round(float(obj.get("x", 0.0)), 2)
+                y = round(float(obj.get("y", 0.0)), 2)
+                z = round(float(obj.get("z", 0.0)), 2)
+            except Exception:
+                x = y = z = 0.0
+            key2 = ("pos", kind, x, y, z)
+            prev = chosen2.get(key2)
+            if prev is None:
+                chosen2[key2] = obj
+                order2.append(key2)
+                continue
+            if _entry_quality(obj) > _entry_quality(prev):
+                chosen2[key2] = obj
+
+        out = [chosen2[k] for k in order2 if k in chosen2]
+    except Exception:
+        pass
+
+    # Best-effort full entry boundaries for delete:
+    # use next parsed entry start as end when available, otherwise keep minimal end.
+    try:
+        ordered = [
+            o
+            for o in out
+            if isinstance(o.get("start_off"), int)
+            and int(o.get("start_off")) >= 0
+        ]
+        ordered.sort(key=lambda o: int(o.get("start_off", 0)))
+        for idx, obj in enumerate(ordered):
+            try:
+                min_end = int(obj.get("end_off", 0))
+            except Exception:
+                min_end = 0
+            if min_end <= int(obj.get("start_off", 0)):
+                min_end = int(obj.get("coord_off", 0)) + 12
+
+            if idx + 1 < len(ordered):
+                next_start = int(ordered[idx + 1].get("start_off", min_end))
+                if next_start > min_end:
+                    obj["end_off"] = next_start
+                else:
+                    obj["end_off"] = min_end
+            else:
+                obj["end_off"] = min_end
+    except Exception:
+        pass
+
+    return out
+
+
+def _sts_load_file(path: str) -> Dict[str, Any]:
+    with open(path, "rb") as f:
+        raw = f.read()
+    if len(raw) < 6:
+        raise ValueError(f"STS file too small: {os.path.basename(path)}")
+
+    declared_size = struct.unpack_from("<I", raw, 0)[0]
+    dec = zlib.decompressobj()
+    payload = dec.decompress(raw[4:])
+    try:
+        payload += dec.flush()
+    except Exception:
+        pass
+    trailer = bytes(dec.unused_data or b"")
+    return {
+        "path": path,
+        "declared_size": int(declared_size),
+        "payload": bytearray(payload),
+        # Preserve bytes after zlib stream (game expects them).
+        "trailer": trailer,
+    }
+
+
+def _sts_write_file(path: str, payload: bytes, trailer: bytes = b""):
+    data = bytes(payload or b"")
+    comp = zlib.compress(data)
+    tail = bytes(trailer or b"")
+    with open(path, "wb") as f:
+        f.write(struct.pack("<I", len(data)))
+        f.write(comp)
+        if tail:
+            f.write(tail)
+
+
+def _map_id_from_sts_filename(path_or_name: str) -> str:
+    base = os.path.splitext(os.path.basename(str(path_or_name or "")))[0].lower()
+    m = re.match(r"^(?:\d+_)?sts_level_(.+)$", base)
+    if not m:
+        return ""
+    return m.group(1)
+
+
+def _list_sts_files_for_slot_region(save_folder: str, slot: int, region_code: str) -> List[str]:
+    if not os.path.isdir(save_folder):
+        return []
+
+    region = str(region_code or "").strip().lower()
+    prefix = _slot_to_sts_prefix(slot).lower()
+    target_prefix = f"{prefix}sts_level_"
+    out = []
+    try:
+        names = sorted(os.listdir(save_folder))
+    except Exception:
+        return []
+
+    for name in names:
+        low = name.lower()
+        if not (low.startswith(target_prefix) and (low.endswith(".cfg") or low.endswith(".dat"))):
+            continue
+        map_id = _map_id_from_sts_filename(name)
+        if not map_id:
+            continue
+        if region and region != "all" and not map_id.startswith(region + "_"):
+            continue
+        out.append(os.path.join(save_folder, name))
+
+    return out
+
+
+# TAB: Vehicles (launch_gui -> tab_vehicles)
+def create_vehicles_tab(tab, save_path_var):
+    # ---------------------------------------------------------------------
+    # STS controls
+    # ---------------------------------------------------------------------
+    sts_state = {
+        "files": {},
+        "objects": [],
+        "row_to_obj": {},
+        "backed_up_files": set(),
+        "load_token": 0,
+        "is_loading": False,
+        "loaded_save_path": "",
+        "loaded_save_mtime": None,
+    }
+    metadata_state = {
+        "refresh_running": False,
+        "refresh_done": False,
+    }
+    sts_state["raw_objects"] = []
+
+    _GROUP_AXIS_TOL = 1.0
+    _GROUP_DIST_TOL = 1.35
+
+    def _obj_num(obj: Dict[str, Any], key: str) -> float:
+        try:
+            return float(obj.get(key, 0.0))
+        except Exception:
+            return 0.0
+
+    def _obj_group_key(obj: Dict[str, Any]):
+        file_path = str(obj.get("file_path", "") or "").strip().lower()
+        kind = str(obj.get("kind", "") or "").strip().lower()
+        map_id = str(obj.get("map_id", "") or "").strip().lower()
+        # Group by resolved display name first; fallback to type id.
+        name = str(obj.get("name", "") or "").strip().lower()
+        if not name:
+            name = str(obj.get("type_id", "") or "").strip().lower()
+        return (file_path, kind, map_id, name)
+
+    def _obj_is_close(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+        ax, ay, az = _obj_num(a, "x"), _obj_num(a, "y"), _obj_num(a, "z")
+        bx, by, bz = _obj_num(b, "x"), _obj_num(b, "y"), _obj_num(b, "z")
+        dx = abs(ax - bx)
+        dy = abs(ay - by)
+        dz = abs(az - bz)
+        if dx > _GROUP_AXIS_TOL or dy > _GROUP_AXIS_TOL or dz > _GROUP_AXIS_TOL:
+            return False
+        return ((dx * dx) + (dy * dy) + (dz * dz)) <= (_GROUP_DIST_TOL * _GROUP_DIST_TOL)
+
+    def _obj_anchor_quality(obj: Dict[str, Any]) -> int:
+        score = 0
+        guid = str(obj.get("guid", "") or "").strip()
+        oid = str(obj.get("object_id", "") or "").strip()
+        if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", guid):
+            score += 8
+        if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", oid):
+            score += 6
+        if oid and (not oid.lower().startswith("deleted")):
+            score += 2
+        score += int(_vehicle_name_quality(str(obj.get("name", "") or ""), str(obj.get("type_id", "") or "")))
+        return score
+
+    def _build_grouped_objects_from_raw(raw_objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        buckets = {}
+        for obj in raw_objects or []:
+            if not isinstance(obj, dict):
+                continue
+            buckets.setdefault(_obj_group_key(obj), []).append(obj)
+
+        grouped = []
+        for _k, items in buckets.items():
+            if not items:
+                continue
+            used = [False] * len(items)
+            for i, base in enumerate(items):
+                if used[i]:
+                    continue
+                used[i] = True
+                cluster = [base]
+                changed = True
+                while changed:
+                    changed = False
+                    for j, cand in enumerate(items):
+                        if used[j]:
+                            continue
+                        if any(_obj_is_close(cand, cur) for cur in cluster):
+                            used[j] = True
+                            cluster.append(cand)
+                            changed = True
+                if len(cluster) <= 1:
+                    grouped.append(base)
+                    continue
+                anchor = max(cluster, key=_obj_anchor_quality)
+                disp = dict(anchor)
+                disp["is_group"] = True
+                disp["group_members"] = list(cluster)
+                disp["group_anchor_obj"] = anchor
+                disp["group_size"] = int(len(cluster))
+                grouped.append(disp)
+
+        grouped.sort(
+            key=lambda o: (
+                str(o.get("region_name", "")),
+                str(o.get("map_name", "")),
+                str(o.get("map_id", "")),
+                str(o.get("file", "")),
+                str(o.get("kind", "")),
+                str(o.get("name", "")),
+                _obj_num(o, "x"),
+                _obj_num(o, "z"),
+            )
+        )
+        return grouped
+
+    def _rebuild_grouped_objects():
+        raw = sts_state.get("raw_objects", [])
+        sts_state["objects"] = _build_grouped_objects_from_raw(raw if isinstance(raw, list) else [])
+
+    top = ttk.Frame(tab)
+    top.pack(fill="x", padx=10, pady=(10, 6))
+
+    ttk.Label(top, text="Type:").pack(side="left")
+    type_filter_var = tk.StringVar(value="All")
+    type_filter_cb = ttk.Combobox(top, textvariable=type_filter_var, state="readonly", width=10, values=["All"])
+    type_filter_cb.pack(side="left", padx=(4, 8))
+
+    ttk.Label(top, text="Region:").pack(side="left")
+    region_filter_var = tk.StringVar(value="All")
+    region_filter_cb = ttk.Combobox(top, textvariable=region_filter_var, state="readonly", width=20, values=["All"])
+    region_filter_cb.pack(side="left", padx=(4, 8))
+
+    ttk.Label(top, text="Map:").pack(side="left")
+    map_filter_var = tk.StringVar(value="All")
+    map_filter_cb = ttk.Combobox(top, textvariable=map_filter_var, state="readonly", width=24, values=["All"])
+    map_filter_cb.pack(side="left", padx=(4, 8))
+
+    ttk.Label(top, text="Name:").pack(side="left")
+    name_filter_var = tk.StringVar(value="")
+    name_filter_entry = ttk.Entry(top, textvariable=name_filter_var, width=22)
+    name_filter_entry.pack(side="left", padx=(4, 0))
+
+    sts_status_var = tk.StringVar(value="Select a save to load STS objects.")
+    ttk.Label(tab, textvariable=sts_status_var).pack(fill="x", padx=10, pady=(0, 6))
+
+    tree_wrap = tk.Frame(tab, bg="#f0f0f0", bd=0, highlightthickness=0)
+    tree_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+    cols = ("kind", "name", "region", "map", "x", "y", "z")
+    try:
+        _vpalette = _get_effective_theme(_is_dark_mode_active())
+    except Exception:
+        _vpalette = {}
+    _tree_fg = str((_vpalette.get("fg") if isinstance(_vpalette, dict) else "") or "#000000")
+    _tree_empty_bg = "#f0f0f0"
+    _tree_sel_bg = str((_vpalette.get("accent") if isinstance(_vpalette, dict) else "") or "#4A90E2")
+    _tree_sel_fg = str((_vpalette.get("accent_fg") if isinstance(_vpalette, dict) else "") or "#FFFFFF")
+    _head_bg = str((_vpalette.get("button_bg") if isinstance(_vpalette, dict) else "") or STRIPE_B)
+    _head_active_bg = str((_vpalette.get("button_active_bg") if isinstance(_vpalette, dict) else "") or _head_bg)
+    try:
+        tree_wrap.configure(bg=_tree_empty_bg)
+    except Exception:
+        pass
+    try:
+        _vstyle = ttk.Style()
+        _vstyle.configure(
+            "Vehicles.Treeview",
+            rowheight=30,
+            background=_tree_empty_bg,
+            fieldbackground=_tree_empty_bg,
+            foreground=_tree_fg,
+        )
+        _vstyle.map(
+            "Vehicles.Treeview",
+            background=[("selected", _tree_sel_bg)],
+            foreground=[("selected", _tree_sel_fg)],
+        )
+        _vstyle.configure("Vehicles.Treeview.Heading", background=_head_bg, foreground=_tree_fg)
+        _vstyle.map("Vehicles.Treeview.Heading", background=[("active", _head_active_bg)])
+    except Exception:
+        pass
+    tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", selectmode="extended", style="Vehicles.Treeview")
+    headings = {
+        "kind": "Type",
+        "name": "Name",
+        "region": "Region",
+        "map": "Map",
+        "x": "X",
+        "y": "Y",
+        "z": "Z",
+    }
+    widths = {
+        "kind": 72,
+        "name": 240,
+        "region": 150,
+        "map": 180,
+        "x": 78,
+        "y": 78,
+        "z": 78,
+    }
+    for c in cols:
+        tree.heading(c, text=headings[c])
+        tree.column(c, width=widths[c], anchor="w")
+    try:
+        tree.tag_configure("even", background=STRIPE_B)
+        tree.tag_configure("odd", background=STRIPE_A)
+        tree.tag_configure("filler", background="#f0f0f0")
+    except Exception:
+        pass
+
+    yscroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=tree.yview)
+    xscroll = ttk.Scrollbar(tree_wrap, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    yscroll.grid(row=0, column=1, sticky="ns")
+    xscroll.grid(row=1, column=0, sticky="ew")
+    tree_wrap.grid_rowconfigure(0, weight=1)
+    tree_wrap.grid_columnconfigure(0, weight=1)
+    try:
+        tree.configure(takefocus=0)
+    except Exception:
+        pass
+
+    edit_row = ttk.Frame(tab)
+    edit_row.pack(fill="x", padx=10, pady=(0, 8))
+
+    def _attach_vehicles_hover_tooltip(anchor_widget, tooltip_text):
+        tip_state = {"win": None, "job": None}
+
+        def _cancel_job():
+            job = tip_state.get("job")
+            if job is not None:
+                try:
+                    anchor_widget.after_cancel(job)
+                except Exception:
+                    pass
+                tip_state["job"] = None
+
+        def _hide(_event=None):
+            _cancel_job()
+            tip = tip_state.get("win")
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+                tip_state["win"] = None
+
+        def _show_now():
+            _hide()
+            try:
+                tip = tk.Toplevel(anchor_widget)
+                tip.wm_overrideredirect(True)
+                try:
+                    tip.withdraw()
+                except Exception:
+                    pass
+                try:
+                    tip.attributes("-topmost", True)
+                except Exception:
+                    pass
+                x = int(anchor_widget.winfo_rootx() + anchor_widget.winfo_width() + 8)
+                y = int(anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 6)
+                tip.geometry(f"+{x}+{y}")
+                tk.Label(
+                    tip,
+                    text=str(tooltip_text or ""),
+                    justify="left",
+                    wraplength=520,
+                    bg="#fffbe6",
+                    fg="black",
+                    relief="solid",
+                    bd=1,
+                    padx=8,
+                    pady=6,
+                ).pack()
+                tip_state["win"] = tip
+                try:
+                    tip.deiconify()
+                except Exception:
+                    pass
+            except Exception:
+                _hide()
+
+        def _schedule_show(_event=None):
+            _cancel_job()
+            try:
+                tip_state["job"] = anchor_widget.after(260, _show_now)
+            except Exception:
+                _show_now()
+
+        anchor_widget.bind("<Enter>", _schedule_show, add="+")
+        anchor_widget.bind("<Leave>", _hide, add="+")
+        anchor_widget.bind("<ButtonPress>", _hide, add="+")
+        anchor_widget.bind("<FocusOut>", _hide, add="+")
+
+    vehicles_info_badge = tk.Label(
+        top,
+        text="i",
+        width=2,
+        relief="ridge",
+        bd=1,
+        highlightthickness=0,
+        cursor="question_arrow",
+        bg="#d32f2f",
+        fg="#ffffff",
+    )
+    vehicles_info_badge.pack(side="right", padx=(8, 0))
+    _attach_vehicles_hover_tooltip(
+        vehicles_info_badge,
+        "Use with caution. These actions can cause serious save issues. Make sure backups are enabled and be ready to restore a backup if something goes wrong. The safest use is selecting one entry at a time and lifting by +2 to +5, or deleting a single entry. Large bulk edits (especially setting many trucks/trailers to the same XYZ) can produce broken or unstable results.",
+    )
+
+    ttk.Label(edit_row, text="Lift Y by:").pack(side="left")
+    lift_var = tk.StringVar(value="2.0")
+    ttk.Entry(edit_row, textvariable=lift_var, width=8).pack(side="left", padx=(6, 12))
+
+    ttk.Label(edit_row, text="X:").pack(side="left")
+    x_var = tk.StringVar()
+    ttk.Entry(edit_row, textvariable=x_var, width=12).pack(side="left", padx=(4, 8))
+
+    ttk.Label(edit_row, text="Y:").pack(side="left")
+    y_var = tk.StringVar()
+    ttk.Entry(edit_row, textvariable=y_var, width=12).pack(side="left", padx=(4, 8))
+
+    ttk.Label(edit_row, text="Z:").pack(side="left")
+    z_var = tk.StringVar()
+    ttk.Entry(edit_row, textvariable=z_var, width=12).pack(side="left", padx=(4, 12))
+
+    filter_zero_var = tk.BooleanVar(value=True)
+    _tree_refresh_guard = {"busy": False}
+    _tree_resize_job = {"id": None}
+
+    def _row_values(obj: Dict[str, Any]):
+        return (
+            obj.get("kind", ""),
+            obj.get("name", ""),
+            obj.get("region_name", ""),
+            obj.get("map_name", "") or obj.get("map_id", ""),
+            f"{float(obj.get('x', 0.0)):.3f}",
+            f"{float(obj.get('y', 0.0)):.3f}",
+            f"{float(obj.get('z', 0.0)):.3f}",
+        )
+
+    def _set_combo_values(cb: ttk.Combobox, var: tk.StringVar, values: List[str]):
+        vals = values if values else ["All"]
+        cb["values"] = vals
+        current = str(var.get() or "").strip()
+        if current not in vals:
+            var.set(vals[0])
+
+    def _iter_filtered_objects(apply_map_filter: bool = True):
+        selected_type = str(type_filter_var.get() or "All").strip().lower()
+        selected_region = str(region_filter_var.get() or "All").strip().lower()
+        selected_map = str(map_filter_var.get() or "All").strip().lower()
+        name_query = str(name_filter_var.get() or "").strip().lower()
+
+        for obj in sts_state.get("objects", []):
+            if bool(filter_zero_var.get()):
+                try:
+                    ox = float(obj.get("x", 0.0))
+                    oy = float(obj.get("y", 0.0))
+                    oz = float(obj.get("z", 0.0))
+                except Exception:
+                    ox = oy = oz = 0.0
+                if abs(ox) < 1e-9 and abs(oy) < 1e-9 and abs(oz) < 1e-9:
+                    continue
+
+            kind = str(obj.get("kind", "") or "").strip().lower()
+            region = str(obj.get("region_name", "") or "").strip().lower()
+            map_name = str(obj.get("map_name", "") or obj.get("map_id", "") or "").strip().lower()
+            disp_name = str(obj.get("name", "") or "").strip().lower()
+            type_id = str(obj.get("type_id", "") or "").strip().lower()
+            object_id = str(obj.get("object_id", "") or "").strip()
+            # Name filter should be based on real display names only.
+            resolved_name = (
+                str(_vehicle_display_name_for_entry(type_id, object_id) or "").strip().lower()
+                if (type_id or object_id)
+                else ""
+            )
+
+            if selected_type != "all" and kind != selected_type:
+                continue
+            if selected_region != "all" and region != selected_region:
+                continue
+            if apply_map_filter and selected_map != "all" and map_name != selected_map:
+                continue
+            if name_query and (name_query not in disp_name) and (name_query not in resolved_name):
+                continue
+            yield obj
+
+    def _refresh_filter_values():
+        objs = sts_state.get("objects", []) if isinstance(sts_state.get("objects"), list) else []
+        type_values = ["All"] + sorted({str(o.get("kind", "") or "").strip() for o in objs if str(o.get("kind", "") or "").strip()})
+        region_values = ["All"] + sorted({str(o.get("region_name", "") or "").strip() for o in objs if str(o.get("region_name", "") or "").strip()})
+        _set_combo_values(type_filter_cb, type_filter_var, type_values)
+        _set_combo_values(region_filter_cb, region_filter_var, region_values)
+
+        filtered = list(_iter_filtered_objects(apply_map_filter=False))
+
+        map_values = ["All"] + sorted(
+            {
+                str(o.get("map_name", "") or o.get("map_id", "") or "").strip()
+                for o in filtered
+                if str(o.get("map_name", "") or o.get("map_id", "") or "").strip()
+            }
+        )
+        _set_combo_values(map_filter_cb, map_filter_var, map_values)
+
+    def _refresh_tree():
+        if _tree_refresh_guard.get("busy"):
+            return
+        _tree_refresh_guard["busy"] = True
+        try:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            sts_state["row_to_obj"] = {}
+
+            real_count = 0
+            for row_idx, obj in enumerate(_iter_filtered_objects(apply_map_filter=True)):
+                iid = f"row_{row_idx}"
+                tag = "even" if (row_idx % 2 == 0) else "odd"
+                tree.insert("", "end", iid=iid, values=_row_values(obj), tags=(tag,))
+                sts_state["row_to_obj"][iid] = obj
+                real_count += 1
+
+            # Fallback for Windows/native themes that may ignore Treeview fieldbackground:
+            # paint remaining visible area with explicit #f0f0f0 filler rows.
+            try:
+                row_h = 30
+                view_h = int(tree.winfo_height() or 0)
+                visible_rows = max(0, int(view_h / row_h) + 1)
+                filler_needed = max(0, visible_rows - real_count)
+                for i in range(filler_needed):
+                    tree.insert(
+                        "",
+                        "end",
+                        iid=f"filler_{i}",
+                        values=("", "", "", "", "", "", ""),
+                        tags=("filler",),
+                    )
+            except Exception:
+                pass
+        finally:
+            _tree_refresh_guard["busy"] = False
+
+    def _schedule_tree_resize_refresh(_event=None):
+        try:
+            if _tree_resize_job.get("id") is not None:
+                tab.after_cancel(_tree_resize_job["id"])
+        except Exception:
+            pass
+        try:
+            _tree_resize_job["id"] = tab.after(70, lambda: (_tree_resize_job.__setitem__("id", None), _refresh_tree()))
+        except Exception:
+            _refresh_tree()
+
+    def _relabel_loaded_objects_from_metadata():
+        changed = False
+        objs = sts_state.get("raw_objects", [])
+        if not isinstance(objs, list) or not objs:
+            return
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            type_id = str(obj.get("type_id", "") or "").strip()
+            object_id = str(obj.get("object_id", "") or "").strip()
+            if type_id or object_id:
+                new_name = _vehicle_display_name_for_entry(type_id, object_id)
+                if new_name and new_name != str(obj.get("name", "") or ""):
+                    obj["name"] = new_name
+                    changed = True
+
+            map_id = str(obj.get("map_id", "") or "").strip()
+            if map_id:
+                info = _map_display_info(map_id)
+                new_region = str(info.get("region_name", "") or "").strip()
+                new_map = str(info.get("map_name", "") or "").strip()
+                if new_region and new_region != str(obj.get("region_name", "") or ""):
+                    obj["region_name"] = new_region
+                    changed = True
+                if new_map and new_map != str(obj.get("map_name", "") or ""):
+                    obj["map_name"] = new_map
+                    changed = True
+
+        if changed:
+            _rebuild_grouped_objects()
+            _refresh_filter_values()
+            _refresh_tree()
+
+    def _refresh_vehicle_metadata_in_background(force: bool = False):
+        if metadata_state.get("refresh_running"):
+            return
+        if metadata_state.get("refresh_done") and (not force):
+            return
+        # Never compete with STS parsing; refresh metadata once STS is done.
+        if sts_state.get("is_loading"):
+            return
+
+        metadata_state["refresh_running"] = True
+
+        def _worker():
+            ok = False
+            try:
+                _vehicle_load_metadata(force_reload=True, allow_online=True)
+                ok = True
+            except Exception:
+                ok = False
+
+            def _apply():
+                metadata_state["refresh_running"] = False
+                if not ok:
+                    return
+                metadata_state["refresh_done"] = True
+                _relabel_loaded_objects_from_metadata()
+
+            try:
+                tab.after(0, _apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _clear_sts_view(message: str):
+        sts_state["load_token"] = int(sts_state.get("load_token", 0)) + 1
+        sts_state["is_loading"] = False
+        sts_state["loaded_save_path"] = ""
+        sts_state["loaded_save_mtime"] = None
+        sts_state["files"] = {}
+        sts_state["raw_objects"] = []
+        sts_state["objects"] = []
+        sts_state["row_to_obj"] = {}
+        _refresh_filter_values()
+        _refresh_tree()
+        sts_status_var.set(message)
+
+    def _load_sts_objects(manual: bool = True):
+        if sts_state.get("is_loading"):
+            if manual:
+                return show_info("Vehicles", "STS loading is already in progress.")
+            return
+
+        save_path = save_path_var.get()
+        if not save_path or not os.path.exists(save_path):
+            if manual:
+                return messagebox.showerror("Error", "CompleteSave file not found.")
+            sts_status_var.set("Select a valid save file to load STS objects.")
+            return
+        try:
+            save_mtime = float(os.path.getmtime(save_path))
+        except Exception:
+            save_mtime = None
+
+        # Keep already loaded data when save file didn't change.
+        if (
+            (not manual)
+            and str(sts_state.get("loaded_save_path", "") or "") == str(save_path)
+            and sts_state.get("loaded_save_mtime", None) == save_mtime
+        ):
+            _refresh_filter_values()
+            _refresh_tree()
+            return
+
+        folder = os.path.dirname(save_path)
+        slot_n = _detect_complete_save_slot_from_path(save_path)
+        sts_files = _list_sts_files_for_slot_region(folder, slot_n, "ALL")
+        if not sts_files:
+            _clear_sts_view(f"No STS files found for save slot {slot_n}.")
+            sts_state["loaded_save_path"] = save_path
+            sts_state["loaded_save_mtime"] = save_mtime
+            return
+
+        token = int(sts_state.get("load_token", 0)) + 1
+        sts_state["load_token"] = token
+        sts_state["is_loading"] = True
+        sts_state["files"] = {}
+        sts_state["raw_objects"] = []
+        sts_state["objects"] = []
+        sts_state["row_to_obj"] = {}
+        _refresh_filter_values()
+        _refresh_tree()
+        sts_status_var.set(f"Loading STS objects... 0/{len(sts_files)} files (slot {slot_n})")
+
+        progress = {
+            "loaded_files": 0,
+            "loaded_raw_objects": 0,
+            "loaded_grouped_objects": 0,
+            "errors": 0,
+        }
+
+        def _is_current() -> bool:
+            return token == int(sts_state.get("load_token", -1))
+
+        def _apply_chunk(fpath: str, fdata: Dict[str, Any], objs: List[Dict[str, Any]], err_text: str = ""):
+            if not _is_current():
+                return
+            if err_text:
+                progress["errors"] += 1
+            else:
+                sts_state["files"][fpath] = fdata
+                for obj in objs:
+                    obj["file_path"] = fpath
+                sts_state["raw_objects"].extend(objs)
+                _rebuild_grouped_objects()
+                progress["loaded_files"] = int(progress.get("loaded_files", 0)) + 1
+                progress["loaded_raw_objects"] = len(sts_state.get("raw_objects", []))
+                progress["loaded_grouped_objects"] = len(sts_state.get("objects", []))
+
+            _refresh_filter_values()
+            _refresh_tree()
+            processed = int(progress.get("loaded_files", 0)) + int(progress.get("errors", 0))
+            sts_status_var.set(
+                f"Loading STS objects... {processed}/{len(sts_files)} files"
+                f" | entries: {progress.get('loaded_grouped_objects', 0)}"
+                f" (raw: {progress.get('loaded_raw_objects', 0)})"
+                + (f" | failed: {progress.get('errors', 0)}" if progress.get("errors", 0) else "")
+            )
+
+        def _finish_loading():
+            if not _is_current():
+                return
+            try:
+                sts_state["raw_objects"].sort(
+                    key=lambda o: (
+                        str(o.get("region_name", "")),
+                        str(o.get("map_name", "")),
+                        str(o.get("map_id", "")),
+                        str(o.get("file", "")),
+                        str(o.get("kind", "")),
+                        str(o.get("name", "")),
+                        str(o.get("object_id", "")),
+                    )
+                )
+            except Exception:
+                pass
+            _rebuild_grouped_objects()
+            _refresh_filter_values()
+            _refresh_tree()
+            sts_state["is_loading"] = False
+            sts_state["loaded_save_path"] = save_path
+            sts_state["loaded_save_mtime"] = save_mtime
+
+            msg = (
+                f"Loaded {len(sts_state.get('objects', []))} movable entries from "
+                f"{progress.get('loaded_files', 0)} STS files (slot {slot_n}). "
+                f"(raw: {len(sts_state.get('raw_objects', []))})"
+            )
+            if progress.get("errors", 0):
+                msg += f" ({progress.get('errors', 0)} failed)"
+            sts_status_var.set(msg)
+            # After STS list is already usable, refresh metadata in background.
+            _refresh_vehicle_metadata_in_background(force=False)
+
+        def _run_loader():
+            for fpath in sts_files:
+                if not _is_current():
+                    return
+                try:
+                    fdata = _sts_load_file(fpath)
+                    objs = _sts_parse_movable_objects(fdata.get("payload", b""), fpath)
+                    try:
+                        tab.after(0, lambda p=fpath, d=fdata, o=objs: _apply_chunk(p, d, o, ""))
+                    except Exception:
+                        pass
+                except Exception as e:
+                    try:
+                        tab.after(0, lambda p=fpath, err=str(e): _apply_chunk(p, {}, [], err))
+                    except Exception:
+                        pass
+
+            try:
+                tab.after(0, _finish_loading)
+            except Exception:
+                pass
+
+        threading.Thread(target=_run_loader, daemon=True).start()
+
+    def _selected_rows():
+        out = []
+        for iid in tree.selection():
+            obj = sts_state["row_to_obj"].get(iid)
+            if isinstance(obj, dict):
+                out.append((iid, obj))
+        return out
+
+    def _expand_members_with_linked_entries(members: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out = []
+        seen_ids = set()
+        link_keys = set()
+
+        for obj in members or []:
+            if not isinstance(obj, dict):
+                continue
+            oid = id(obj)
+            if oid not in seen_ids:
+                seen_ids.add(oid)
+                out.append(obj)
+            fpath = str(obj.get("file_path", "") or "").strip()
+            ref_id = str(obj.get("guid", "") or obj.get("object_id", "") or "").strip()
+            if fpath and ref_id:
+                link_keys.add((fpath, ref_id.lower()))
+
+        if not link_keys:
+            return out
+
+        for obj in sts_state.get("raw_objects", []) or []:
+            if not isinstance(obj, dict):
+                continue
+            oid = id(obj)
+            if oid in seen_ids:
+                continue
+            fpath = str(obj.get("file_path", "") or "").strip()
+            ref_id = str(obj.get("guid", "") or obj.get("object_id", "") or "").strip()
+            if not fpath or not ref_id:
+                continue
+            if (fpath, ref_id.lower()) not in link_keys:
+                continue
+            seen_ids.add(oid)
+            out.append(obj)
+
+        return out
+
+    def _selected_edit_units():
+        rows = _selected_rows()
+        if not rows:
+            return []
+        units = []
+        seen_members = set()
+
+        for iid, display_obj in rows:
+            if not isinstance(display_obj, dict):
+                continue
+            raw_members = []
+            if bool(display_obj.get("is_group")) and isinstance(display_obj.get("group_members"), list):
+                for m in display_obj.get("group_members", []):
+                    if isinstance(m, dict):
+                        raw_members.append(m)
+            else:
+                raw_members.append(display_obj)
+
+            raw_members = _expand_members_with_linked_entries(raw_members)
+            deduped = []
+            for m in raw_members:
+                mid = id(m)
+                if mid in seen_members:
+                    continue
+                seen_members.add(mid)
+                deduped.append(m)
+            if not deduped:
+                continue
+
+            anchor_obj = display_obj.get("group_anchor_obj") if isinstance(display_obj, dict) else None
+            if not isinstance(anchor_obj, dict):
+                anchor_obj = deduped[0]
+
+            units.append(
+                {
+                    "iid": iid,
+                    "display_obj": display_obj,
+                    "anchor_obj": anchor_obj,
+                    "members": deduped,
+                }
+            )
+
+        return units
+
+    def _select_filtered_rows():
+        rows = [iid for iid in tree.get_children() if iid in sts_state.get("row_to_obj", {})]
+        if not rows:
+            return
+        try:
+            tree.selection_set(rows)
+            tree.focus(rows[0])
+            tree.see(rows[0])
+        except Exception:
+            pass
+
+    def _unselect_filtered_rows():
+        try:
+            tree.selection_remove(tree.selection())
+        except Exception:
+            pass
+
+    def _on_tree_select(_event=None):
+        # Remove filler/empty rows from selection so "blank area" cannot stay selected.
+        current = list(tree.selection())
+        if current:
+            real = [iid for iid in current if iid in sts_state.get("row_to_obj", {})]
+            if len(real) != len(current):
+                try:
+                    if real:
+                        tree.selection_set(real)
+                    else:
+                        tree.selection_remove(current)
+                except Exception:
+                    pass
+
+        rows = _selected_rows()
+        if len(rows) != 1:
+            return
+        _, obj = rows[0]
+        x_var.set(f"{float(obj.get('x', 0.0)):.3f}")
+        y_var.set(f"{float(obj.get('y', 0.0)):.3f}")
+        z_var.set(f"{float(obj.get('z', 0.0)):.3f}")
+
+    def _on_tree_click(event):
+        try:
+            region = str(tree.identify("region", event.x, event.y) or "")
+        except Exception:
+            region = ""
+        if region not in {"cell", "tree"}:
+            return
+        iid = str(tree.identify_row(event.y) or "")
+        if iid and iid in sts_state.get("row_to_obj", {}):
+            return
+        try:
+            tree.selection_remove(tree.selection())
+        except Exception:
+            pass
+        try:
+            tree.focus("")
+        except Exception:
+            pass
+        return "break"
+
+    tree.bind("<Button-1>", _on_tree_click, add="+")
+    tree.bind("<<TreeviewSelect>>", _on_tree_select)
+    tree.bind("<Configure>", _schedule_tree_resize_refresh)
+
+    def _save_touched_files(touched_paths: Set[str]):
+        saved = 0
+        for path in sorted(set(touched_paths or [])):
+            entry = sts_state["files"].get(path)
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get("payload", b"")
+            if not isinstance(payload, (bytes, bytearray)):
+                continue
+            trailer = entry.get("trailer", b"")
+            try:
+                if path not in sts_state["backed_up_files"]:
+                    try:
+                        make_backup_if_enabled(path)
+                    except Exception:
+                        pass
+                    sts_state["backed_up_files"].add(path)
+                _sts_write_file(path, payload, trailer=trailer)
+                saved += 1
+            except Exception as e:
+                raise RuntimeError(f"Failed to save {os.path.basename(path)}: {e}")
+        return saved
+
+    def _coord_offsets_for_obj(obj: Dict[str, Any], payload: bytearray) -> List[int]:
+        offs = []
+        raw = obj.get("coord_offs")
+        if isinstance(raw, list):
+            for v in raw:
+                try:
+                    iv = int(v)
+                except Exception:
+                    continue
+                offs.append(iv)
+        if not offs:
+            try:
+                offs.append(int(obj.get("coord_off", -1)))
+            except Exception:
+                pass
+        out = []
+        seen = set()
+        max_off = max(0, len(payload) - 12)
+        for iv in offs:
+            if iv < 0 or iv > max_off:
+                continue
+            if iv in seen:
+                continue
+            seen.add(iv)
+            out.append(iv)
+        # Keep edits bounded even if parser ever returns a huge list.
+        if len(out) > 128:
+            out = out[:128]
+        return out
+
+    def _collect_transform_offsets_in_range(payload: bytearray, scan_start: int, scan_end: int) -> List[int]:
+        out = []
+        if not isinstance(payload, (bytes, bytearray)):
+            return out
+        size = len(payload)
+        beg = max(32, int(scan_start))
+        end = min(int(scan_end), size - 12)
+        if end <= beg:
+            return out
+        for coord_off in range(beg, end):
+            try:
+                x, y, z = struct.unpack_from("<fff", payload, coord_off)
+            except Exception:
+                continue
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+                continue
+            if max(abs(x), abs(y), abs(z)) > 5000000:
+                continue
+            if _sts_is_denorm_float(x) or _sts_is_denorm_float(y) or _sts_is_denorm_float(z):
+                continue
+            if max(abs(x), abs(y), abs(z)) < 20.0:
+                continue
+            if not _sts_has_valid_transform_at(payload, coord_off):
+                continue
+            if coord_off < 4 or (coord_off + 16) > size:
+                continue
+            try:
+                prev_w = float(struct.unpack_from("<f", payload, coord_off - 4)[0])
+                row_w = float(struct.unpack_from("<f", payload, coord_off + 12)[0])
+            except Exception:
+                continue
+            if (not math.isfinite(prev_w)) or (not math.isfinite(row_w)):
+                continue
+            if abs(prev_w) > 0.25:
+                continue
+            if abs(row_w - 1.0) > 0.25:
+                continue
+            out.append(int(coord_off))
+            if len(out) >= 4096:
+                break
+        return sorted(set(out))
+
+    def _all_transform_offsets_for_obj(obj: Dict[str, Any], payload: bytearray) -> List[int]:
+        if not isinstance(payload, bytearray):
+            return []
+
+        size = len(payload)
+        base_offs = _coord_offsets_for_obj(obj, payload)
+        off_set = set(base_offs)
+
+        def _ival(key: str, default: int = -1) -> int:
+            try:
+                return int(obj.get(key, default))
+            except Exception:
+                return default
+
+        start_off = _ival("start_off", -1)
+        end_off = _ival("end_off", -1)
+        if start_off >= 0 and end_off > start_off:
+            scan_beg = max(0, start_off)
+            scan_end = min(size, end_off)
+            try:
+                off_set.update(_collect_transform_offsets_in_range(payload, scan_beg, scan_end))
+            except Exception:
+                pass
+
+        # Fallback: capture nearby valid transform anchors around known offsets.
+        # Some vehicles have extra parts in nearby sub-blocks not listed in coord_offs.
+        anchor_xyz = None
+        if base_offs:
+            try:
+                anchor_xyz = struct.unpack_from("<fff", payload, int(base_offs[0]))
+            except Exception:
+                anchor_xyz = None
+
+        for base in base_offs[:16]:
+            win_beg = max(32, int(base) - 4096)
+            win_end = min(size, int(base) + 4096)
+            try:
+                nearby = _collect_transform_offsets_in_range(payload, win_beg, win_end)
+            except Exception:
+                nearby = []
+            if not nearby:
+                continue
+            if anchor_xyz is None:
+                off_set.update(nearby)
+                continue
+            ax, ay, az = anchor_xyz
+            for off in nearby:
+                try:
+                    x, y, z = struct.unpack_from("<fff", payload, int(off))
+                except Exception:
+                    continue
+                # Keep nearby parts of the same object cluster, avoid unrelated neighbors.
+                if (x - ax) * (x - ax) + (y - ay) * (y - ay) + (z - az) * (z - az) <= 80.0 * 80.0:
+                    off_set.add(int(off))
+
+        out = sorted(v for v in off_set if 0 <= int(v) <= max(0, size - 12))
+        if len(out) > 4096:
+            out = out[:4096]
+        return out
+
+    def _unstuck_selected():
+        if sts_state.get("is_loading"):
+            return show_info("Vehicles", "Wait for STS loading to finish first.")
+        units = _selected_edit_units()
+        if not units:
+            return show_info("Vehicles", "No vehicle/trailer selected.")
+
+        try:
+            lift = float(str(lift_var.get() or "0").strip())
+        except Exception:
+            return messagebox.showerror("Error", "Lift Y value is invalid.")
+        if abs(lift) < 1e-9:
+            return show_info("Vehicles", "Lift value is 0, nothing to apply.")
+
+        touched = set()
+        moved_parts = 0
+        for unit in units:
+            for obj in unit.get("members", []):
+                if not isinstance(obj, dict):
+                    continue
+                path = obj.get("file_path")
+                entry = sts_state["files"].get(path)
+                if not isinstance(entry, dict):
+                    continue
+                payload = entry.get("payload")
+                if not isinstance(payload, bytearray):
+                    continue
+
+                coord_offs = _all_transform_offsets_for_obj(obj, payload)
+                if not coord_offs:
+                    continue
+
+                # Shift all tracked transforms in this object together.
+                for off in coord_offs:
+                    try:
+                        cx, cy, cz = struct.unpack_from("<fff", payload, off)
+                    except Exception:
+                        continue
+                    struct.pack_into("<fff", payload, off, float(cx), float(cy + lift), float(cz))
+
+                obj["x"] = float(obj.get("x", 0.0))
+                obj["y"] = float(obj.get("y", 0.0)) + lift
+                obj["z"] = float(obj.get("z", 0.0))
+                touched.add(path)
+                moved_parts += 1
+
+        try:
+            saved = _save_touched_files(touched)
+        except Exception as e:
+            return messagebox.showerror("Error", str(e))
+        _rebuild_grouped_objects()
+        _refresh_filter_values()
+        _refresh_tree()
+        sts_status_var.set(
+            f"Unstuck applied to {len(units)} selected entries ({moved_parts} linked parts). Saved {saved} STS files."
+        )
+
+    def _apply_xyz_selected():
+        if sts_state.get("is_loading"):
+            return show_info("Vehicles", "Wait for STS loading to finish first.")
+        units = _selected_edit_units()
+        if not units:
+            return show_info("Vehicles", "No vehicle/trailer selected.")
+
+        sx = str(x_var.get() or "").strip()
+        sy = str(y_var.get() or "").strip()
+        sz = str(z_var.get() or "").strip()
+        if not sx and not sy and not sz:
+            return show_info("Vehicles", "X/Y/Z fields are empty.")
+
+        try:
+            vx = float(sx) if sx else None
+            vy = float(sy) if sy else None
+            vz = float(sz) if sz else None
+        except Exception:
+            return messagebox.showerror("Error", "X/Y/Z values are invalid.")
+
+        touched = set()
+        moved_parts = 0
+        for unit in units:
+            anchor = unit.get("anchor_obj")
+            if not isinstance(anchor, dict):
+                continue
+            ox = float(anchor.get("x", 0.0))
+            oy = float(anchor.get("y", 0.0))
+            oz = float(anchor.get("z", 0.0))
+            tx = ox if vx is None else float(vx)
+            ty = oy if vy is None else float(vy)
+            tz = oz if vz is None else float(vz)
+            dx = tx - ox
+            dy = ty - oy
+            dz = tz - oz
+
+            for obj in unit.get("members", []):
+                if not isinstance(obj, dict):
+                    continue
+                path = obj.get("file_path")
+                entry = sts_state["files"].get(path)
+                if not isinstance(entry, dict):
+                    continue
+                payload = entry.get("payload")
+                if not isinstance(payload, bytearray):
+                    continue
+
+                coord_offs = _all_transform_offsets_for_obj(obj, payload)
+                if not coord_offs:
+                    continue
+
+                # Apply anchor delta to all parts of this grouped object.
+                for off in coord_offs:
+                    try:
+                        cx, cy, cz = struct.unpack_from("<fff", payload, off)
+                    except Exception:
+                        continue
+                    struct.pack_into("<fff", payload, off, float(cx + dx), float(cy + dy), float(cz + dz))
+
+                obj["x"] = float(obj.get("x", 0.0)) + dx
+                obj["y"] = float(obj.get("y", 0.0)) + dy
+                obj["z"] = float(obj.get("z", 0.0)) + dz
+                touched.add(path)
+                moved_parts += 1
+
+        try:
+            saved = _save_touched_files(touched)
+        except Exception as e:
+            return messagebox.showerror("Error", str(e))
+        _rebuild_grouped_objects()
+        _refresh_filter_values()
+        _refresh_tree()
+        sts_status_var.set(
+            f"Custom XYZ applied to {len(units)} selected entries ({moved_parts} linked parts). Saved {saved} STS files."
+        )
+
+    def _delete_selected_entries():
+        if sts_state.get("is_loading"):
+            return show_info("Vehicles", "Wait for STS loading to finish first.")
+        units = _selected_edit_units()
+        if not units:
+            return show_info("Vehicles", "No vehicle/trailer selected.")
+
+        target_members = []
+        seen_member_ids = set()
+        for unit in units:
+            for obj in unit.get("members", []):
+                if not isinstance(obj, dict):
+                    continue
+                oid = id(obj)
+                if oid in seen_member_ids:
+                    continue
+                seen_member_ids.add(oid)
+                target_members.append(obj)
+
+        try:
+            ok = messagebox.askyesno(
+                "Delete selected entries?",
+                f"Delete {len(target_members)} selected map entries from STS files?\n\nThis cannot be undone without backup.",
+            )
+        except Exception:
+            ok = True
+        if not ok:
+            return
+
+        by_file = {}
+        for obj in target_members:
+            path = obj.get("file_path")
+            if not path:
+                continue
+            by_file.setdefault(path, []).append(obj)
+
+        touched = set()
+        deleted_obj_ids = set()
+        deleted_count = 0
+        skipped_count = 0
+
+        def _write_span_string(buf: bytearray, beg: int, end: int, seed_text: str, keep_guid_shape: bool = False) -> bool:
+            if beg < 0 or end <= beg:
+                return False
+            if beg >= len(buf):
+                return False
+            end2 = min(int(end), len(buf))
+            if end2 <= beg:
+                return False
+            span_len = int(end2 - beg)
+            if span_len <= 0:
+                return False
+            if span_len == 1:
+                try:
+                    buf[beg] = 0
+                    return True
+                except Exception:
+                    return False
+
+            text_len = span_len - 1  # keep terminating NUL byte in place
+            if keep_guid_shape and text_len == 38:
+                seed = "{00000000-0000-0000-0000-000000000000}"
+            else:
+                seed = str(seed_text or "deleted")
+            raw = bytearray(seed.encode("ascii", errors="ignore"))
+            if not raw:
+                raw = bytearray(b"deleted")
+
+            try:
+                # Fill with '_' then overlay seed text; this preserves exact span length.
+                fill = bytearray(b"_" * text_len)
+                lim = min(text_len, len(raw))
+                fill[:lim] = raw[:lim]
+                buf[beg:beg + text_len] = bytes(fill)
+                buf[beg + text_len] = 0
+                return True
+            except Exception:
+                return False
+
+        def _rewrite_all_cstring_occurrences(buf: bytearray, target_text: str, replacement_text: str) -> int:
+            target = str(target_text or "")
+            if not target:
+                return 0
+            try:
+                t_bytes = target.encode("ascii")
+            except Exception:
+                return 0
+            if not t_bytes:
+                return 0
+
+            repl = str(replacement_text or "")
+            try:
+                r_bytes = repl.encode("ascii")
+            except Exception:
+                r_bytes = b"deleted"
+            if not r_bytes:
+                r_bytes = b"deleted"
+
+            needle = t_bytes + b"\x00"
+            count = 0
+            pos = 0
+            max_pos = max(0, len(buf) - len(needle))
+            while pos <= max_pos:
+                idx = buf.find(needle, pos)
+                if idx < 0:
+                    break
+                span_len = len(t_bytes)
+                fill = bytearray(b"_" * span_len)
+                lim = min(span_len, len(r_bytes))
+                fill[:lim] = r_bytes[:lim]
+                try:
+                    buf[idx:idx + span_len] = bytes(fill)
+                    # keep terminal NUL unchanged
+                    count += 1
+                except Exception:
+                    pass
+                pos = idx + len(needle)
+            return count
+
+        def _invalidate_entry(payload: bytearray, obj: Dict[str, Any]) -> bool:
+            changed = False
+
+            def _ival(key: str, default: int = -1) -> int:
+                try:
+                    return int(obj.get(key, default))
+                except Exception:
+                    return default
+
+            start_off = _ival("start_off", -1)
+            end_off = _ival("end_off", -1)
+            # Keep binary length/layout stable: invalidate identifying strings/lengths in place.
+            type_beg = _ival("type_beg", -1)
+            type_end = _ival("type_end", -1)
+            obj_beg = _ival("obj_beg", -1)
+            obj_end = _ival("obj_end", -1)
+            guid_beg = _ival("guid_beg", -1)
+            guid_end = _ival("guid_end", -1)
+
+            def _zero_guid_literals_in_range(buf: bytearray, beg: int, end: int) -> int:
+                if beg < 0 or end <= beg or beg >= len(buf):
+                    return 0
+                e2 = min(int(end), len(buf))
+                if e2 <= beg:
+                    return 0
+                try:
+                    chunk = bytes(buf[beg:e2])
+                except Exception:
+                    return 0
+                # Match canonical GUID text with braces. Replace in-place with zero GUID text.
+                pat = re.compile(rb"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}")
+                repl = b"{00000000-0000-0000-0000-000000000000}"
+                count = 0
+                for m in pat.finditer(chunk):
+                    s = beg + int(m.start())
+                    t = s + 38
+                    if s < 0 or t > len(buf):
+                        continue
+                    try:
+                        if bytes(buf[s:t]) != repl:
+                            buf[s:t] = repl
+                            count += 1
+                    except Exception:
+                        pass
+                return count
+
+            # Keep binary structure and string lengths untouched.
+            # We only rewrite string content in-place so parser offsets stay valid.
+            if _write_span_string(payload, type_beg, type_end, "deleted_type"):
+                changed = True
+            if _write_span_string(payload, obj_beg, obj_end, "deleted_entry_id"):
+                changed = True
+            if _write_span_string(payload, guid_beg, guid_end, "deleted_guid", keep_guid_shape=True):
+                changed = True
+
+            # Rewrite all direct C-string occurrences of this object id / guid in the file.
+            type_id_value = str(obj.get("type_id", "") or "").strip()
+            if type_id_value:
+                if _rewrite_all_cstring_occurrences(payload, type_id_value, "deleted_type"):
+                    changed = True
+            object_id = str(obj.get("object_id", "") or "").strip()
+            if object_id:
+                if _rewrite_all_cstring_occurrences(payload, object_id, "deleted_entry_id"):
+                    changed = True
+            if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", object_id):
+                if _rewrite_all_cstring_occurrences(payload, object_id, "{00000000-0000-0000-0000-000000000000}"):
+                    changed = True
+            guid_value = str(obj.get("guid", "") or "").strip()
+            if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", guid_value):
+                if _rewrite_all_cstring_occurrences(payload, guid_value, "{00000000-0000-0000-0000-000000000000}"):
+                    changed = True
+            # Also scrub any GUID literals in this entry block (handles nested/variant refs).
+            if start_off >= 0 and end_off > start_off:
+                if _zero_guid_literals_in_range(payload, start_off, end_off):
+                    changed = True
+
+            return changed
+
+        for path, objs in by_file.items():
+            entry = sts_state["files"].get(path)
+            payload = entry.get("payload") if isinstance(entry, dict) else None
+            if not isinstance(payload, bytearray):
+                skipped_count += len(objs)
+                continue
+
+            for obj in objs:
+                try:
+                    ok_inv = _invalidate_entry(payload, obj)
+                except Exception:
+                    ok_inv = False
+                if ok_inv:
+                    deleted_count += 1
+                    deleted_obj_ids.add(id(obj))
+                    touched.add(path)
+                else:
+                    skipped_count += 1
+
+        if not touched:
+            return show_info("Vehicles", "Failed to delete selected entries.")
+
+        try:
+            saved = _save_touched_files(touched)
+        except Exception as e:
+            return messagebox.showerror("Error", str(e))
+
+        sts_state["raw_objects"] = [o for o in sts_state.get("raw_objects", []) if id(o) not in deleted_obj_ids]
+        _rebuild_grouped_objects()
+        _refresh_filter_values()
+        _refresh_tree()
+        sts_status_var.set(
+            f"Deleted {deleted_count} entries. Saved {saved} STS files."
+            + (f" Skipped {skipped_count}." if skipped_count else "")
+        )
+
+    def _on_type_or_region_filter_change(_event=None):
+        _refresh_filter_values()
+        _refresh_tree()
+
+    def _on_map_filter_change(_event=None):
+        _refresh_tree()
+
+    def _on_name_filter_change(_event=None):
+        _refresh_filter_values()
+        _refresh_tree()
+
+    type_filter_cb.bind("<<ComboboxSelected>>", _on_type_or_region_filter_change)
+    region_filter_cb.bind("<<ComboboxSelected>>", _on_type_or_region_filter_change)
+    map_filter_cb.bind("<<ComboboxSelected>>", _on_map_filter_change)
+    name_filter_entry.bind("<KeyRelease>", _on_name_filter_change)
+
+    ttk.Button(edit_row, text="Select Filtered", command=_select_filtered_rows).pack(side="left", padx=(0, 8))
+    ttk.Button(edit_row, text="Unselect Filtered", command=_unselect_filtered_rows).pack(side="left", padx=(0, 8))
+    ttk.Button(edit_row, text="Delete Selected", command=_delete_selected_entries).pack(side="left", padx=(0, 12))
+    ttk.Button(edit_row, text="Unstuck Selected (+Y)", command=_unstuck_selected).pack(side="left", padx=(0, 8))
+    ttk.Button(edit_row, text="Apply Custom XYZ", command=_apply_xyz_selected).pack(side="left")
+    ttk.Checkbutton(
+        edit_row,
+        text="Filter X0 Y0 Z0",
+        variable=filter_zero_var,
+        command=_on_type_or_region_filter_change,
+    ).pack(side="left", padx=(12, 0))
+
+    def _on_save_path_changed():
+        path = save_path_var.get()
+        if path and os.path.exists(path):
+            _clear_sts_view("Loading STS objects in background...")
+            _load_sts_objects(manual=False)
+        else:
+            _clear_sts_view("Select a valid save file to load STS objects.")
+
+    def _on_tab_visible(_event=None):
+        _refresh_vehicle_metadata_in_background(force=False)
+        path = save_path_var.get()
+        if not path or not os.path.exists(path):
+            return
+        if sts_state.get("is_loading"):
+            return
+        # Always keep data fresh when this tab becomes visible.
+        _load_sts_objects(manual=False)
+
+    _on_save_path_changed()
+    try:
+        tab.after(1200, lambda: _refresh_vehicle_metadata_in_background(force=False))
+    except Exception:
+        pass
+    tab.bind("<Visibility>", _on_tab_visible)
+    _trace_var_write(save_path_var, _on_save_path_changed)
+# =============================================================================
+# SECTION: Objective-State Helpers (used by Objectives+)
+# Used In: Objectives+ task accept/re-accept and objective status operations
+# =============================================================================
+def _experiments_dedupe_ids(ids):
+    seen = set()
+    out = []
+    for raw in ids or []:
+        if raw is None:
+            continue
+        value = str(raw).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _experiments_clean_text(value):
+    text = "" if value is None else str(value)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _experiments_is_likely_token(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if text.startswith("UI_") or text.startswith("EXP_"):
+        return True
+    if re.fullmatch(r"[A-Z0-9_]+", text):
+        return True
+    if re.fullmatch(r"(level_)?[a-z]{2}_\d{2}(?:_\d{2})?(?:_name|_desc)?", text):
+        return True
+    return False
+
+
+def _experiments_translate_token(token, localization):
+    tok = str(token or "").strip()
+    if not tok:
+        return ""
+    if not isinstance(localization, dict) or not localization:
+        return tok
+
+    candidates = [tok]
+    if tok.startswith("EXP_"):
+        candidates.append(tok[4:])
+    else:
+        candidates.append("EXP_" + tok)
+    if tok.startswith("UI_") and not tok.startswith("EXP_UI_"):
+        candidates.append("EXP_" + tok)
+    if tok.endswith("_NAME"):
+        candidates.append(tok[:-5])
+    if tok.endswith("_DESC"):
+        candidates.append(tok[:-5])
+
+    for candidate in list(candidates):
+        if candidate:
+            candidates.append(candidate.upper())
+            candidates.append(candidate.lower())
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate in localization:
+            return _experiments_clean_text(localization.get(candidate))
+
+    return tok
+
+
+def _experiments_humanize_objective_key(objective_id):
+    oid = str(objective_id or "").strip()
+    if not oid:
+        return ""
+    parts = [p for p in oid.split("_") if p]
+    if len(parts) > 3 and parts[1].isdigit() and parts[2].isdigit():
+        parts = parts[3:]
+    if parts and parts[-1] in {"TSK", "OBJ", "CNT", "CONTRACT"}:
+        parts = parts[:-1]
+    if not parts:
+        return oid
+    return _experiments_clean_text(" ".join(p.capitalize() for p in parts))
+
+
+def _experiments_load_objective_index():
+    """
+    Load objective index rows from maprunner_data.csv.
+    Returns a list of normalized rows.
+    """
+    csv_path = resource_path("maprunner_data.csv")
+    if not os.path.exists(csv_path):
+        return []
+
+    localization = {}
+
+    rows = []
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key = str(row.get("key", "")).strip()
+                if not key:
+                    continue
+
+                raw_display = str(row.get("displayName", "")).strip()
+                display = _experiments_translate_token(raw_display, localization)
+                if not display or _experiments_is_likely_token(display):
+                    display = _experiments_humanize_objective_key(key)
+
+                region_code = str(row.get("region", "")).strip()
+                raw_region_name = str(row.get("region_name", "")).strip() or REGION_NAME_MAP.get(region_code, "")
+                region_name = _experiments_translate_token(raw_region_name, localization)
+                if not region_name or _experiments_is_likely_token(region_name):
+                    region_name = REGION_NAME_MAP.get(region_code, raw_region_name or region_code)
+
+                raw_desc = str(row.get("descriptionText", "")).strip()
+                description = _experiments_translate_token(raw_desc, localization)
+                description = _experiments_clean_text(description)
+                if _experiments_is_likely_token(description):
+                    description = ""
+
+                rows.append(
+                    {
+                        "key": key,
+                        "displayName": display or key,
+                        "category": str(row.get("category", "")).strip(),
+                        "region": region_code,
+                        "region_name": region_name,
+                        "type": str(row.get("type", "")).strip(),
+                        "cargo_needed": str(row.get("cargo_needed", "")).strip(),
+                        "descriptionText": description,
+                    }
+                )
+    except Exception as e:
+        print(f"[Experiments] Failed to read maprunner_data.csv: {e}")
+        return []
+
+    dedup = {}
+    for row in rows:
+        k = row["key"]
+        if k not in dedup:
+            dedup[k] = row
+    return list(dedup.values())
+
+
+_EXPERIMENTS_OBJECTIVE_ROW_BY_KEY = None
+
+
+def _experiments_get_objective_row_by_key():
+    global _EXPERIMENTS_OBJECTIVE_ROW_BY_KEY
+    if isinstance(_EXPERIMENTS_OBJECTIVE_ROW_BY_KEY, dict):
+        return _EXPERIMENTS_OBJECTIVE_ROW_BY_KEY
+    rows = _experiments_load_objective_index()
+    mapping = {}
+    for row in rows:
+        key = str(row.get("key", "")).strip()
+        if key and key not in mapping:
+            mapping[key] = row
+    _EXPERIMENTS_OBJECTIVE_ROW_BY_KEY = mapping
+    return mapping
+
+
+def _experiments_is_task_objective(objective_id, row_by_key=None, meta_kind=None):
+    oid = str(objective_id or "").strip()
+    if not oid:
+        return False
+
+    mapping = row_by_key if isinstance(row_by_key, dict) else _experiments_get_objective_row_by_key()
+    row = mapping.get(oid, {})
+    if isinstance(row, dict):
+        category = str(row.get("category", "") or "").strip().upper()
+        if "TASK" in category:
+            return True
+        if "CONTRACT" in category or "CONTEST" in category:
+            return False
+
+    kind_map = meta_kind if isinstance(meta_kind, dict) else _experiments_load_meta_objective_kind()
+    kind = str(kind_map.get(oid, "") or "").strip().lower()
+    if kind == "task":
+        return True
+    if kind in {"contract", "contest"}:
+        return False
+
+    # Fallback by common SnowRunner suffix naming.
+    upper = oid.upper()
+    if upper.endswith("_TSK"):
+        return True
+    if upper.endswith("_OBJ") or upper.endswith("_CNT"):
+        return False
+
+    return False
+
+
+def _experiments_find_save_keys(doc):
+    keys = []
+    if not isinstance(doc, dict):
+        return keys
+    for k, v in doc.items():
+        if isinstance(k, str) and re.fullmatch(r"CompleteSave\d*", k) and isinstance(v, dict):
+            keys.append(k)
+    return keys
+
+
+def _experiments_read_save_doc(path):
+    with open(path, "r", encoding="utf-8") as f:
+        raw = f.read()
+    had_null = raw.endswith("\0")
+    clean = raw.rstrip("\0")
+    doc = json.loads(clean)
+    save_keys = _experiments_find_save_keys(doc)
+    if not save_keys:
+        raise ValueError("No CompleteSave* block found in file.")
+    return doc, had_null, save_keys
+
+
+def _experiments_write_save_doc(path, doc, had_null=False):
+    out = json.dumps(doc, separators=(",", ":"), ensure_ascii=False)
+    if had_null:
+        out += "\0"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(out)
+
+
+def _experiments_iter_ssl_values(doc, save_keys):
+    for save_key in save_keys:
+        save_obj = doc.get(save_key)
+        if not isinstance(save_obj, dict):
+            continue
+        ssl_value = save_obj.get("SslValue")
+        if not isinstance(ssl_value, dict):
+            ssl_value = {}
+            save_obj["SslValue"] = ssl_value
+        yield save_key, save_obj, ssl_value
+
+
+_EXPERIMENTS_JS_OBJECTIVE_INDEX = None
+_EXPERIMENTS_JS_LOCALIZATION = None
+_EXPERIMENTS_JS_LOAD_INFO = None
+_EXPERIMENTS_META_OBJECTIVE_KIND = None
+
+
+def _experiments_extract_json_parse_payload(text):
+    """
+    Extract JSON.parse('<payload>') payload from a JS bundle.
+    """
+    if not text:
+        return None
+    idx = text.find("JSON.parse")
+    if idx < 0:
+        return None
+    i = text.find("(", idx)
+    if i < 0:
+        return None
+    j = i + 1
+    while j < len(text) and text[j].isspace():
+        j += 1
+    if j >= len(text) or text[j] not in ("'", '"'):
+        return None
+    raw = _mr_extract_js_string_literal(text, j)
+    if raw is None:
+        return None
+    try:
+        return codecs.decode(raw.replace(r"\/", "/"), "unicode_escape")
+    except Exception:
+        return raw
+
+
+def _experiments_load_js_objective_sources(force_reload=False):
+    """
+    Load objective definitions/localization for objective-state seeding.
+    Priority:
+      1) MapRunner in-memory canonical JS (`data.js` / `desc.js`) if available.
+      2) Cached canonical JS saved by Objectives+ from earlier online runs.
+      3) Fresh MapRunner fetch + role detection (handles random chunk names).
+    """
+    global _EXPERIMENTS_JS_OBJECTIVE_INDEX, _EXPERIMENTS_JS_LOCALIZATION, _EXPERIMENTS_JS_LOAD_INFO
+
+    if (
+        not force_reload
+        and isinstance(_EXPERIMENTS_JS_OBJECTIVE_INDEX, dict)
+        and isinstance(_EXPERIMENTS_JS_LOCALIZATION, dict)
+        and isinstance(_EXPERIMENTS_JS_LOAD_INFO, dict)
+    ):
+        return _EXPERIMENTS_JS_OBJECTIVE_INDEX, _EXPERIMENTS_JS_LOCALIZATION, _EXPERIMENTS_JS_LOAD_INFO
+
+    objective_index = {}
+    localization = {}
+    info = {
+        "data_path": "",
+        "desc_path": "",
+        "data_entries": 0,
+        "localization_entries": 0,
+    }
+
+    def _merge_objective_entries(arr):
+        if not isinstance(arr, list):
+            return
+        for entry in arr:
+            if not isinstance(entry, dict):
+                continue
+            key = str(entry.get("key", "")).strip()
+            if key and key not in objective_index:
+                objective_index[key] = entry
+
+    def _parse_data_text(text):
+        payload = _experiments_extract_json_parse_payload(text)
+        if not payload:
+            return 0
+        try:
+            arr = json.loads(payload)
+        except Exception:
+            return 0
+        before = len(objective_index)
+        _merge_objective_entries(arr)
+        return max(0, len(objective_index) - before)
+
+    def _parse_desc_text(text):
+        parsed = _mr_parse_localization_from_desc_text(text) or {}
+        if not parsed:
+            return 0
+        if not localization:
+            localization.update(parsed)
+        else:
+            for k, v in parsed.items():
+                if k not in localization:
+                    localization[k] = v
+        return len(parsed)
+
+    def _try_parse_canonical_mr_sources():
+        parsed_any = False
+        try:
+            _mr_choose_best_js_roles()
+        except Exception:
+            pass
+
+        try:
+            data_bs = _mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["data"])
+            data_text = _mr_decode_bytes_to_text(data_bs) if data_bs is not None else None
+            if data_text:
+                added = _parse_data_text(data_text)
+                if added > 0 and not info["data_path"]:
+                    info["data_path"] = "in-memory:data.js"
+                    parsed_any = True
+        except Exception:
+            pass
+
+        try:
+            desc_bs = _mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["desc"])
+            desc_text = _mr_decode_bytes_to_text(desc_bs) if desc_bs is not None else None
+            if desc_text:
+                parsed = _parse_desc_text(desc_text)
+                if parsed > 0 and not info["desc_path"]:
+                    info["desc_path"] = "in-memory:desc.js"
+                    parsed_any = True
+        except Exception:
+            pass
+        return parsed_any
+
+    # 1) First try already-loaded MapRunner canonical sources.
+    _try_parse_canonical_mr_sources()
+
+    # 2) Try cached canonical JS (saved by previous Objectives+ fetch).
+    if not objective_index or not localization:
+        try:
+            loaded_cached = _mr_load_cached_canonical_js_to_mem()
+            if loaded_cached:
+                if "data" in loaded_cached and not info["data_path"]:
+                    info["data_path"] = f"cache:{os.path.basename(loaded_cached['data'])}"
+                if "desc" in loaded_cached and not info["desc_path"]:
+                    info["desc_path"] = f"cache:{os.path.basename(loaded_cached['desc'])}"
+            _try_parse_canonical_mr_sources()
+        except Exception:
+            pass
+
+    # 3) If still missing, fetch/resolve MapRunner JS roles (random chunk names supported).
+    if not objective_index or not localization:
+        try:
+            _mr_download_js_step()
+            _try_parse_canonical_mr_sources()
+        except Exception:
+            pass
+
+    info["data_entries"] = len(objective_index)
+    info["localization_entries"] = len(localization)
+
+    _EXPERIMENTS_JS_OBJECTIVE_INDEX = objective_index
+    _EXPERIMENTS_JS_LOCALIZATION = localization
+    _EXPERIMENTS_JS_LOAD_INFO = info
+    return objective_index, localization, info
+
+
+def _experiments_load_meta_objective_kind():
+    """
+    Parse meta_desc_ssl.ps and map objective id -> kind:
+      task / contract / contest
+    """
+    global _EXPERIMENTS_META_OBJECTIVE_KIND
+    if isinstance(_EXPERIMENTS_META_OBJECTIVE_KIND, dict):
+        return _EXPERIMENTS_META_OBJECTIVE_KIND
+
+    kind_map = {}
+    path = ""
+    try:
+        path = resource_path("meta_desc_ssl.ps")
+    except Exception:
+        path = ""
+
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+            pattern = re.compile(
+                r'__type\s*=\s*"(TaskSettings|ContractSettings|ContestSettings)"[\s\S]{0,420}?__sslBrandName\s*=\s*"([A-Z0-9_]+)"',
+                flags=re.IGNORECASE,
+            )
+            for m in pattern.finditer(text):
+                raw_type = str(m.group(1) or "").strip().lower()
+                obj_id = str(m.group(2) or "").strip()
+                if not obj_id:
+                    continue
+                if raw_type.startswith("task"):
+                    kind = "task"
+                elif raw_type.startswith("contract"):
+                    kind = "contract"
+                elif raw_type.startswith("contest"):
+                    kind = "contest"
+                else:
+                    continue
+                if obj_id not in kind_map:
+                    kind_map[obj_id] = kind
+        except Exception as e:
+            print(f"[Experiments] Failed to parse meta_desc_ssl.ps: {e}")
+
+    _EXPERIMENTS_META_OBJECTIVE_KIND = kind_map
+    return kind_map
+
+
+def _experiments_parse_id_collection(raw):
+    if isinstance(raw, dict):
+        shape = "dict"
+        items = list(raw.keys())
+    elif isinstance(raw, list):
+        shape = "list"
+        items = [x for x in raw if isinstance(x, str)]
+    else:
+        shape = "list"
+        items = []
+    return shape, _experiments_dedupe_ids(items)
+
+
+def _experiments_pack_id_collection(shape, items):
+    if shape == "dict":
+        return {k: True for k in items}
+    return list(items)
+
+
+def _experiments_add_ids_to_collection(raw, ids):
+    shape, items = _experiments_parse_id_collection(raw)
+    ids = _experiments_dedupe_ids(ids)
+    if not ids:
+        return _experiments_pack_id_collection(shape, items), 0
+    seen = set(items)
+    added = 0
+    for oid in ids:
+        if oid in seen:
+            continue
+        items.append(oid)
+        seen.add(oid)
+        added += 1
+    return _experiments_pack_id_collection(shape, items), added
+
+
+def _experiments_remove_ids_from_collection(raw, ids):
+    shape, items = _experiments_parse_id_collection(raw)
+    ids_set = set(_experiments_dedupe_ids(ids))
+    if not ids_set:
+        return _experiments_pack_id_collection(shape, items), 0
+    new_items = [x for x in items if x not in ids_set]
+    removed = len(items) - len(new_items)
+    return _experiments_pack_id_collection(shape, new_items), removed
+
+
+def _experiments_guess_map_from_objective_id(objective_id):
+    oid = str(objective_id or "").strip()
+    if not oid:
+        return ""
+
+    parts = oid.split("_")
+    if len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
+        return f"level_{parts[0].lower()}_{parts[1]}_{parts[2]}"
+
+    m = re.search(r"(US|RU)_(\d{2})_(\d{2})", oid, flags=re.IGNORECASE)
+    if m:
+        return f"level_{m.group(1).lower()}_{m.group(2)}_{m.group(3)}"
+
+    return ""
+
+
+def _experiments_guess_zone_from_objective_id(objective_id):
+    oid = str(objective_id or "").strip()
+    if not oid:
+        return ""
+
+    base = re.sub(r"_(TSK|OBJ|CNT)$", "", oid, flags=re.IGNORECASE)
+    if base:
+        return base
+    return oid
+
+
+_EXPERIMENTS_KNOWN_CARGO_TYPES = {
+    "CargoMetalPlanks",
+    "CargoWoodenPlanks",
+    "CargoWoodenPlanks2",
+    "CargoBricks",
+    "CargoConcreteBlocks",
+    "CargoConcreteSlab",
+    "CargoServiceSpareParts",
+    "CargoServiceSparePartsSpecial",
+    "CargoVehiclesSpareParts",
+    "CargoCrateLarge",
+    "CargoBigDrill",
+    "CargoBarrels",
+    "CargoBarrelsOil",
+    "CargoContainerSmall",
+    "CargoContainerSmallSpecial",
+    "CargoContainerLarge",
+    "CargoContainerLargeDrilling",
+    "CargoBags",
+    "CargoPipesSmall",
+    "CargoPipesMedium",
+    "CargoPipeLarge",
+    "CargoRadioactive",
+}
+
+
+_EXPERIMENTS_CARGO_ALIAS = {
+    "metalplanks": "CargoMetalPlanks",
+    "woodenplanks": "CargoWoodenPlanks2",
+    "bricks": "CargoBricks",
+    "blocks": "CargoConcreteBlocks",
+    "concreteblocks": "CargoConcreteBlocks",
+    "concreteslab": "CargoConcreteSlab",
+    "servicespareparts": "CargoServiceSpareParts",
+    "vehiclesspareparts": "CargoVehiclesSpareParts",
+    "cratelarge": "CargoCrateLarge",
+    "bigdrill": "CargoBigDrill",
+    "barrels": "CargoBarrels",
+    "oilbarrels": "CargoBarrelsOil",
+    "containersmall": "CargoContainerSmall",
+    "containerlarge": "CargoContainerLarge",
+    "bags": "CargoBags",
+    "smallpipes": "CargoPipesSmall",
+    "pipessmall": "CargoPipesSmall",
+    "mediumpipes": "CargoPipesMedium",
+    "pipesmedium": "CargoPipesMedium",
+    "largepipes": "CargoPipeLarge",
+    "pipeslarge": "CargoPipeLarge",
+}
+
+
+def _experiments_normalize_key_token(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _experiments_guess_cargo_type(label):
+    raw = str(label or "").strip()
+    if not raw:
+        return None
+
+    if raw.startswith("Cargo") and re.fullmatch(r"Cargo[A-Za-z0-9_]+", raw):
+        return raw
+
+    norm = _experiments_normalize_key_token(raw)
+    alias = _EXPERIMENTS_CARGO_ALIAS.get(norm)
+    if alias:
+        return alias
+
+    camel = re.sub(r"[^A-Za-z0-9]+", " ", raw).strip()
+    if camel:
+        camel = "".join(p[:1].upper() + p[1:] for p in camel.split() if p)
+        candidate = "Cargo" + camel
+        if candidate in _EXPERIMENTS_KNOWN_CARGO_TYPES:
+            return candidate
+
+    for known in _EXPERIMENTS_KNOWN_CARGO_TYPES:
+        if _experiments_normalize_key_token(known.replace("Cargo", "")) == norm:
+            return known
+
+    return None
+
+
+def _experiments_parse_cargo_needed(cargo_needed_text):
+    """
+    Parse maprunner cargo string like:
+      "2× Concrete Slab; 1× Metal Planks"
+    into list of (count, cargo_type).
+    """
+    text = str(cargo_needed_text or "").strip()
+    if not text:
+        return []
+
+    items = []
+    chunks = [c.strip() for c in re.split(r"[;,]+", text) if c.strip()]
+    for chunk in chunks:
+        m = re.match(r"^\s*(\d+)\s*[x×]\s*(.+?)\s*$", chunk, flags=re.IGNORECASE)
+        if m:
+            count = max(1, int(m.group(1)))
+            label = m.group(2).strip()
+        else:
+            count = 1
+            label = chunk
+
+        cargo_type = _experiments_guess_cargo_type(label)
+        if not cargo_type:
+            continue
+        items.append((count, cargo_type))
+    return items
+
+
+def _experiments_collect_marker_data(markers, objective_id):
+    zones = []
+    level_name = ""
+    for marker in markers or []:
+        if not isinstance(marker, dict):
+            continue
+        zone = str(marker.get("key", "")).strip()
+        if zone:
+            zones.append(zone)
+        if not level_name:
+            lv = str(marker.get("level", "")).strip()
+            if not lv:
+                lv = str(marker.get("map", "")).strip()
+            if lv:
+                level_name = lv
+
+    zones = _experiments_dedupe_ids(zones)
+    if not level_name:
+        level_name = _experiments_guess_map_from_objective_id(objective_id)
+    if not zones:
+        fallback_zone = _experiments_guess_zone_from_objective_id(objective_id)
+        if fallback_zone:
+            zones = [fallback_zone]
+    return level_name, zones
+
+
+def _experiments_build_stage_from_js(stage_def, root_markers, objective_id):
+    stage = stage_def if isinstance(stage_def, dict) else {}
+    markers = stage.get("markers")
+    if not isinstance(markers, list):
+        markers = root_markers if isinstance(root_markers, list) else []
+
+    map_name, zones = _experiments_collect_marker_data(markers, objective_id)
+
+    cargo_actions = []
+    cargo_items = stage.get("cargo")
+    if isinstance(cargo_items, list):
+        for cargo in cargo_items:
+            if not isinstance(cargo, dict):
+                continue
+            cargo_type = str(cargo.get("key", "")).strip()
+            if not cargo_type:
+                cargo_type = _experiments_guess_cargo_type(cargo.get("name", ""))
+            if not cargo_type:
+                continue
+            raw_count = cargo.get("count", 1)
+            try:
+                aim_value = int(float(raw_count))
+            except Exception:
+                aim_value = 1
+            if aim_value <= 0:
+                aim_value = 1
+
+            cargo_actions.append(
+                {
+                    "cargoState": {"aimValue": aim_value, "type": cargo_type, "curValue": 0},
+                    "map": map_name or "",
+                    "zones": list(zones),
+                    "zoneColorOverride": {"r": 0.0, "g": 185.0, "b": 25.0, "a": 125.0},
+                    "isZoneVisited": False,
+                    "platformColorOverride": None,
+                    "modelBuildingTag": "",
+                    "isNeedVisitOnTruck": False,
+                    "truckUid": "",
+                    "platformId": "",
+                    "isVisibleWithPlatform": False,
+                    "unloadingMode": 0,
+                }
+            )
+
+    truck_delivery_states = []
+    stage_type = str(stage.get("type", "") or "").strip()
+    nested = stage.get("objectives")
+    if isinstance(nested, list) and (stage_type == "truckDelivery" or any(isinstance(x, dict) and x.get("key") for x in nested)):
+        for item in nested:
+            if not isinstance(item, dict):
+                continue
+            truck_id = str(item.get("key", "")).strip()
+            if not truck_id:
+                continue
+            truck_delivery_states.append(
+                {
+                    "isDelivered": False,
+                    "truckId": truck_id,
+                    "deliveryZones": list(zones),
+                    "mapDelivery": map_name or "",
+                }
+            )
+    elif stage_type == "truckDelivery":
+        truck_delivery_states.append(
+            {
+                "isDelivered": False,
+                "truckId": "",
+                "deliveryZones": list(zones),
+                "mapDelivery": map_name or "",
+            }
+        )
+
+    visit_all = None
+    if not cargo_actions and not truck_delivery_states and map_name and zones:
+        visit_all = {
+            "map": map_name,
+            "zoneStates": [
+                {
+                    "zone": zone,
+                    "truckUid": "",
+                    "isVisited": False,
+                    "isVisitWithCertainTruck": False,
+                }
+                for zone in zones
+            ],
+        }
+
+    return {
+        "cargoDeliveryActions": cargo_actions,
+        "makeActionInZone": None,
+        "farmingState": None,
+        "truckDeliveryStates": truck_delivery_states,
+        "truckRepairStates": [],
+        "changeTruckState": None,
+        "cargoSpawnState": [],
+        "livingAreaState": None,
+        "visitAllZonesState": visit_all,
+    }
+
+
+def _experiments_build_stage_states_from_js_objective(objective_id):
+    objective_index, _, _ = _experiments_load_js_objective_sources()
+    entry = objective_index.get(str(objective_id))
+    if not isinstance(entry, dict):
+        return []
+
+    root_markers = entry.get("markers")
+    if not isinstance(root_markers, list):
+        root_markers = []
+
+    stage_defs = entry.get("objectives")
+    stage_states = []
+    if isinstance(stage_defs, list):
+        for stage_def in stage_defs:
+            if not isinstance(stage_def, dict):
+                continue
+            stage_state = _experiments_build_stage_from_js(stage_def, root_markers, objective_id)
+            stage_states.append(stage_state)
+
+    if not stage_states and root_markers:
+        stage_states.append(_experiments_build_stage_from_js({"markers": root_markers}, root_markers, objective_id))
+
+    return stage_states
+
+
+def _experiments_build_placeholder_stage_state(objective_id):
+    level_name = _experiments_guess_map_from_objective_id(objective_id)
+    zone_name = _experiments_guess_zone_from_objective_id(objective_id)
+    objective_row = _experiments_get_objective_row_by_key().get(str(objective_id), {})
+    objective_type = str(objective_row.get("type", "") or "").strip()
+    if not objective_type:
+        meta_kind = _experiments_load_meta_objective_kind().get(str(objective_id), "")
+        if meta_kind == "contest":
+            objective_type = "exploration"
+    cargo_needed = objective_row.get("cargo_needed", "")
+
+    visit_all = None
+    if level_name and zone_name:
+        visit_all = {
+            "map": level_name,
+            "zoneStates": [
+                {
+                    "zone": zone_name,
+                    "truckUid": "",
+                    "isVisited": False,
+                    "isVisitWithCertainTruck": False,
+                }
+            ],
+        }
+
+    cargo_actions = []
+    if objective_type == "cargoDelivery":
+        for count, cargo_type in _experiments_parse_cargo_needed(cargo_needed):
+            cargo_actions.append(
+                {
+                    "cargoState": {"aimValue": count, "type": cargo_type, "curValue": 0},
+                    "map": level_name or "",
+                    "zones": [zone_name] if zone_name else [],
+                    "zoneColorOverride": {"r": 0.0, "g": 185.0, "b": 25.0, "a": 125.0},
+                    "isZoneVisited": False,
+                    "platformColorOverride": None,
+                    "modelBuildingTag": "",
+                    "isNeedVisitOnTruck": False,
+                    "truckUid": "",
+                    "platformId": "",
+                    "isVisibleWithPlatform": False,
+                    "unloadingMode": 0,
+                }
+            )
+
+    truck_delivery_states = []
+    if objective_type == "truckDelivery":
+        truck_delivery_states.append(
+            {
+                "isDelivered": False,
+                "truckId": "",
+                "deliveryZones": [zone_name] if zone_name else [],
+                "mapDelivery": level_name or "",
+            }
+        )
+
+    return {
+        "cargoDeliveryActions": cargo_actions,
+        "makeActionInZone": None,
+        "farmingState": None,
+        "truckDeliveryStates": truck_delivery_states,
+        "truckRepairStates": [],
+        "changeTruckState": None,
+        "cargoSpawnState": [],
+        "livingAreaState": None,
+        "visitAllZonesState": visit_all if objective_type == "exploration" else None,
+    }
+
+
+def _experiments_seed_objective_state_with_source(objective_id, stage_mode="none"):
+    """
+    stage_mode:
+      - 'none': no stagesState key (let game generate from objective defs)
+      - 'placeholder': inject a non-completing stage (prefer JS-based mission stages)
+    """
+    state = {
+        "failReasons": {},
+        "id": objective_id,
+        "spentTime": 0.0,
+        "isTimerStarted": True,
+        "isFinished": False,
+        "wasCompletedAtLeastOnce": False,
+    }
+
+    source = "none"
+    mode = str(stage_mode or "none").strip().lower()
+    if mode == "placeholder":
+        js_stages = _experiments_build_stage_states_from_js_objective(objective_id)
+        if js_stages:
+            state["stagesState"] = js_stages
+            source = "js"
+        else:
+            state["stagesState"] = [_experiments_build_placeholder_stage_state(objective_id)]
+            source = "fallback"
+
+    return state, source
+
+
+def _experiments_seed_objective_state(objective_id, stage_mode="none"):
+    state, _ = _experiments_seed_objective_state_with_source(objective_id, stage_mode=stage_mode)
+    return state
+
+
+def _experiments_apply_to_save(path, mutator, create_backup=True):
+    if not path or not os.path.exists(path):
+        messagebox.showerror("Error", "Save file not found.")
+        return None
+
+    if create_backup:
+        try:
+            make_backup_if_enabled(path)
+        except Exception as e:
+            print(f"[Experiments] Backup warning: {e}")
+
+    try:
+        doc, had_null, save_keys = _experiments_read_save_doc(path)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to parse save file:\n{e}")
+        return None
+
+    stats = {"blocks": 0}
+    try:
+        for _, _, ssl_value in _experiments_iter_ssl_values(doc, save_keys):
+            stats["blocks"] += 1
+            mutator(ssl_value, stats)
+        _experiments_write_save_doc(path, doc, had_null=had_null)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to apply experiment change:\n{e}")
+        return None
+
+    return stats
+
+
+def _experiments_accept_objectives(
+    path,
+    objective_ids,
+    add_discovered=True,
+    seed_states=True,
+    seed_stage_mode="placeholder",
+    reset_to_unfinished=True,
+    touch_existing_states=False,
+    remove_from_finished=True,
+    remove_from_viewed=True,
+    track_first=False,
+    trust_ids_as_tasks=False,
+):
+    all_ids = _experiments_dedupe_ids(objective_ids)
+    if not all_ids:
+        return None
+
+    if trust_ids_as_tasks:
+        ids = list(all_ids)
+        non_task_skipped = 0
+    else:
+        row_by_key = _experiments_get_objective_row_by_key()
+        meta_kind = _experiments_load_meta_objective_kind()
+        ids = [oid for oid in all_ids if _experiments_is_task_objective(oid, row_by_key=row_by_key, meta_kind=meta_kind)]
+        non_task_skipped = max(0, len(all_ids) - len(ids))
+    if not ids:
+        return {"blocks": 0, "ids_skipped_non_tasks": non_task_skipped}
+
+    def _mutator(ssl_value, stats):
+        stats.setdefault("discovered_added", 0)
+        stats.setdefault("states_seeded", 0)
+        stats.setdefault("states_seeded_js", 0)
+        stats.setdefault("states_seeded_fallback", 0)
+        stats.setdefault("states_touched", 0)
+        stats.setdefault("finished_removed", 0)
+        stats.setdefault("viewed_removed", 0)
+        stats.setdefault("tracked_set", 0)
+        stats.setdefault("ids_skipped_finished", 0)
+        if "ids_skipped_non_tasks" not in stats:
+            stats["ids_skipped_non_tasks"] = non_task_skipped
+
+        finished_raw = ssl_value.get("finishedObjs", [])
+        _, finished_ids = _experiments_parse_id_collection(finished_raw)
+        finished_set = set(finished_ids)
+        active_ids = [oid for oid in ids if oid not in finished_set]
+        stats["ids_skipped_finished"] += max(0, len(ids) - len(active_ids))
+
+        if not active_ids:
+            return
+
+        if add_discovered:
+            new_raw, added = _experiments_add_ids_to_collection(ssl_value.get("discoveredObjectives", []), active_ids)
+            ssl_value["discoveredObjectives"] = new_raw
+            stats["discovered_added"] += added
+
+        states = ssl_value.get("objectiveStates")
+        if not isinstance(states, dict):
+            states = {}
+
+        for oid in active_ids:
+            state = states.get(oid)
+            is_new_state = False
+            if not isinstance(state, dict):
+                if not seed_states:
+                    continue
+                state, seeded_source = _experiments_seed_objective_state_with_source(oid, stage_mode=seed_stage_mode)
+                if seeded_source == "js":
+                    stats["states_seeded_js"] += 1
+                elif seeded_source == "fallback":
+                    stats["states_seeded_fallback"] += 1
+                states[oid] = state
+                stats["states_seeded"] += 1
+                is_new_state = True
+
+            state["id"] = oid
+            if "failReasons" not in state or not isinstance(state.get("failReasons"), dict):
+                state["failReasons"] = {}
+            if "spentTime" not in state:
+                state["spentTime"] = 0.0
+            if "isTimerStarted" not in state:
+                state["isTimerStarted"] = True
+
+            if reset_to_unfinished and (is_new_state or touch_existing_states):
+                state["isFinished"] = False
+                state["wasCompletedAtLeastOnce"] = False
+                state["isTimerStarted"] = True
+
+            stats["states_touched"] += 1
+
+        ssl_value["objectiveStates"] = states
+
+        if remove_from_finished:
+            # Safeguard: never remove objectives that are already finished in this block.
+            removable = [oid for oid in active_ids if oid not in finished_set]
+            if removable:
+                new_finished, removed = _experiments_remove_ids_from_collection(finished_raw, removable)
+                ssl_value["finishedObjs"] = new_finished
+                stats["finished_removed"] += removed
+
+        if remove_from_viewed:
+            viewed_raw = ssl_value.get("viewedUnactivatedObjectives", [])
+            if isinstance(viewed_raw, list):
+                ids_set = set(active_ids)
+                new_viewed = [v for v in viewed_raw if isinstance(v, str) and v not in ids_set]
+                stats["viewed_removed"] += max(0, len(viewed_raw) - len(new_viewed))
+                ssl_value["viewedUnactivatedObjectives"] = new_viewed
+            elif isinstance(viewed_raw, dict):
+                new_viewed, removed = _experiments_remove_ids_from_collection(viewed_raw, active_ids)
+                stats["viewed_removed"] += removed
+                ssl_value["viewedUnactivatedObjectives"] = new_viewed
+            else:
+                ssl_value["viewedUnactivatedObjectives"] = viewed_raw
+
+        if track_first and active_ids:
+            ssl_value["trackedObjective"] = active_ids[0]
+            stats["tracked_set"] += 1
+
+    return _experiments_apply_to_save(path, _mutator, create_backup=True)
+
+
+def _experiments_reaccept_finished_tasks(
+    path,
+    objective_ids,
+    add_discovered=True,
+    seed_states=True,
+    seed_stage_mode="placeholder",
+    reset_to_unfinished=True,
+    touch_existing_states=False,
+    remove_from_viewed=True,
+    track_first=False,
+    trust_ids_as_tasks=False,
+):
+    all_ids = _experiments_dedupe_ids(objective_ids)
+    if not all_ids:
+        return None
+
+    if trust_ids_as_tasks:
+        ids = list(all_ids)
+        non_task_skipped = 0
+    else:
+        row_by_key = _experiments_get_objective_row_by_key()
+        meta_kind = _experiments_load_meta_objective_kind()
+        ids = [oid for oid in all_ids if _experiments_is_task_objective(oid, row_by_key=row_by_key, meta_kind=meta_kind)]
+        non_task_skipped = max(0, len(all_ids) - len(ids))
+    if not ids:
+        return {"blocks": 0, "ids_skipped_non_tasks": non_task_skipped}
+
+    def _mutator(ssl_value, stats):
+        stats.setdefault("discovered_added", 0)
+        stats.setdefault("states_seeded", 0)
+        stats.setdefault("states_seeded_js", 0)
+        stats.setdefault("states_seeded_fallback", 0)
+        stats.setdefault("states_touched", 0)
+        stats.setdefault("finished_removed", 0)
+        stats.setdefault("viewed_removed", 0)
+        stats.setdefault("tracked_set", 0)
+        stats.setdefault("ids_skipped_not_finished", 0)
+        if "ids_skipped_non_tasks" not in stats:
+            stats["ids_skipped_non_tasks"] = non_task_skipped
+
+        finished_raw = ssl_value.get("finishedObjs", [])
+        _, finished_ids = _experiments_parse_id_collection(finished_raw)
+        finished_set = set(finished_ids)
+        target_ids = [oid for oid in ids if oid in finished_set]
+        stats["ids_skipped_not_finished"] += max(0, len(ids) - len(target_ids))
+
+        if not target_ids:
+            return
+
+        # Re-accept requires removing tasks from finishedObjs first.
+        new_finished, removed = _experiments_remove_ids_from_collection(finished_raw, target_ids)
+        ssl_value["finishedObjs"] = new_finished
+        stats["finished_removed"] += removed
+
+        if add_discovered:
+            new_raw, added = _experiments_add_ids_to_collection(ssl_value.get("discoveredObjectives", []), target_ids)
+            ssl_value["discoveredObjectives"] = new_raw
+            stats["discovered_added"] += added
+
+        states = ssl_value.get("objectiveStates")
+        if not isinstance(states, dict):
+            states = {}
+
+        for oid in target_ids:
+            state = states.get(oid)
+            is_new_state = False
+            if not isinstance(state, dict):
+                if not seed_states:
+                    continue
+                state, seeded_source = _experiments_seed_objective_state_with_source(oid, stage_mode=seed_stage_mode)
+                if seeded_source == "js":
+                    stats["states_seeded_js"] += 1
+                elif seeded_source == "fallback":
+                    stats["states_seeded_fallback"] += 1
+                states[oid] = state
+                stats["states_seeded"] += 1
+                is_new_state = True
+
+            state["id"] = oid
+            if "failReasons" not in state or not isinstance(state.get("failReasons"), dict):
+                state["failReasons"] = {}
+            if "spentTime" not in state:
+                state["spentTime"] = 0.0
+            if "isTimerStarted" not in state:
+                state["isTimerStarted"] = True
+
+            if reset_to_unfinished and (is_new_state or touch_existing_states):
+                state["isFinished"] = False
+                state["wasCompletedAtLeastOnce"] = False
+                state["isTimerStarted"] = True
+
+            stats["states_touched"] += 1
+
+        ssl_value["objectiveStates"] = states
+
+        if remove_from_viewed:
+            viewed_raw = ssl_value.get("viewedUnactivatedObjectives", [])
+            if isinstance(viewed_raw, list):
+                ids_set = set(target_ids)
+                new_viewed = [v for v in viewed_raw if isinstance(v, str) and v not in ids_set]
+                stats["viewed_removed"] += max(0, len(viewed_raw) - len(new_viewed))
+                ssl_value["viewedUnactivatedObjectives"] = new_viewed
+            elif isinstance(viewed_raw, dict):
+                new_viewed, removed = _experiments_remove_ids_from_collection(viewed_raw, target_ids)
+                stats["viewed_removed"] += removed
+                ssl_value["viewedUnactivatedObjectives"] = new_viewed
+            else:
+                ssl_value["viewedUnactivatedObjectives"] = viewed_raw
+
+        if track_first and target_ids:
+            ssl_value["trackedObjective"] = target_ids[0]
+            stats["tracked_set"] += 1
+
+    return _experiments_apply_to_save(path, _mutator, create_backup=True)
+
+
+def _experiments_order_collection_items(existing_items, final_set, priority=None):
+    """
+    Preserve original order where possible and append missing keys using priority order.
+    """
+    if final_set is None:
+        final_set = set()
+    if priority is None:
+        priority = []
+
+    out = []
+    seen = set()
+    for item in existing_items:
+        if item in final_set and item not in seen:
+            out.append(item)
+            seen.add(item)
+
+    for item in priority:
+        if item in final_set and item not in seen:
+            out.append(item)
+            seen.add(item)
+
+    for item in sorted(final_set):
+        if item not in seen:
+            out.append(item)
+            seen.add(item)
+
+    return out
+
+
+def _experiments_set_objective_state_flags(
+    path,
+    objective_ids,
+    *,
+    seed_missing=True,
+    is_finished=None,
+    was_completed=None,
+    is_timer_started=None,
+    spent_time=None,
+    clear_fail_reasons=False,
+    clear_stages=False,
+):
+    ids = _experiments_dedupe_ids(objective_ids)
+    if not ids:
+        return None
+
+    spent_time_value = None
+    if spent_time is not None:
+        spent_time_value = float(spent_time)
+
+    def _mutator(ssl_value, stats):
+        stats.setdefault("states_seeded", 0)
+        stats.setdefault("states_touched", 0)
+
+        states = ssl_value.get("objectiveStates")
+        if not isinstance(states, dict):
+            states = {}
+
+        for oid in ids:
+            state = states.get(oid)
+            if not isinstance(state, dict):
+                if not seed_missing:
+                    continue
+                state = _experiments_seed_objective_state(oid)
+                states[oid] = state
+                stats["states_seeded"] += 1
+
+            state["id"] = oid
+            if "failReasons" not in state or not isinstance(state.get("failReasons"), dict):
+                state["failReasons"] = {}
+            if "stagesState" not in state or not isinstance(state.get("stagesState"), list):
+                state["stagesState"] = []
+
+            if is_finished is not None:
+                state["isFinished"] = bool(is_finished)
+            if was_completed is not None:
+                state["wasCompletedAtLeastOnce"] = bool(was_completed)
+            if is_timer_started is not None:
+                state["isTimerStarted"] = bool(is_timer_started)
+            if spent_time is not None:
+                state["spentTime"] = spent_time_value
+            if clear_fail_reasons:
+                state["failReasons"] = {}
+            if clear_stages:
+                state["stagesState"] = []
+
+            stats["states_touched"] += 1
+
+        ssl_value["objectiveStates"] = states
+
+    return _experiments_apply_to_save(path, _mutator, create_backup=True)
+
+
+def _experiments_mutate_collection_key(path, key, objective_ids, mode):
+    ids = _experiments_dedupe_ids(objective_ids)
+    if not ids:
+        return None
+
+    allowed = {"discoveredObjectives", "finishedObjs", "viewedUnactivatedObjectives"}
+    if key not in allowed:
+        raise ValueError(f"Unsupported collection key: {key}")
+    if mode not in {"add", "remove"}:
+        raise ValueError(f"Unsupported mutate mode: {mode}")
+
+    def _mutator(ssl_value, stats):
+        stats.setdefault("changed", 0)
+        current_raw = ssl_value.get(key, [] if key != "finishedObjs" else {})
+        if mode == "add":
+            new_raw, changed = _experiments_add_ids_to_collection(current_raw, ids)
+        else:
+            new_raw, changed = _experiments_remove_ids_from_collection(current_raw, ids)
+        ssl_value[key] = new_raw
+        stats["changed"] += changed
+
+    return _experiments_apply_to_save(path, _mutator, create_backup=True)
+
+
+def _experiments_sync_finished_from_states(path, *, add_finished=True, remove_not_finished=False):
+    if not add_finished and not remove_not_finished:
+        return None
+
+    def _mutator(ssl_value, stats):
+        stats.setdefault("changed", 0)
+        stats.setdefault("finished_from_states", 0)
+
+        states = ssl_value.get("objectiveStates")
+        finished_from_states = set()
+        if isinstance(states, dict):
+            for oid, state in states.items():
+                if not isinstance(oid, str) or not isinstance(state, dict):
+                    continue
+                if bool(state.get("isFinished")):
+                    finished_from_states.add(oid)
+
+        shape, items = _experiments_parse_id_collection(ssl_value.get("finishedObjs", []))
+        final_set = set(items)
+
+        if remove_not_finished:
+            final_set &= finished_from_states
+        if add_finished:
+            final_set |= finished_from_states
+
+        ordered = _experiments_order_collection_items(items, final_set, priority=sorted(finished_from_states))
+        ssl_value["finishedObjs"] = _experiments_pack_id_collection(shape, ordered)
+
+        stats["finished_from_states"] += len(finished_from_states)
+        stats["changed"] += abs(len(items) - len(ordered))
+
+    return _experiments_apply_to_save(path, _mutator, create_backup=True)
+
+
+def _experiments_set_tracked_objective(path, objective_id):
+    tracked = ""
+    if objective_id is not None:
+        tracked = str(objective_id).strip()
+
+    def _mutator(ssl_value, stats):
+        stats.setdefault("changed_blocks", 0)
+        old = str(ssl_value.get("trackedObjective", "") or "").strip()
+        if old != tracked:
+            stats["changed_blocks"] += 1
+        ssl_value["trackedObjective"] = tracked
+
+    return _experiments_apply_to_save(path, _mutator, create_backup=True)
+
+
+def _experiments_collect_save_snapshot(path):
+    if not path or not os.path.exists(path):
+        return None
+
+    doc, _, save_keys = _experiments_read_save_doc(path)
+    snapshot = {
+        "path": path,
+        "blocks": [],
+        "totals": {
+            "blocks": 0,
+            "discovered": 0,
+            "finished": 0,
+            "viewed": 0,
+            "states": 0,
+            "states_finished": 0,
+            "tracked_nonempty": 0,
+        },
+    }
+
+    for save_key, _, ssl_value in _experiments_iter_ssl_values(doc, save_keys):
+        d_shape, d_items = _experiments_parse_id_collection(ssl_value.get("discoveredObjectives", []))
+        f_shape, f_items = _experiments_parse_id_collection(ssl_value.get("finishedObjs", []))
+        v_shape, v_items = _experiments_parse_id_collection(ssl_value.get("viewedUnactivatedObjectives", []))
+
+        states = ssl_value.get("objectiveStates", {})
+        states_count = 0
+        states_finished = 0
+        if isinstance(states, dict):
+            for oid, state in states.items():
+                if not isinstance(oid, str):
+                    continue
+                states_count += 1
+                if isinstance(state, dict) and bool(state.get("isFinished")):
+                    states_finished += 1
+
+        tracked = str(ssl_value.get("trackedObjective", "") or "").strip()
+
+        block = {
+            "save_key": save_key,
+            "discovered_count": len(d_items),
+            "discovered_shape": d_shape,
+            "finished_count": len(f_items),
+            "finished_shape": f_shape,
+            "viewed_count": len(v_items),
+            "viewed_shape": v_shape,
+            "states_count": states_count,
+            "states_finished": states_finished,
+            "tracked": tracked,
+        }
+        snapshot["blocks"].append(block)
+
+        snapshot["totals"]["blocks"] += 1
+        snapshot["totals"]["discovered"] += len(d_items)
+        snapshot["totals"]["finished"] += len(f_items)
+        snapshot["totals"]["viewed"] += len(v_items)
+        snapshot["totals"]["states"] += states_count
+        snapshot["totals"]["states_finished"] += states_finished
+        if tracked:
+            snapshot["totals"]["tracked_nonempty"] += 1
+
+    return snapshot
+
+
+def _experiments_apply_status_preset(path, objective_ids, status):
+    """
+    Approximate ObjectiveStatus transitions using known save keys:
+    NEW, VIEWED, ACTIVE, TRACKED, LOCKED, COMPLETED.
+    """
+    ids = _experiments_dedupe_ids(objective_ids)
+    if not ids:
+        return None
+
+    status_norm = str(status or "").strip().upper()
+    allowed = {"NEW", "VIEWED", "ACTIVE", "TRACKED", "LOCKED", "COMPLETED"}
+    if status_norm not in allowed:
+        raise ValueError(f"Unsupported status preset: {status}")
+
+    ids_set = set(ids)
+
+    def _ensure_state(states, oid):
+        state = states.get(oid)
+        seeded = 0
+        if not isinstance(state, dict):
+            state = _experiments_seed_objective_state(oid)
+            states[oid] = state
+            seeded = 1
+        state["id"] = oid
+        if "failReasons" not in state or not isinstance(state.get("failReasons"), dict):
+            state["failReasons"] = {}
+        if "stagesState" not in state or not isinstance(state.get("stagesState"), list):
+            state["stagesState"] = []
+        return state, seeded
+
+    def _mutator(ssl_value, stats):
+        stats.setdefault("states_seeded", 0)
+        stats.setdefault("states_touched", 0)
+        stats.setdefault("tracked_changed", 0)
+
+        d_shape, d_items = _experiments_parse_id_collection(ssl_value.get("discoveredObjectives", []))
+        f_shape, f_items = _experiments_parse_id_collection(ssl_value.get("finishedObjs", []))
+        v_shape, v_items = _experiments_parse_id_collection(ssl_value.get("viewedUnactivatedObjectives", []))
+
+        d_set = set(d_items)
+        f_set = set(f_items)
+        v_set = set(v_items)
+
+        states = ssl_value.get("objectiveStates")
+        if not isinstance(states, dict):
+            states = {}
+
+        if status_norm in {"NEW", "LOCKED"}:
+            d_set -= ids_set
+            v_set -= ids_set
+            f_set -= ids_set
+            for oid in ids:
+                state = states.get(oid)
+                if isinstance(state, dict):
+                    state["id"] = oid
+                    state["isFinished"] = False
+                    state["wasCompletedAtLeastOnce"] = False
+                    state["isTimerStarted"] = True
+                    stats["states_touched"] += 1
+        elif status_norm == "VIEWED":
+            d_set |= ids_set
+            v_set |= ids_set
+            f_set -= ids_set
+            for oid in ids:
+                state, seeded = _ensure_state(states, oid)
+                stats["states_seeded"] += seeded
+                state["isFinished"] = False
+                state["wasCompletedAtLeastOnce"] = False
+                state["isTimerStarted"] = True
+                stats["states_touched"] += 1
+        elif status_norm == "ACTIVE":
+            d_set |= ids_set
+            v_set -= ids_set
+            f_set -= ids_set
+            for oid in ids:
+                state, seeded = _ensure_state(states, oid)
+                stats["states_seeded"] += seeded
+                state["isFinished"] = False
+                state["wasCompletedAtLeastOnce"] = False
+                state["isTimerStarted"] = True
+                stats["states_touched"] += 1
+        elif status_norm == "TRACKED":
+            d_set |= ids_set
+            v_set -= ids_set
+            f_set -= ids_set
+            for oid in ids:
+                state, seeded = _ensure_state(states, oid)
+                stats["states_seeded"] += seeded
+                state["isFinished"] = False
+                state["wasCompletedAtLeastOnce"] = False
+                state["isTimerStarted"] = True
+                stats["states_touched"] += 1
+            old = str(ssl_value.get("trackedObjective", "") or "").strip()
+            if old != ids[0]:
+                stats["tracked_changed"] += 1
+            ssl_value["trackedObjective"] = ids[0]
+        elif status_norm == "COMPLETED":
+            d_set |= ids_set
+            v_set -= ids_set
+            f_set |= ids_set
+            for oid in ids:
+                state, seeded = _ensure_state(states, oid)
+                stats["states_seeded"] += seeded
+                state["isFinished"] = True
+                state["wasCompletedAtLeastOnce"] = True
+                state["isTimerStarted"] = True
+                stats["states_touched"] += 1
+
+        if status_norm in {"NEW", "LOCKED"}:
+            old = str(ssl_value.get("trackedObjective", "") or "").strip()
+            if old in ids_set:
+                ssl_value["trackedObjective"] = ""
+                stats["tracked_changed"] += 1
+
+        d_out = _experiments_order_collection_items(d_items, d_set, priority=ids)
+        f_out = _experiments_order_collection_items(f_items, f_set, priority=ids)
+        v_out = _experiments_order_collection_items(v_items, v_set, priority=ids)
+
+        ssl_value["discoveredObjectives"] = _experiments_pack_id_collection(d_shape, d_out)
+        ssl_value["finishedObjs"] = _experiments_pack_id_collection(f_shape, f_out)
+        ssl_value["viewedUnactivatedObjectives"] = _experiments_pack_id_collection(v_shape, v_out)
+        ssl_value["objectiveStates"] = states
+
+    return _experiments_apply_to_save(path, _mutator, create_backup=True)
+
+
+# ---------- FACTOR_RULE_DEFINITIONS ----------
+# IMPORTANT:
+# - each rule (except game difficulty) gets an extra "random" choice
+# - random resolves to a real option during save
 FACTOR_RULE_DEFINITIONS = [
-    ("Addon Selling Price", "addonSellingFactor", {"normal": 1.0, "10%": 0.1, "30%": 0.3, "50%": 0.5, "no refunds": 0}),
-    ("Trailer selling price", "trailerSellingFactor", {"normal price": 1, "50%": 0.5, "30%": 0.3, "10%": 0.1, "cant be sold": -1}),
-    ("Trailer availability", "trailerAvailability", {"default": 0, "all trailers available": 1}),
-    ("truck switching price (Over Minimap)", "teleportationPrice", {"free": 0, "500": 500, "1000": 1000, "2000": 2000, "5000": 5000}),
-    ("Tire availability", "tyreAvailability", {"default": 1, "all tires available": 0, "highway , allraod": 2, "highway, allroad, offroad": 3, "no mudtires": 4, "no chained tires": 5, "random per garage": 6}),
-    ("truck availibility", "truckAvailability", {"default": 1, "all trucks are available from the start": 0, "5-15 trucks in each garage": 3, "store unlocks at rank 10": 2, "store unlocks at rank 20": 2, "store unlocks at rank 30": 2, "store is locked": 4}),
-    ("truck pricing", "truckPricingFactor", {"default": 1, "free": 0, "2 times": 2, "4 times": 4, "6 times": 6}),
-    ("Internal addon availability", "internalAddonAvailability", {"default": 0, "all internal addons unlocked": 1}),
-    ("Fuel price", "fuelPriceFactor", {"normal price": 1, "free": 0, "2times": 2, "4times": 4, "6times": 6}),
-    ("Garage repair price", "garageRepairePriceFactor", {"free": 0, "normal price": 1, "2times": 2, "4time": 4, "6times": 6}),
-    ("Map marker style", "isMapMarkerAsInHardMode", {"default": False, "hard mode": True}),
-    ("Truck selling price", "truckSellingFactor", {"normal price": 1, "50%": 0.5, "30%": 0.3, "10%": 0.1, "cant be sold": -1}),
-    ("Vehicle addon pricing", "addonPricingFactor", {"default": 1, "free": 0, "2times": 2, "4times": 4, "6times": 6}),
     ("Game difficulty", "gameDifficultyMode", {"Normal": 0, "Hard": 1, "New Game+": 2}),
-    ("Vehicle damage", "vehicleDamageFactor", {"default": 1, "no damage": 0, "2x": 2, "3x": 3, "5x": 5}),
+    ("Truck availability", "truckAvailability", {
+        "default": 1,
+        "all trucks available from start": 0,
+        "5-15 trucks in each garage": 3,
+        "store unlocks at rank 10": 2,
+        "store unlocks at rank 20": 2,
+        "store unlocks at rank 30": 2,
+        "store is locked": 4
+    }),
+    ("Truck pricing", "truckPricingFactor", {"default": 1, "free": 0, "2x": 2, "4x": 4, "6x": 6}),
+    ("Truck selling price", "truckSellingFactor", {"normal price": 1, "50%": 0.5, "30%": 0.3, "10%": 0.1, "cant be sold": -1}),
+    ("DLC vehicles availability", "isDLCVehiclesAvailable", {"available": True, "unavailable": False}),
     ("Vehicle storage slots", "vehicleStorageSlots", {"default": 0, "only 3": 3, "only 5": 5, "only 10": 10, "only scouts": -1}),
-    ("Trailer pricing", "trailerPricingFactor", {"free": 0, "normal price": 1, "2x": 2, "4x": 4, "6x": 6}),
-    ("External addon availability", "externalAddonAvailability", {"default": 0, "all addons unlocked": 1, "random 5": 2, "random 10": 3, "each garage random 10": 4}),
-    ("Garage refuelling", "isGarageRefuelAvailable", {"True": True, "False": False}),
-    ("Max contest attempts", "maxContestAttempts", {"default": -1, "1 attempt": 1, "3 attempt": 3, "5 attempt": 5}),
+    ("External addon availability", "externalAddonAvailability", {
+        "default": 0,
+        "all addons unlocked": 1
+    }),
+    ("Internal addon availability", "internalAddonAvailability", {
+        "default": 0,
+        "all internal addons unlocked": 1
+    }),
+    ("Tire availability", "tyreAvailability", {
+        "default": 1,
+        "all tires available": 0,
+        "highway and allroad": 2,
+        "highway, allroad, offroad": 3,
+        "no mud tires": 4,
+        "no chained tires": 5
+    }),
+    ("Vehicle addon pricing", "addonPricingFactor", {"default": 1, "free": 0, "2x": 2, "4x": 4, "6x": 6}),
+    ("Addon selling price", "addonSellingFactor", {"normal": 1.0, "10%": 0.1, "30%": 0.3, "50%": 0.5, "no refunds": 0}),
+    ("Trailer store availability", "trailerStoreAviability", {"default": 1, "not available": 0}),
+    ("Trailer availability", "trailerAvailability", {"default": 0, "all trailers available": 1, "not available": 2}),
+    ("Trailer pricing", "trailerPricingFactor", {"normal price": 1, "free": 0, "2x": 2, "4x": 4, "6x": 6}),
+    ("Trailer selling price", "trailerSellingFactor", {"normal price": 1, "50%": 0.5, "30%": 0.3, "10%": 0.1, "cant be sold": -1}),
+    ("Fuel price", "fuelPriceFactor", {
+        "normal price": 1,
+        "free": 0,
+        "2x": 2,
+        "4x": 4,
+        "6x": 6
+    }),
+    ("Garage repair price", "garageRepairePriceFactor", {
+        "default": 1,
+        "no auto repair": -1,
+        "2x": 2,
+        "4x": 4,
+        "6x": 6
+    }),
+    ("Garage refuelling", "isGarageRefuelAvailable", {"available": True, "unavailable": False}),
+    ("Repair points cost", "repairPointsCostFactor", {
+        "default": 1,
+        "hard mode rules": 1,
+        "free": 0,
+        "2x": 2,
+        "4x": 4,
+        "6x": 6
+    }),
     ("Repair points required", "repairPointsRequiredFactor", {"default": 1, "2x less": 0.5, "2x": 2, "4x": 4, "6x": 6}),
-    ("Repair points cost", "repairPointsCostFactor", {"free": 0, "default": 1, "2x": 2, "4x": 4, "6x": 6}),
-    ("Region repair price", "regionRepaireMoneyFactor", {"free": 0, "default": 1, "2x": 2, "4x": 4, "6x": 6}),
-    ("Recovery price", "recoveryPriceFactor", {"free": 0, "default": 1, "2x": 2, "4x": 4, "6x": 6}),
+    ("Vehicle repair regional rules", "regionRepaireMoneyFactor", {
+        "default": 1,
+        "2x price and points": 2,
+        "3x price and points": 3,
+        "4x price and points": 4,
+        "unavailable": 0
+    }),
+    ("Vehicle damage", "vehicleDamageFactor", {"default": 1, "no damage": 0, "2x": 2, "3x": 3, "5x": 5}),
+    ("Recovery price", "recoveryPriceFactor", {
+        "default": 1,
+        "hard mode price": 0,
+        "2x": 2,
+        "4x": 4,
+        "6x": 6,
+        "unavailable": -1
+    }),
     ("Automatic cargo loading", "loadingPriceFactor", {"free": 0, "paid": 1, "2x": 2, "4x": 4, "6x": 6}),
-    ("Region traveling price", "regionTravellingPriceFactor", {"free": 0, "default": 1, "2x": 2, "4x": 4, "6x": 6}),
+    ("Truck switching price (minimap)", "teleportationPrice", {"free": 0, "500": 500, "1000": 1000, "2000": 2000, "5000": 5000}),
+    ("Region traveling price", "regionTravellingPriceFactor", {
+        "default": 1,
+        "hard mode rules": 1,
+        "free": 0,
+        "2x": 2,
+        "4x": 4,
+        "6x": 6
+    }),
     ("Task and contest payouts", "tasksAndContestsPayoutsFactor", {"normal": 1, "50%": 0.5, "150%": 1.5, "200%": 2, "300%": 3}),
     ("Contracts payouts", "contractsPayoutsFactor", {"normal": 1, "50%": 0.5, "150%": 1.5, "200%": 2, "300%": 3}),
+    ("Max contest attempts", "maxContestAttempts", {"default": -1, "1 attempt": 1, "3 attempts": 3, "5 attempts": 5, "gold time only": -1}),
+    ("Map marker style", "isMapMarkerAsInHardMode", {"default": False, "hard mode": True}),
 ]
+
+_RULE_RANDOM_LABEL = "random"
+_RULE_RANDOM_VALUE = "__RULE_RANDOM__"
+
+# Key -> NGP dictionary key + label -> dictionary state.
+_RULE_NGP_DICT_META = {
+    "truckAvailability": ("TRUCK_AVAILABILITY", {
+        "default": 0,
+        "all trucks available from start": 1,
+        "5-15 trucks in each garage": 2,
+        "store unlocks at rank 10": 3,
+        "store unlocks at rank 20": 4,
+        "store unlocks at rank 30": 5,
+        "store is locked": 6
+    }),
+    "truckPricingFactor": ("TRUCK_PRICING", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "truckSellingFactor": ("TRUCK_SELLING", {"normal price": 0, "50%": 1, "30%": 2, "10%": 3, "cant be sold": 4}),
+    "isDLCVehiclesAvailable": ("DLC_VEHICLES", {"available": 0, "unavailable": 1}),
+    "vehicleStorageSlots": ("VEHICLE_STORAGE", {"default": 0, "only 3": 1, "only 5": 2, "only 10": 3, "only scouts": 4}),
+    "externalAddonAvailability": ("ADDON_AVAILABILITY", {"default": 0, "all addons unlocked": 1}),
+    "internalAddonAvailability": ("INTENAL_ADDON_AVAILABILITY", {
+        "default": 0,
+        "all internal addons unlocked": 1
+    }),
+    "tyreAvailability": ("TYRE_AVAILABILITY", {
+        "default": 0,
+        "all tires available": 1,
+        "highway and allroad": 2,
+        "highway, allroad, offroad": 3,
+        "no mud tires": 4,
+        "no chained tires": 5
+    }),
+    "trailerStoreAviability": ("TRAILER_STORE_AVAILBILITY", {"default": 1, "not available": 0}),
+    "trailerAvailability": ("TRAILER_AVAILABILITY", {"default": 0, "all trailers available": 1, "not available": 2}),
+    "trailerPricingFactor": ("TRAILER_PRICING", {"normal price": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "trailerSellingFactor": ("TRAILER_SELLING", {"normal price": 0, "50%": 1, "30%": 2, "10%": 3, "cant be sold": 4}),
+    "fuelPriceFactor": ("FUEL_PRICE", {"normal price": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "garageRepairePriceFactor": ("GARAGE_REPAIRE", {"default": 0, "no auto repair": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "isGarageRefuelAvailable": ("GARAGE_REFUEL", {"available": 0, "unavailable": 1}),
+    "repairPointsCostFactor": ("REPAIR_POINTS_COST", {"default": 0, "hard mode rules": 1, "free": 0, "2x": 2, "4x": 3, "6x": 4}),
+    "repairPointsRequiredFactor": ("REPAIR_POINTS_AMOUNT", {"default": 0, "2x less": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "regionRepaireMoneyFactor": ("REGIONAL_REPAIR", {
+        "default": 0,
+        "2x price and points": 1,
+        "3x price and points": 2,
+        "4x price and points": 3,
+        "unavailable": 4
+    }),
+    "vehicleDamageFactor": ("VEHICLE_DAMAGE", {"default": 0, "no damage": 1, "2x": 2, "3x": 3, "5x": 4}),
+    "recoveryPriceFactor": ("RECOVERY", {"default": 0, "hard mode price": 1, "2x": 2, "4x": 3, "6x": 4, "unavailable": 5}),
+    "loadingPriceFactor": ("LOADING", {"free": 0, "paid": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "teleportationPrice": ("TELEPORTATION", {"free": 0, "500": 1, "1000": 2, "2000": 3, "5000": 4}),
+    "regionTravellingPriceFactor": ("REGION_TRAVELLING", {"default": 0, "hard mode rules": 1, "free": 0, "2x": 2, "4x": 3, "6x": 4}),
+    "tasksAndContestsPayoutsFactor": ("TASKS_CONTESTS", {"normal": 0, "50%": 1, "150%": 2, "200%": 3, "300%": 4}),
+    "contractsPayoutsFactor": ("CONTRACTS", {"normal": 0, "50%": 1, "150%": 2, "200%": 3, "300%": 4}),
+    "maxContestAttempts": ("CONTEST_ATTEMPTS", {"default": 0, "1 attempt": 1, "3 attempts": 2, "5 attempts": 3, "gold time only": 4}),
+    "isMapMarkerAsInHardMode": ("MAP_MARKER", {"default": 0, "hard mode": 1}),
+    "addonPricingFactor": ("ADDON_PRICING", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
+}
+
+_INTERNAL_ADDON_AMOUNT_BY_LABEL = {
+    # Randomized internal-addon presets are intentionally not exposed in the editor.
+}
 
 # defensive globals
 try:
@@ -11520,6 +18536,21 @@ def create_rules_tab(tab_rules, save_path_var):
     FACTOR_RULE_VARS = []
     rule_savers = []
     dropdown_widgets = {}
+    random_rules_var = tk.BooleanVar(value=False)
+
+    def _set_all_rules_to_random():
+        for rule in FACTOR_RULE_VARS:
+            if rule["key"] == "gameDifficultyMode":
+                continue
+            if _RULE_RANDOM_LABEL in rule["options"]:
+                try:
+                    rule["var"].set(_RULE_RANDOM_LABEL)
+                except Exception:
+                    pass
+
+    def _on_random_rules_toggle():
+        if random_rules_var.get():
+            _set_all_rules_to_random()
 
     # UI container + scrollable canvas
     container = ttk.Frame(tab_rules)
@@ -11565,9 +18596,14 @@ def create_rules_tab(tab_rules, save_path_var):
                 options = {str(x): x for x in options}
             except Exception:
                 options = {"default": 0}
+        else:
+            options = dict(options)
+        if key != "gameDifficultyMode" and _RULE_RANDOM_LABEL not in options:
+            options[_RULE_RANDOM_LABEL] = _RULE_RANDOM_VALUE
         var = tk.StringVar(value=list(options.keys())[0])
-        FACTOR_RULE_VARS.append((label, key, options, var))
-        entries.append((label, key, options, var))
+        rule = {"label": label, "key": key, "options": options, "var": var}
+        FACTOR_RULE_VARS.append(rule)
+        entries.append(rule)
 
     COLS = 3
     for ci in range(COLS):
@@ -11575,7 +18611,11 @@ def create_rules_tab(tab_rules, save_path_var):
 
     r = 0
     c = 0
-    for label_text, key, opts, var in entries:
+    for rule in entries:
+        label_text = rule["label"]
+        key = rule["key"]
+        opts = rule["options"]
+        var = rule["var"]
         card = ttk.Frame(center_frame, padding=(10, 8), relief="groove")
         card.grid(row=r, column=c, padx=12, pady=8, sticky="nsew")
         ttk.Label(card, text=label_text + ":", font=("TkDefaultFont", 9)).pack(anchor="w")
@@ -11655,6 +18695,66 @@ def create_rules_tab(tab_rules, save_path_var):
             text = _set_key_in_text(text, "settingsDictionaryForNGPScreen", json.dumps(default_dict))
         return text
 
+    def _read_scalar_key(text: str, key: str):
+        m = re.search(
+            rf'"{re.escape(key)}"\s*:\s*(".*?"|[-]?\d+(\.\d+)?|true|false|null)',
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return None
+        raw = m.group(1).strip()
+        rl = raw.lower()
+        if rl == "true":
+            return True
+        if rl == "false":
+            return False
+        if rl == "null":
+            return None
+        if raw.startswith('"') and raw.endswith('"'):
+            return raw[1:-1]
+        try:
+            if "." in raw:
+                return float(raw)
+            return int(raw)
+        except Exception:
+            return raw
+
+    def _load_settings_dictionary(text: str, default_dict: dict):
+        out = dict(default_dict)
+        m = re.search(r'"settingsDictionaryForNGPScreen"\s*:\s*({[^}]*})', text)
+        if not m:
+            return out
+        try:
+            obj = json.loads(m.group(1))
+            if isinstance(obj, dict):
+                out.update(obj)
+        except Exception:
+            pass
+        return out
+
+    def _resolve_rule_selection(rule: dict):
+        opts = rule["options"]
+        current_label = rule["var"].get()
+        current_value = opts.get(current_label, _choose_safe_default(opts))
+        if current_label != _RULE_RANDOM_LABEL and current_value != _RULE_RANDOM_VALUE:
+            return current_label, current_value
+
+        concrete_labels = [lab for lab, val in opts.items() if lab != _RULE_RANDOM_LABEL and val != _RULE_RANDOM_VALUE]
+        if not concrete_labels:
+            safe_label = next(iter(opts.keys()), _RULE_RANDOM_LABEL)
+            safe_value = opts.get(safe_label, 0)
+            return safe_label, safe_value
+
+        chosen_label = random.choice(concrete_labels)
+        chosen_value = opts.get(chosen_label, _choose_safe_default(opts))
+        try:
+            # Update UI to the concrete value that was written to the save.
+            rule["var"].set(chosen_label)
+        except Exception:
+            pass
+        return chosen_label, chosen_value
+
     # ---------- save/apply logic ----------
     def apply_all_rules():
         path = save_path_var.get()
@@ -11670,51 +18770,105 @@ def create_rules_tab(tab_rules, save_path_var):
             return
 
         try:
-            # 1) run per-key savers on tmp
+            if random_rules_var.get():
+                _set_all_rules_to_random()
+
+            # 1) Resolve "random" labels to concrete choices up-front.
+            #    This guarantees savers, linked logic, and dictionary sync all use
+            #    the same final choice.
+            resolved_rule_choices = {}
+            for rule in FACTOR_RULE_VARS:
+                resolved_rule_choices[rule["key"]] = _resolve_rule_selection(rule)
+
+            # 2) Run direct key savers (non-virtual rules).
             for saver in rule_savers:
                 try:
                     saver(tmp)
                 except Exception as se:
                     print("rule saver error:", se)
 
-            # 2) Set isHardMode based on gameDifficultyMode UI selection
-            gd_val = None
-            for lbl, ikey, opts, var in FACTOR_RULE_VARS:
-                if ikey == "gameDifficultyMode":
-                    sel_label = var.get()
-                    gd_val = opts.get(sel_label, _choose_safe_default(opts))
-                    break
-            with open(tmp, "r", encoding="utf-8") as f:
-                content = f.read()
-            if gd_val is not None:
-                try:
-                    is_hard_bool = True if int(gd_val) == 1 else False
-                except Exception:
-                    is_hard_bool = False
-                content = _set_key_in_text(content, "isHardMode", json.dumps(is_hard_bool))
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.write(content)
-
-            # 3) Read back and sanitize
+            # 3) Read back for custom/special rule handling.
             with open(tmp, "r", encoding="utf-8") as f:
                 text = f.read()
 
-            # Ensure each rule key exists and not null (use defaults)
-            for _, internal_key, options, _ in FACTOR_RULE_VARS:
+            # 4) Ensure each rule key exists and is not null.
+            for rule in FACTOR_RULE_VARS:
+                internal_key = rule["key"]
+                options = rule["options"]
                 safe = _choose_safe_default(options)
                 text = _ensure_key_with_default_text(text, internal_key, safe, treat_zero_as_missing=False)
 
-            # Ensure autoloadPrice > 0 (treat 0 as missing)
-            text = _ensure_key_with_default_text(text, "autoloadPrice", _DEFAULT_AUTOLOAD_PRICE, treat_zero_as_missing=True)
+            # 5) Apply special linked rule behavior.
+            for rule in FACTOR_RULE_VARS:
+                key = rule["key"]
+                opts = rule["options"]
+                label, selected_value = resolved_rule_choices.get(
+                    key, (rule["var"].get(), opts.get(rule["var"].get(), _choose_safe_default(opts)))
+                )
 
-            # Ensure special arrays
+                if key == "gameDifficultyMode":
+                    try:
+                        is_hard_bool = int(selected_value) == 1
+                    except Exception:
+                        is_hard_bool = False
+                    text = _set_key_in_text(text, "isHardMode", json.dumps(is_hard_bool))
+                    continue
+
+                if key == "truckAvailability":
+                    # Distinguish rank 10/20/30 when the base value is "AVAILABLE_FROM_LEVEL".
+                    if label == "store unlocks at rank 10":
+                        text = _set_key_in_text(text, "truckAvailabilityLevel", json.dumps(10))
+                    elif label == "store unlocks at rank 20":
+                        text = _set_key_in_text(text, "truckAvailabilityLevel", json.dumps(20))
+                    elif label == "store unlocks at rank 30":
+                        text = _set_key_in_text(text, "truckAvailabilityLevel", json.dumps(30))
+                    continue
+
+                if key == "internalAddonAvailability":
+                    amt = _INTERNAL_ADDON_AMOUNT_BY_LABEL.get(label)
+                    if amt is not None:
+                        text = _set_key_in_text(text, "internalAddonAmount", json.dumps(int(amt)))
+                    continue
+
+                if key == "maxContestAttempts":
+                    text = _set_key_in_text(text, "isGoldFailReason", json.dumps(label == "gold time only"))
+                    if label == "gold time only":
+                        text = _set_key_in_text(text, "maxContestAttempts", json.dumps(-1))
+                    continue
+
+                if key == "regionRepaireMoneyFactor":
+                    # Keep money and points factors in sync for regional repair rule.
+                    text = _set_key_in_text(text, "regionRepairePointsFactor", json.dumps(selected_value))
+                    continue
+
+                if key == "isDLCVehiclesAvailable":
+                    # Keep this companion flag coherent with current availability choice.
+                    try:
+                        text = _set_key_in_text(text, "needToAddDlcTrucks", json.dumps(bool(selected_value)))
+                    except Exception:
+                        pass
+
+            # 6) Ensure key defaults and special arrays.
+            text = _ensure_key_with_default_text(text, "autoloadPrice", _DEFAULT_AUTOLOAD_PRICE, treat_zero_as_missing=True)
             text = _ensure_array_key(text, "recoveryPrice", _DEFAULT_RECOVERY_PRICE)
             text = _ensure_array_key(text, "fullRepairPrice", _DEFAULT_FULL_REPAIR_PRICE)
 
-            # settingsDictionaryForNGPScreen fix
+            # 7) settingsDictionaryForNGPScreen: ensure exists, then sync from selected rule labels.
             text = _ensure_settings_dictionary(text, _DEFAULT_SETTINGS_DICT)
+            settings_dict = _load_settings_dictionary(text, _DEFAULT_SETTINGS_DICT)
+            for rule in FACTOR_RULE_VARS:
+                key = rule["key"]
+                label, _ = resolved_rule_choices.get(key, (rule["var"].get(), None))
+                meta = _RULE_NGP_DICT_META.get(key)
+                if not meta:
+                    continue
+                ngp_key, label_to_state = meta
+                state = label_to_state.get(label)
+                if state is not None:
+                    settings_dict[ngp_key] = int(state)
+            text = _set_key_in_text(text, "settingsDictionaryForNGPScreen", json.dumps(settings_dict))
 
-            # deployPrice ensure object with Region/Map
+            # 8) deployPrice ensure object with Region/Map
             m = re.search(r'"deployPrice"\s*:\s*({[^}]*})', text)
             if m:
                 try:
@@ -11726,7 +18880,7 @@ def create_rules_tab(tab_rules, save_path_var):
             else:
                 text = _set_key_in_text(text, "deployPrice", json.dumps(_DEFAULT_DEPLOY_PRICE))
 
-            # 4) Compare & write
+            # 9) Compare & write
             with open(path, "r", encoding="utf-8") as f:
                 original = f.read()
 
@@ -11760,27 +18914,47 @@ def create_rules_tab(tab_rules, save_path_var):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
-            for display_label, internal_key, options, var in FACTOR_RULE_VARS:
-                m = re.search(rf'"{re.escape(internal_key)}"\s*:\s*(".*?"|\[[^\]]*\]|\{{[^}}]*\}}|[-]?\d+(\.\d+)?|true|false|null)', content, flags=re.IGNORECASE)
-                if not m:
+            for rule in FACTOR_RULE_VARS:
+                internal_key = rule["key"]
+                options = rule["options"]
+                var = rule["var"]
+
+                # Special state inference for real keys.
+                if internal_key == "truckAvailability":
+                    avail = _read_scalar_key(content, "truckAvailability")
+                    if avail == 2:
+                        lvl = _read_scalar_key(content, "truckAvailabilityLevel")
+                        if lvl is not None and int(lvl) >= 30 and "store unlocks at rank 30" in options:
+                            var.set("store unlocks at rank 30")
+                        elif lvl is not None and int(lvl) >= 20 and "store unlocks at rank 20" in options:
+                            var.set("store unlocks at rank 20")
+                        elif "store unlocks at rank 10" in options:
+                            var.set("store unlocks at rank 10")
+                        continue
+
+                if internal_key == "maxContestAttempts":
+                    is_gold = _read_scalar_key(content, "isGoldFailReason")
+                    if is_gold is True and "gold time only" in options:
+                        var.set("gold time only")
+                        continue
+
+                if internal_key == "regionRepaireMoneyFactor":
+                    money_factor = _read_scalar_key(content, "regionRepaireMoneyFactor")
+                    points_factor = _read_scalar_key(content, "regionRepairePointsFactor")
+                    if money_factor is not None and points_factor is not None:
+                        for lab, val in options.items():
+                            if str(money_factor) == str(val) and str(points_factor) == str(val):
+                                var.set(lab)
+                                break
+                        continue
+
+                rawv = _read_scalar_key(content, internal_key)
+                if rawv is None:
                     continue
-                raw = m.group(1).strip()
-                # quoted values
-                if raw.startswith('"') and raw.endswith('"'):
-                    rawv = raw[1:-1]
-                else:
-                    rawv = raw
-                # ignore arrays/objects for comboboxes
-                if rawv.startswith('[') or rawv.startswith('{'):
-                    continue
-                matched = False
                 for lab, val in options.items():
                     if str(val) == str(rawv):
                         var.set(lab)
-                        matched = True
                         break
-                if not matched and rawv in options:
-                    var.set(rawv)
         except Exception as e:
             print("sync failed:", e)
 
@@ -11806,9 +18980,12 @@ def create_rules_tab(tab_rules, save_path_var):
     # bottom Save button (centered)
     bottom = ttk.Frame(container)
     bottom.pack(fill="x", pady=(6,10))
-    ttk.Frame(bottom).pack(side="left", expand=True)
-    ttk.Button(bottom, text="Save Rules to Save File", command=apply_all_rules, width=30).pack(side="left")
-    ttk.Frame(bottom).pack(side="left", expand=True)
+    ttk.Checkbutton(bottom, text="Random rules", variable=random_rules_var, command=_on_random_rules_toggle).pack(anchor="center", pady=(0, 6))
+    button_row = ttk.Frame(bottom)
+    button_row.pack(fill="x")
+    ttk.Frame(button_row).pack(side="left", expand=True)
+    ttk.Button(button_row, text="Save Rules to Save File", command=apply_all_rules, width=30).pack(side="left")
+    ttk.Frame(button_row).pack(side="left", expand=True)
 
     # initial sync
     p = save_path_var.get()
@@ -11834,6 +19011,651 @@ GITHUB_MAIN_PAGE = "https://github.com/MrBoxik/SnowRunner-Save-Editor"
 # SECTION: Update Checks
 # Used In: Settings tab -> "Check for Update"
 # =============================================================================
+def _platform_release_suffix(system_name=None):
+    system = str(system_name or platform.system() or "").strip().lower()
+    if system == "windows":
+        return "a"
+    if system == "linux":
+        return "b"
+    if system == "darwin":
+        return "c"
+    return ""
+
+
+def _select_latest_release_for_platform(releases, suffix):
+    """Pick latest release matching suffix (a/b/c). Fallback to all releases when needed."""
+    candidates = []
+    for rel in releases:
+        if not isinstance(rel, dict):
+            continue
+        tag_raw = str(rel.get("tag_name", "") or "").lstrip("v").strip()
+        if not tag_raw:
+            continue
+        if suffix and not tag_raw.lower().endswith(suffix.lower()):
+            continue
+        num = normalize_version(tag_raw)
+        published = str(rel.get("published_at", "") or rel.get("created_at", "") or "")
+        candidates.append((num, published, tag_raw, rel))
+
+    if not candidates and suffix:
+        # Fallback for legacy tags that may not carry platform suffix.
+        for rel in releases:
+            if not isinstance(rel, dict):
+                continue
+            tag_raw = str(rel.get("tag_name", "") or "").lstrip("v").strip()
+            if not tag_raw:
+                continue
+            num = normalize_version(tag_raw)
+            published = str(rel.get("published_at", "") or rel.get("created_at", "") or "")
+            candidates.append((num, published, tag_raw, rel))
+
+    if not candidates:
+        return None, ""
+
+    candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    _, _, tag_raw, rel = candidates[0]
+    return rel, tag_raw
+
+
+def _pick_windows_release_download_url(release, tag_raw):
+    """Prefer .exe asset URL + expected size from release assets; fallback to default URL."""
+    assets = release.get("assets") if isinstance(release, dict) else None
+    picks = []
+    if isinstance(assets, list):
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            name = str(asset.get("name", "") or "")
+            url = str(asset.get("browser_download_url", "") or "").strip()
+            if not url:
+                continue
+            lname = name.lower()
+            if not lname.endswith(".exe"):
+                continue
+            size_val = asset.get("size")
+            try:
+                size_val = int(size_val)
+            except Exception:
+                size_val = None
+            score = 0
+            if "snowrunner" in lname:
+                score += 2
+            if "editor" in lname:
+                score += 1
+            picks.append((score, lname, url, size_val))
+
+    if picks:
+        picks.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return {
+            "url": picks[0][2],
+            "expected_size": picks[0][3],
+        }
+
+    clean_tag = str(tag_raw or "").strip()
+    return {
+        "url": f"https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/download/{clean_tag}/snowrunner_editor.exe",
+        "expected_size": None,
+    }
+
+
+def _download_file(url, dest_path, timeout=45, progress_callback=None):
+    req = urllib.request.Request(
+        str(url or ""),
+        headers={
+            "User-Agent": "SnowRunnerEditor/1.0",
+            "Accept": "application/octet-stream",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        total_bytes = None
+        try:
+            content_len = resp.headers.get("Content-Length")
+            if content_len:
+                total_bytes = int(content_len)
+        except Exception:
+            total_bytes = None
+
+        bytes_read = 0
+        t_start = time.time()
+        t_last = t_start
+        report_interval = 0.15
+
+        if callable(progress_callback):
+            try:
+                progress_callback(0, total_bytes, 0.0, None)
+            except Exception:
+                pass
+
+        with open(dest_path, "wb") as out:
+            while True:
+                chunk = resp.read(1024 * 64)
+                if not chunk:
+                    break
+                out.write(chunk)
+                bytes_read += len(chunk)
+
+                now = time.time()
+                if callable(progress_callback) and (now - t_last) >= report_interval:
+                    elapsed = max(now - t_start, 0.001)
+                    speed_bps = bytes_read / elapsed
+                    eta_sec = None
+                    if total_bytes and speed_bps > 0:
+                        eta_sec = max((total_bytes - bytes_read) / speed_bps, 0.0)
+                    try:
+                        progress_callback(bytes_read, total_bytes, speed_bps, eta_sec)
+                    except Exception:
+                        pass
+                    t_last = now
+
+        if callable(progress_callback):
+            now = time.time()
+            elapsed = max(now - t_start, 0.001)
+            speed_bps = bytes_read / elapsed
+            eta_sec = 0.0 if total_bytes else None
+            try:
+                progress_callback(bytes_read, total_bytes, speed_bps, eta_sec)
+            except Exception:
+                pass
+
+
+def _resolve_windows_update_work_dir(fallback_dir=""):
+    """
+    Resolve a writable working directory for updater artifacts.
+    Prefer the editor data folder (same location as config) so update temp files
+    stay out of the dist/exe folder.
+    """
+    try:
+        preferred = os.path.abspath(str(get_editor_data_dir() or "").strip())
+        if preferred:
+            os.makedirs(preferred, exist_ok=True)
+            return preferred
+    except Exception:
+        pass
+
+    try:
+        fb = os.path.abspath(str(fallback_dir or "").strip())
+    except Exception:
+        fb = ""
+    if not fb:
+        try:
+            fb = os.path.abspath(tempfile.gettempdir())
+        except Exception:
+            fb = os.path.abspath(".")
+    try:
+        os.makedirs(fb, exist_ok=True)
+    except Exception:
+        pass
+    return fb
+
+
+def _prepare_windows_self_update(
+    download_url,
+    latest_tag,
+    expected_size=None,
+    progress_callback=None,
+):
+    """
+    Download latest .exe and return update payload for external replacer.
+    """
+    if platform.system() != "Windows":
+        raise RuntimeError("Auto update is available only on Windows.")
+    if not getattr(sys, "frozen", False):
+        raise RuntimeError("Auto update is available only in the built .exe.")
+
+    current_exe = os.path.abspath(sys.executable)
+    if not os.path.isfile(current_exe):
+        raise RuntimeError("Current executable path is invalid.")
+
+    tag = str(latest_tag or "").strip() or "latest"
+    target_dir = os.path.dirname(current_exe)
+    if not os.path.isdir(target_dir):
+        raise RuntimeError("Executable directory is invalid.")
+    # Keep update payload in editor data folder (same place as config) for cleaner dist folder.
+    # Use per-run non-.exe payload name to avoid clashes with stale updater runs.
+    work_dir = _resolve_windows_update_work_dir(target_dir)
+    run_id = f"{int(time.time())}_{os.getpid()}"
+    new_exe = os.path.join(work_dir, f"snowrunner_editor_update_payload_{run_id}.bin")
+    try:
+        if os.path.exists(new_exe):
+            os.remove(new_exe)
+    except Exception:
+        pass
+
+    _download_file(
+        download_url,
+        new_exe,
+        timeout=60,
+        progress_callback=progress_callback,
+    )
+    try:
+        size = os.path.getsize(new_exe)
+    except Exception:
+        size = 0
+    if size < 1024 * 200:
+        raise RuntimeError("Downloaded file is unexpectedly small; update aborted.")
+    if expected_size and size != int(expected_size):
+        raise RuntimeError(
+            f"Downloaded file size mismatch ({size} vs expected {int(expected_size)})."
+        )
+
+    return {
+        "target_exe": current_exe,
+        "new_exe": new_exe,
+        "latest_tag": tag,
+    }
+
+
+def _run_windows_updater_script(update_payload):
+    if platform.system() != "Windows":
+        raise RuntimeError("Updater launcher is Windows-only.")
+
+    if not isinstance(update_payload, dict):
+        raise RuntimeError("Invalid updater payload.")
+
+    target_exe = os.path.abspath(str(update_payload.get("target_exe", "") or "").strip())
+    new_exe = os.path.abspath(str(update_payload.get("new_exe", "") or "").strip())
+    if not target_exe or not new_exe:
+        raise RuntimeError("Updater payload is missing executable paths.")
+    if not os.path.isfile(new_exe):
+        raise RuntimeError("Downloaded update file is missing.")
+    script_dir = _resolve_windows_update_work_dir(os.path.dirname(target_exe))
+    launch_token = f"{int(time.time() * 1000)}_{os.getpid()}"
+
+    def _ps_quote(text):
+        return str(text or "").replace("'", "''")
+
+    ack_path = os.path.join(script_dir, f"snowrunner_editor_updater_ack_{launch_token}.txt")
+
+    def _wait_for_launch_ack(log_path, ack_file_path, token, timeout_sec=3.0):
+        deadline = time.time() + float(timeout_sec)
+        marker = f"run={token}"
+        while time.time() < deadline:
+            try:
+                if os.path.exists(ack_file_path):
+                    return True
+            except Exception:
+                pass
+            try:
+                if os.path.exists(log_path):
+                    with open(log_path, "r", encoding="utf-8", errors="ignore") as fh:
+                        content = fh.read()
+                    if marker in content:
+                        return True
+            except Exception:
+                pass
+            time.sleep(0.08)
+        return False
+
+    script_path = os.path.join(script_dir, f"snowrunner_editor_updater_{int(time.time())}.ps1")
+    log_path = os.path.join(tempfile.gettempdir(), "snowrunner_updater.log")
+    ps_script = (
+        "$ErrorActionPreference='Continue'\n"
+        f"$target='{_ps_quote(target_exe)}'\n"
+        f"$newFile='{_ps_quote(new_exe)}'\n"
+        f"$workDir='{_ps_quote(script_dir)}'\n"
+        f"$releases='{_ps_quote(GITHUB_RELEASES_PAGE)}'\n"
+        f"$runId='{_ps_quote(launch_token)}'\n"
+        f"$ackFile='{_ps_quote(ack_path)}'\n"
+        "$tmpCopy=($target + '.updating.tmp')\n"
+        "$pyiVars=@('_MEIPASS2','_PYI_PARENT_PROCESS_LEVEL','_PYI_APPLICATION_HOME_DIR','_PYI_ARCHIVE_FILE','_PYI_SPLASH_IPC','_PYI_SPLASH_IPC_PORT','_PYI_SPLASH_IPC_SOCKET','_PYI_PROCNAME')\n"
+        "$log=([System.IO.Path]::Combine([System.IO.Path]::GetTempPath(),'snowrunner_updater.log'))\n"
+        "function LogLine([string]$m){ try{ Add-Content -LiteralPath $log -Value ((Get-Date -Format 's') + ' ' + $m) -Encoding UTF8 } catch{} }\n"
+        "LogLine ('Updater started [v15-configworkdir] run=' + $runId + ' target=' + $target + ' new=' + $newFile + ' work=' + $workDir)\n"
+        "try{ Set-Content -LiteralPath $ackFile -Value ('run=' + $runId) -Encoding Ascii -Force } catch{}\n"
+        "if(-not (Test-Path -LiteralPath $newFile)){\n"
+        "  LogLine 'Payload missing before replace; aborting'\n"
+        "  Start-Process -FilePath $releases\n"
+        "  try{ Remove-Item -LiteralPath $ackFile -Force -ErrorAction SilentlyContinue } catch{}\n"
+        "  exit\n"
+        "}\n"
+        "$ok=$false\n"
+        "for($i=0;$i -lt 360;$i++){\n"
+        "  try{\n"
+        "    Copy-Item -LiteralPath $newFile -Destination $tmpCopy -Force -ErrorAction Stop\n"
+        "    if(Test-Path -LiteralPath $target){ Remove-Item -LiteralPath $target -Force -ErrorAction Stop }\n"
+        "    Move-Item -LiteralPath $tmpCopy -Destination $target -Force -ErrorAction Stop\n"
+        "    $ok=$true\n"
+        "    LogLine 'Replace succeeded'\n"
+        "    break\n"
+        "  }\n"
+        "  catch{\n"
+        "    LogLine ('Replace retry #' + $i + ' failed: ' + $_.Exception.Message)\n"
+        "    Remove-Item -LiteralPath $tmpCopy -Force -ErrorAction SilentlyContinue\n"
+        "    if(-not (Test-Path -LiteralPath $newFile)){\n"
+        "      LogLine 'Payload missing during retries; aborting'\n"
+        "      break\n"
+        "    }\n"
+        "    Start-Sleep -Milliseconds 250\n"
+        "  }\n"
+        "}\n"
+        "if($ok){\n"
+        "  foreach($ev in $pyiVars){\n"
+        "    try{ Remove-Item -Path ('Env:' + $ev) -ErrorAction SilentlyContinue } catch{}\n"
+        "    try{ [System.Environment]::SetEnvironmentVariable($ev, $null, 'Process') } catch{}\n"
+        "  }\n"
+        "  LogLine 'Cleared inherited PyInstaller environment vars'\n"
+        "  Start-Sleep -Milliseconds 250\n"
+        "  $started=$false\n"
+        "  try{\n"
+        "    $launcher=[System.IO.Path]::Combine($workDir, ('snowrunner_editor_relaunch_' + $runId + '.cmd'))\n"
+        "    $cmd=@\"\n"
+        "@echo off\n"
+        "set _MEIPASS2=\n"
+        "set _PYI_PARENT_PROCESS_LEVEL=\n"
+        "set _PYI_APPLICATION_HOME_DIR=\n"
+        "set _PYI_ARCHIVE_FILE=\n"
+        "set _PYI_SPLASH_IPC=\n"
+        "set _PYI_SPLASH_IPC_PORT=\n"
+        "set _PYI_SPLASH_IPC_SOCKET=\n"
+        "set _PYI_PROCNAME=\n"
+        "timeout /t 1 /nobreak >nul\n"
+        "start \"\" \"$target\"\n"
+        "del /f /q \"%~f0\" >nul 2>&1\n"
+        "\"@\n"
+        "    Set-Content -LiteralPath $launcher -Value $cmd -Encoding Ascii -Force\n"
+        "    Start-Process -FilePath $launcher -WindowStyle Hidden -ErrorAction Stop\n"
+        "    $started=$true\n"
+        "  }\n"
+        "  catch{\n"
+        "    LogLine ('Relaunch scheduler failed: ' + $_.Exception.Message)\n"
+        "  }\n"
+        "  if($started){\n"
+        "    LogLine 'Started updated editor'\n"
+        "    Remove-Item -LiteralPath $newFile -Force -ErrorAction SilentlyContinue\n"
+        "    Remove-Item -LiteralPath $tmpCopy -Force -ErrorAction SilentlyContinue\n"
+        "  }\n"
+        "  else{\n"
+        "    LogLine 'Failed to start updated editor; opening releases page'\n"
+        "    Start-Process -FilePath $releases\n"
+        "  }\n"
+        "}\n"
+        "else{\n"
+        "  Remove-Item -LiteralPath $tmpCopy -Force -ErrorAction SilentlyContinue\n"
+        "  Remove-Item -LiteralPath $newFile -Force -ErrorAction SilentlyContinue\n"
+        "  LogLine 'Replace failed; opening releases page'\n"
+        "  Start-Process -FilePath $releases\n"
+        "}\n"
+        "try{ Remove-Item -LiteralPath $ackFile -Force -ErrorAction SilentlyContinue } catch{}\n"
+        "try{ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue } catch{}\n"
+    )
+    # Windows PowerShell treats UTF-16 BOM scripts as canonical; this avoids
+    # Unicode path mangling on non-ASCII usernames (e.g., Vlastnik with accents).
+    with open(script_path, "w", encoding="utf-16", newline="\r\n") as f:
+        f.write(ps_script)
+
+    si = None
+    try:
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    except Exception:
+        si = None
+    CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+    CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+    CREATE_BREAKAWAY_FROM_JOB = getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+    launch_flags = (
+        CREATE_NO_WINDOW
+        | DETACHED_PROCESS
+        | CREATE_NEW_PROCESS_GROUP
+        | CREATE_BREAKAWAY_FROM_JOB
+    )
+    launch_error = None
+    launch_variants = [
+        (
+            "powershell",
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                script_path,
+            ],
+            launch_flags,
+            2.4,
+        ),
+        (
+            "pwsh",
+            [
+                "pwsh",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                script_path,
+            ],
+            launch_flags,
+            2.4,
+        ),
+        (
+            "cmd->powershell",
+            [
+                "cmd",
+                "/c",
+                "start",
+                "",
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                script_path,
+            ],
+            CREATE_NO_WINDOW,
+            3.0,
+        ),
+        (
+            "cmd->pwsh",
+            [
+                "cmd",
+                "/c",
+                "start",
+                "",
+                "pwsh",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-File",
+                script_path,
+            ],
+            CREATE_NO_WINDOW,
+            3.0,
+        ),
+    ]
+    for variant_name, argv, flags, ack_timeout in launch_variants:
+        try:
+            try:
+                if os.path.exists(ack_path):
+                    os.remove(ack_path)
+            except Exception:
+                pass
+            proc = subprocess.Popen(
+                argv,
+                startupinfo=si,
+                creationflags=flags,
+                close_fds=True,
+            )
+            # Quick sanity check: if launcher dies instantly with non-zero, fallback.
+            time.sleep(0.20)
+            rc = proc.poll()
+            if rc is not None and rc != 0:
+                launch_error = RuntimeError(f"{variant_name} exited immediately with code {rc}")
+                continue
+            # Reliable handoff: updater must confirm startup via ack file/log marker.
+            if _wait_for_launch_ack(log_path, ack_path, launch_token, timeout_sec=ack_timeout):
+                return
+            launch_error = RuntimeError(f"{variant_name} did not acknowledge updater start (rc={rc})")
+            continue
+        except Exception as e:
+            launch_error = e
+            continue
+
+    raise RuntimeError(f"Failed to launch updater shell: {launch_error}")
+
+
+def _cleanup_windows_update_artifacts(exe_path=None):
+    """
+    Best-effort cleanup of updater leftovers next to the running executable.
+    Keeps only the main .exe after successful in-place update.
+    """
+    if platform.system() != "Windows":
+        return
+    # Never clean updater artifacts while an in-process update is being prepared/launched.
+    # This avoids races where payload/ack files are removed before the updater consumes them.
+    try:
+        if bool(globals().get("_WINDOWS_UPDATE_IN_PROGRESS", False)):
+            return
+    except Exception:
+        pass
+
+    try:
+        if exe_path:
+            target_exe = os.path.abspath(str(exe_path))
+        elif getattr(sys, "frozen", False):
+            target_exe = os.path.abspath(sys.executable)
+        else:
+            return
+    except Exception:
+        return
+
+    base_dir = os.path.dirname(target_exe)
+    if not base_dir or not os.path.isdir(base_dir):
+        return
+
+    artifact_dirs = []
+    try:
+        if os.path.isdir(base_dir):
+            artifact_dirs.append(base_dir)
+    except Exception:
+        pass
+    try:
+        work_dir = _resolve_windows_update_work_dir(base_dir)
+        if work_dir and os.path.isdir(work_dir):
+            norms = {os.path.normcase(os.path.normpath(d)) for d in artifact_dirs}
+            wnorm = os.path.normcase(os.path.normpath(work_dir))
+            if wnorm not in norms:
+                artifact_dirs.append(work_dir)
+    except Exception:
+        pass
+
+    candidates = [
+        target_exe + ".previous.exe",
+        target_exe + ".updating.tmp",
+    ]
+
+    for p in candidates:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+
+    for scan_dir in artifact_dirs:
+        try:
+            for name in os.listdir(scan_dir):
+                lname = name.lower()
+                if lname.startswith("snowrunner_editor_updater_") and lname.endswith(".ps1"):
+                    p = os.path.join(scan_dir, name)
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+                elif lname.startswith("snowrunner_editor_updater_ack_") and lname.endswith(".txt"):
+                    p = os.path.join(scan_dir, name)
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+                elif lname.startswith("snowrunner_editor_relaunch_") and lname.endswith(".cmd"):
+                    p = os.path.join(scan_dir, name)
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+                elif lname.startswith("snowrunner_editor_update_payload_") and lname.endswith(".bin"):
+                    p = os.path.join(scan_dir, name)
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+
+def _start_windows_update_artifact_cleanup_retry(exe_path=None, attempts=80, interval_sec=0.5):
+    """Retry cleanup in the background so leftovers disappear shortly after restart."""
+    if platform.system() != "Windows":
+        return
+
+    try:
+        if exe_path:
+            target_exe = os.path.abspath(str(exe_path))
+        elif getattr(sys, "frozen", False):
+            target_exe = os.path.abspath(sys.executable)
+        else:
+            return
+    except Exception:
+        return
+
+    def _has_leftovers():
+        try:
+            base_dir = os.path.dirname(target_exe)
+            if not base_dir or not os.path.isdir(base_dir):
+                return False
+            scan_dirs = []
+            if os.path.isdir(base_dir):
+                scan_dirs.append(base_dir)
+            try:
+                work_dir = _resolve_windows_update_work_dir(base_dir)
+                if work_dir and os.path.isdir(work_dir):
+                    norms = {os.path.normcase(os.path.normpath(d)) for d in scan_dirs}
+                    wnorm = os.path.normcase(os.path.normpath(work_dir))
+                    if wnorm not in norms:
+                        scan_dirs.append(work_dir)
+            except Exception:
+                pass
+            static_paths = [
+                target_exe + ".previous.exe",
+                target_exe + ".updating.tmp",
+            ]
+            for p in static_paths:
+                if os.path.exists(p):
+                    return True
+            for scan_dir in scan_dirs:
+                for name in os.listdir(scan_dir):
+                    lname = str(name).lower()
+                    if lname.startswith("snowrunner_editor_updater_") and lname.endswith(".ps1"):
+                        return True
+                    if lname.startswith("snowrunner_editor_updater_ack_") and lname.endswith(".txt"):
+                        return True
+                    if lname.startswith("snowrunner_editor_relaunch_") and lname.endswith(".cmd"):
+                        return True
+                    if lname.startswith("snowrunner_editor_update_payload_") and lname.endswith(".bin"):
+                        return True
+            return False
+        except Exception:
+            return False
+
+    def _worker():
+        loops = max(1, int(attempts))
+        delay = max(0.05, float(interval_sec))
+        for _ in range(loops):
+            _cleanup_windows_update_artifacts(target_exe)
+            if not _has_leftovers():
+                break
+            time.sleep(delay)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def normalize_version(tag: str) -> int:
     """
     Extract numeric part of version string only.
@@ -11854,11 +19676,16 @@ def check_for_updates_background(root, debug=False):
     done = threading.Event()
 
     def worker():
+        system_name = platform.system()
+        platform_suffix = _platform_release_suffix(system_name)
         result = {
             "status": None,  # "update", "dev", "none", or None on failure/skip
             "current_num": normalize_version(APP_VERSION),
             "latest_num": None,
             "latest_raw": None,
+            "platform_suffix": platform_suffix,
+            "download_url": None,
+            "download_size": None,
         }
         try:
             log("Trying to reach GitHub API...")
@@ -11890,22 +19717,30 @@ def check_for_updates_background(root, debug=False):
                 log("No releases found, aborting.")
                 return
 
-            # collect all tags
-            tags = [rel.get("tag_name", "").lstrip("v") for rel in releases if rel.get("tag_name")]
-            log(f"Found tags: {tags}")
+            selected_release, latest_raw = _select_latest_release_for_platform(releases, platform_suffix)
+            if not latest_raw:
+                log("No valid tag found for this platform, aborting.")
+                return
 
-            # pick the raw tag with the highest numeric part
-            tags_sorted = sorted(tags, key=lambda t: normalize_version(t), reverse=True)
-            latest_raw = tags_sorted[0]
+            tags_preview = [str(rel.get("tag_name", "") or "").lstrip("v") for rel in releases[:15]]
+            log(f"Found tags (preview): {tags_preview}")
+            log(f"Using suffix '{platform_suffix or '-'}' on {system_name}: selected {latest_raw}")
+
             latest_num = normalize_version(latest_raw)
             result["latest_raw"] = latest_raw
             result["latest_num"] = latest_num
 
             log(f"Latest tag after normalization: raw={latest_raw}, numeric={latest_num}")
 
-            if not latest_raw:
-                log("No valid tag found, aborting.")
-                return
+            if system_name == "Windows" and selected_release is not None:
+                pick = _pick_windows_release_download_url(selected_release, latest_raw)
+                if isinstance(pick, dict):
+                    result["download_url"] = str(pick.get("url", "") or "").strip() or None
+                    try:
+                        size_val = pick.get("expected_size")
+                        result["download_size"] = int(size_val) if size_val is not None else None
+                    except Exception:
+                        result["download_size"] = None
 
             current_num = normalize_version(APP_VERSION)
             result["current_num"] = current_num
@@ -11939,6 +19774,10 @@ def check_for_updates_background(root, debug=False):
         status = result.get("status")
         current_num = result.get("current_num", normalize_version(APP_VERSION))
         latest_num = result.get("latest_num", current_num)
+        latest_raw = str(result.get("latest_raw", "") or latest_num)
+        is_windows = platform.system() == "Windows"
+        download_url = str(result.get("download_url", "") or "").strip()
+        download_size = result.get("download_size")
 
         try:
             if status in ("update", "dev", "none"):
@@ -11958,13 +19797,53 @@ def check_for_updates_background(root, debug=False):
         except Exception:
             pass
 
+        if status == "update":
+            try:
+                cfg = _load_config_safe()
+                if _cfg_bool(cfg.get("start_with_windows", False), default=False):
+                    set_app_status(
+                        "Update available. Startup will switch to the newer version after you launch it once.",
+                        timeout_ms=10000,
+                    )
+            except Exception:
+                pass
+
         if status != "update":
+            return
+
+        # During startup, root is temporarily withdrawn. If we build the popup too early,
+        # some systems may never present it. Defer popup creation until the main window is visible.
+        try:
+            root_state = str(root.state()).strip().lower()
+        except Exception:
+            root_state = "normal"
+        try:
+            root_visible = bool(root.winfo_viewable())
+        except Exception:
+            root_visible = (root_state != "withdrawn")
+        if root_state == "withdrawn" or not root_visible:
+            retry_count = int(result_box.get("_update_popup_retry_count", 0) or 0)
+            if retry_count < 120:
+                result_box["_update_popup_retry_count"] = retry_count + 1
+                try:
+                    root.after(120, _apply_result_on_main_thread)
+                except Exception:
+                    pass
+                return
+            try:
+                set_app_status(
+                    "Update available, but popup could not be shown automatically. "
+                    "Use Settings > Check for Update.",
+                    timeout_ms=10000,
+                )
+            except Exception:
+                pass
             return
 
         try:
             top = _create_themed_toplevel(root)
             top.title("Update Available")
-            top.geometry("380x200")
+            top.geometry("420x250")
             try:
                 top.transient(root)
             except Exception:
@@ -11986,7 +19865,7 @@ def check_for_updates_background(root, debug=False):
             ttk.Label(
                 top,
                 text=f"A new version is available!\n\n"
-                     f"Current: {current_num}\nLatest: {latest_num}",
+                     f"Current: {current_num}\nLatest: {latest_raw}",
                 justify="center",
                 wraplength=340
             ).pack(pady=10)
@@ -12003,8 +19882,177 @@ def check_for_updates_background(root, debug=False):
             btn_frame = ttk.Frame(top)
             btn_frame.pack(pady=10)
 
-            ttk.Button(btn_frame, text="Open Page", command=open_page).pack(side="left", padx=5)
-            ttk.Button(btn_frame, text="Copy Link", command=copy_link).pack(side="left", padx=5)
+            if is_windows:
+                status_var = tk.StringVar(value="")
+                status_label = ttk.Label(top, textvariable=status_var, justify="center", wraplength=340)
+                status_label.pack(pady=(0, 8))
+                download_bar = ttk.Progressbar(top, orient="horizontal", length=320, mode="determinate", maximum=100.0)
+                _download_bar_state = {"visible": False}
+
+                def _show_download_bar():
+                    if _download_bar_state["visible"]:
+                        return
+                    try:
+                        download_bar.pack(pady=(0, 8))
+                    except Exception:
+                        pass
+                    _download_bar_state["visible"] = True
+
+                auto_btn = ttk.Button(btn_frame, text="Auto Update")
+                auto_btn.pack(side="left", padx=5)
+
+                def _fmt_size(num_bytes):
+                    try:
+                        n = float(max(0, int(num_bytes)))
+                    except Exception:
+                        return "0 B"
+                    units = ["B", "KB", "MB", "GB"]
+                    idx = 0
+                    while n >= 1024.0 and idx < len(units) - 1:
+                        n /= 1024.0
+                        idx += 1
+                    if idx == 0:
+                        return f"{int(n)} {units[idx]}"
+                    return f"{n:.1f} {units[idx]}"
+
+                def _fmt_eta(seconds):
+                    if seconds is None:
+                        return ""
+                    try:
+                        s = int(max(0, round(float(seconds))))
+                    except Exception:
+                        return ""
+                    if s < 60:
+                        return f"{s}s"
+                    m, s = divmod(s, 60)
+                    if m < 60:
+                        return f"{m}m {s}s"
+                    h, m = divmod(m, 60)
+                    return f"{h}h {m}m"
+
+                def _update_download_ui(downloaded, total, speed_bps, eta_sec):
+                    def _apply():
+                        try:
+                            _show_download_bar()
+                            if total and int(total) > 0:
+                                pct = max(0.0, min(100.0, (float(downloaded) * 100.0) / float(total)))
+                                download_bar.stop()
+                                download_bar.configure(mode="determinate", maximum=100.0, value=pct)
+                                eta_text = _fmt_eta(eta_sec)
+                                eta_part = f", ETA {eta_text}" if eta_text else ""
+                                status_var.set(
+                                    f"Downloading... {pct:.1f}% "
+                                    f"({_fmt_size(downloaded)}/{_fmt_size(total)}) "
+                                    f"at {_fmt_size(speed_bps)}/s{eta_part}"
+                                )
+                            else:
+                                if str(download_bar.cget("mode")) != "indeterminate":
+                                    download_bar.configure(mode="indeterminate")
+                                    download_bar.start(12)
+                                status_var.set(
+                                    f"Downloading... {_fmt_size(downloaded)} "
+                                    f"at {_fmt_size(speed_bps)}/s"
+                                )
+                        except Exception:
+                            pass
+                    try:
+                        root.after(0, _apply)
+                    except Exception:
+                        pass
+
+                def _finish_auto_update(update_payload=None, err_text=None):
+                    global _WINDOWS_UPDATE_IN_PROGRESS
+                    try:
+                        download_bar.stop()
+                    except Exception:
+                        pass
+                    if err_text:
+                        _WINDOWS_UPDATE_IN_PROGRESS = False
+                        try:
+                            auto_btn.config(state="normal")
+                        except Exception:
+                            pass
+                        status_var.set(err_text)
+                        return
+                    try:
+                        _run_windows_updater_script(update_payload)
+                    except Exception as e:
+                        _WINDOWS_UPDATE_IN_PROGRESS = False
+                        try:
+                            auto_btn.config(state="normal")
+                        except Exception:
+                            pass
+                        status_var.set(f"Failed to launch updater: {e}")
+                        return
+
+                    status_var.set("Applying update and restarting now...")
+                    try:
+                        root.update_idletasks()
+                    except Exception:
+                        pass
+                    try:
+                        # Short head start for detached updater, then exit quickly.
+                        time.sleep(0.10)
+                    except Exception:
+                        pass
+                    try:
+                        top.destroy()
+                    except Exception:
+                        pass
+                    try:
+                        root.destroy()
+                    except Exception:
+                        pass
+                    # Ensure the running .exe releases its file lock so updater can replace it.
+                    os._exit(0)
+
+                def _start_auto_update():
+                    global _WINDOWS_UPDATE_IN_PROGRESS
+                    if not download_url:
+                        status_var.set("No Windows download URL found for this release.")
+                        return
+                    _WINDOWS_UPDATE_IN_PROGRESS = True
+                    try:
+                        auto_btn.config(state="disabled")
+                    except Exception:
+                        pass
+                    try:
+                        _show_download_bar()
+                        download_bar.stop()
+                        download_bar.configure(mode="determinate", maximum=100.0, value=0.0)
+                    except Exception:
+                        pass
+                    status_var.set("Downloading latest Windows build...")
+
+                    def _auto_update_worker():
+                        update_payload = None
+                        err_text = None
+                        try:
+                            update_payload = _prepare_windows_self_update(
+                                download_url,
+                                latest_raw,
+                                expected_size=download_size,
+                                progress_callback=_update_download_ui,
+                            )
+                        except Exception as e:
+                            err_text = f"Auto update failed: {e}"
+                        try:
+                            root.after(
+                                0,
+                                lambda payload=update_payload, err=err_text: _finish_auto_update(payload, err),
+                            )
+                        except Exception:
+                            try:
+                                globals()["_WINDOWS_UPDATE_IN_PROGRESS"] = False
+                            except Exception:
+                                pass
+
+                    threading.Thread(target=_auto_update_worker, daemon=True).start()
+
+                auto_btn.config(command=_start_auto_update)
+            else:
+                ttk.Button(btn_frame, text="Open Page", command=open_page).pack(side="left", padx=5)
+                ttk.Button(btn_frame, text="Copy Link", command=copy_link).pack(side="left", padx=5)
 
             # Raise now and again shortly after, because the main window is still finishing startup.
             _bring_update_popup_to_front()
@@ -12186,6 +20234,9 @@ def _apply_focus_outline_fix(root):
 
 # Main GUI entry (builds all tabs + wires callbacks)
 def launch_gui():
+    # Capture terminal output into the shared status log file.
+    install_status_log_stream_tee()
+
     # Check for required/optional dependencies first
     check_dependencies()
     _log_platform_support_status()
@@ -12204,6 +20255,7 @@ def launch_gui():
     global custom_day_var, custom_night_var, other_season_var
     global FACTOR_RULE_VARS, rule_savers, plugin_loaders
     global tyre_var, delete_path_on_close_var, dont_remember_path_var, autosave_var, dark_mode_var, theme_preset_var
+    global objectives_safe_fallback_var
     
     # Create root window first
     root = tk.Tk()
@@ -12211,6 +20263,29 @@ def launch_gui():
     # Hide during initial layout to avoid size jump on startup
     try:
         root.withdraw()
+    except Exception:
+        pass
+    # Run cleanup again after GUI startup so updater leftovers are removed
+    # while the app is open (not only on next restart).
+    try:
+        _start_windows_update_artifact_cleanup_retry()
+    except Exception:
+        pass
+
+    def _runtime_update_artifact_cleanup_tick(remaining=240):
+        if remaining <= 0:
+            return
+        try:
+            _cleanup_windows_update_artifacts()
+        except Exception:
+            pass
+        try:
+            root.after(1000, lambda: _runtime_update_artifact_cleanup_tick(remaining - 1))
+        except Exception:
+            pass
+
+    try:
+        root.after(800, _runtime_update_artifact_cleanup_tick)
     except Exception:
         pass
 
@@ -12248,6 +20323,7 @@ def launch_gui():
     dark_mode_var = tk.BooleanVar(root, value=False)
     theme_preset_var = tk.StringVar(root, value="Light")
     max_autobackups_var = tk.StringVar(root, value="50")
+    objectives_safe_fallback_var = tk.BooleanVar(root, value=_get_objectives_safe_fallback_mode())
     # Initialize additional variables
     difficulty_var = tk.StringVar(root)
     truck_avail_var = tk.StringVar(root)
@@ -12259,6 +20335,12 @@ def launch_gui():
     garage_refuel_var = tk.BooleanVar(root)
     app_status_var = tk.StringVar(root, value=_DEFAULT_STATUS_TEXT)
     configure_app_status(root, app_status_var)
+    try:
+        # Start Objectives+ online refresh immediately so latest data is ready
+        # by the time the tab is opened.
+        start_objectives_prefetch_background(force=False)
+    except Exception:
+        pass
 
     # Ensure global registries exist before building UI
     try:
@@ -12290,7 +20372,27 @@ def launch_gui():
     config = load_config()
     delete_path_on_close_var.set(config.get("delete_path_on_close", False))
     dont_remember_path_var.set(config.get("dont_remember_path", False))
+    enable_legacy_tabs_var = tk.BooleanVar(root, value=bool(config.get("enable_legacy_tabs", False)))
     dark_mode_var.set(bool(config.get("dark_mode", False)))
+    try:
+        val = config.get("objectives_use_safe_fallback", None)
+        if val is None:
+            val = config.get("objectives_use_backup", False)
+        _set_objectives_safe_fallback_mode(bool(val))
+        objectives_safe_fallback_var.set(_get_objectives_safe_fallback_mode())
+    except Exception:
+        pass
+    improve_share_raw = config.get("improve_share_enabled", False)
+    if isinstance(improve_share_raw, bool):
+        improve_share_enabled = improve_share_raw
+    else:
+        improve_share_enabled = str(improve_share_raw).strip().lower() in ("1", "true", "yes", "on")
+    improve_share_var = tk.BooleanVar(root, value=bool(improve_share_enabled))
+    improve_share_state_lock = threading.Lock()
+    improve_share_state = {
+        "uploading": False,
+        "last_uploaded_signature": "",
+    }
     try:
         globals()["_THEME_CUSTOM_PRESETS"] = _load_theme_presets_from_config(config)
     except Exception:
@@ -12308,6 +20410,12 @@ def launch_gui():
         _bind_autosave_runtime_state_traces()
     except Exception as e:
         print("[Autosave] failed to bind state traces:", e)
+
+    # If startup is enabled, keep the Startup shortcut aligned to the currently running build.
+    try:
+        _sync_windows_startup_registration_if_needed()
+    except Exception as e:
+        print("[Startup] registration sync failed:", e)
 
     check_for_updates_background(root, debug=True)
 
@@ -12339,8 +20447,7 @@ def launch_gui():
         root.after(_VERSION_CHECK_DELAY_MS, _delayed_version_check)
     except Exception:
         try:
-            dummy = tk._default_root or tk.Toplevel()
-            dummy.after(_VERSION_CHECK_DELAY_MS, _delayed_version_check)
+            (tk._default_root or root).after(_VERSION_CHECK_DELAY_MS, _delayed_version_check)
         except Exception:
             # as last resort, call directly (will be immediate)
             _delayed_version_check()
@@ -12460,6 +20567,145 @@ def launch_gui():
             set_app_status(f"Loaded {base} and synchronized all tabs.", timeout_ms=5000)
         except Exception:
             pass
+
+    def _set_improve_share_meta_text(text, timeout_ms=6000):
+        message = str(text or "").strip()
+        if not message:
+            return
+        try:
+            set_app_status(message, timeout_ms=timeout_ms)
+        except Exception:
+            pass
+
+    def _update_improve_share_meta(message_override=None, timeout_ms=6000):
+        if message_override is not None:
+            _set_improve_share_meta_text(message_override, timeout_ms=timeout_ms)
+            return
+        if not improve_share_var.get():
+            _set_improve_share_meta_text("Optional upload: off.", timeout_ms=timeout_ms)
+            return
+        if not is_improve_upload_endpoint_configured():
+            _set_improve_share_meta_text(
+                "Optional upload: enabled, but worker URL is not configured.",
+                timeout_ms=timeout_ms,
+            )
+            return
+        _set_improve_share_meta_text(
+            "Optional upload: on. Only top-level files starting with commonsslsave or completesave are sent anonymously.",
+            timeout_ms=timeout_ms,
+        )
+
+    def _maybe_upload_improve_samples_from_save_path(save_file_path=None, force=False):
+        if not improve_share_var.get():
+            return
+
+        endpoint = get_improve_upload_endpoint()
+        if not is_improve_upload_endpoint_configured(endpoint):
+            msg = "Optional upload skipped: worker URL is not configured in the desktop editor."
+            _update_improve_share_meta(msg, timeout_ms=9000)
+            return
+
+        file_path = str(save_file_path or save_path_var.get() or "").strip()
+        if not file_path or not os.path.isfile(file_path):
+            _update_improve_share_meta("Optional upload: on. Select a valid save file to send samples.", timeout_ms=7000)
+            return
+
+        folder_path = os.path.dirname(file_path)
+        if not folder_path or not os.path.isdir(folder_path):
+            msg = "Optional upload skipped: save folder path is not available."
+            _update_improve_share_meta(msg, timeout_ms=9000)
+            return
+
+        sample_entries = collect_improve_share_entries(folder_path)
+        if not sample_entries:
+            msg = "Optional upload skipped: no top-level files found in the save folder."
+            _update_improve_share_meta(msg, timeout_ms=7000)
+            return
+
+        signature = get_improve_share_signature(folder_path, sample_entries)
+        with improve_share_state_lock:
+            if improve_share_state.get("uploading"):
+                msg = "Optional upload already in progress."
+                _update_improve_share_meta(msg, timeout_ms=5000)
+                return
+            if (not force) and signature and signature == improve_share_state.get("last_uploaded_signature"):
+                msg = "Optional upload already sent for this loaded folder."
+                _update_improve_share_meta(msg, timeout_ms=5000)
+                return
+            improve_share_state["uploading"] = True
+
+        folder_root = os.path.basename(os.path.normpath(folder_path))
+        upload_count = len(sample_entries)
+        _update_improve_share_meta(f"Uploading anonymous samples ({upload_count} file(s))...", timeout_ms=0)
+
+        def _worker(entries_snapshot, sig_snapshot, folder_root_snapshot):
+            try:
+                result = upload_improve_samples_from_entries(
+                    entries_snapshot,
+                    endpoint=endpoint,
+                    source="snowrunner-save-editor-desktop",
+                    folder_root=folder_root_snapshot,
+                )
+                batch_id = str((result or {}).get("batchId") or (result or {}).get("id") or "").strip()
+                raw_uploaded_count = (result or {}).get("uploadedCount")
+                try:
+                    uploaded_count = int(raw_uploaded_count)
+                except Exception:
+                    uploaded_count = len(entries_snapshot)
+                raw_failed_count = (result or {}).get("failedCount")
+                try:
+                    failed_count = int(raw_failed_count)
+                except Exception:
+                    failed_count = 0
+                raw_ignored_count = (result or {}).get("ignoredCount")
+                try:
+                    ignored_count = int(raw_ignored_count)
+                except Exception:
+                    ignored_count = 0
+                first_error = str((result or {}).get("error") or "").strip()
+
+                if failed_count > 0:
+                    if batch_id:
+                        message = (
+                            f"Optional upload partial ({uploaded_count} uploaded, {failed_count} failed, "
+                            f"{ignored_count} ignored, ID: {batch_id})."
+                        )
+                    else:
+                        message = (
+                            f"Optional upload partial ({uploaded_count} uploaded, {failed_count} failed, "
+                            f"{ignored_count} ignored)."
+                        )
+                    if first_error:
+                        message = f"{message} {first_error}"
+                elif batch_id:
+                    message = f"Optional upload complete ({uploaded_count} file(s), {ignored_count} ignored, ID: {batch_id})."
+                else:
+                    message = f"Optional upload complete ({uploaded_count} file(s), {ignored_count} ignored)."
+
+                if failed_count <= 0:
+                    with improve_share_state_lock:
+                        improve_share_state["last_uploaded_signature"] = sig_snapshot
+
+                _update_improve_share_meta(message, timeout_ms=9000)
+            except Exception as err:
+                message = f"Optional upload failed: {err}"
+                _update_improve_share_meta(message, timeout_ms=10000)
+            finally:
+                with improve_share_state_lock:
+                    improve_share_state["uploading"] = False
+
+        threading.Thread(
+            target=_worker,
+            args=(sample_entries, signature, folder_root),
+            daemon=True,
+        ).start()
+
+    def _on_improve_share_checkbox_changed():
+        enabled = bool(improve_share_var.get())
+        _update_config_values({"improve_share_enabled": enabled})
+        _update_improve_share_meta(timeout_ms=7000)
+        if enabled:
+            _maybe_upload_improve_samples_from_save_path()
 
     # Expose refresh helpers to module-level code that uses globals()
     try:
@@ -12628,6 +20874,8 @@ def launch_gui():
         # Centralized refresh
         try:
             _refresh_all_tabs_from_save(file_path)
+            if improve_share_var.get():
+                _maybe_upload_improve_samples_from_save_path(file_path)
             return
         except Exception as e:
             print(f"_refresh_all_tabs_from_save failed: {e}")
@@ -12693,6 +20941,9 @@ def launch_gui():
                 _sync_time_ui(day=day, night=night, skip_time=s)
             except Exception:
                 pass
+
+            if improve_share_var.get():
+                _maybe_upload_improve_samples_from_save_path(file_path)
 
         except Exception:
             # This should be rare because we validated earlier, but handle defensively
@@ -12762,18 +21013,59 @@ def launch_gui():
     # TAB: Money & Rank (inline UI built below)
     tab_control.add(tab_money, text='Money & Rank')
 
-    # TAB: Missions (inline UI built below)
-    tab_control.add(tab_missions, text='Missions')
+    # TAB: Missions (legacy, optional; inline UI built below)
+    # Visibility is controlled by the Settings -> Enable legacy tabs option.
 
-    # TAB: Contests (create_contest_tab)
+    # TAB: Contests (legacy, optional; create_contest_tab)
     tab_contests = ttk.Frame(tab_control)
-    tab_control.add(tab_contests, text='Contests')
     _register_lazy_tab(tab_contests, "Contests", lambda: create_contest_tab(tab_contests, save_path_var))
 
     # TAB: Objectives+ (create_objectives_tab)
     tab_objectives = ttk.Frame(tab_control)
     tab_control.add(tab_objectives, text='Objectives+')
     _register_lazy_tab(tab_objectives, "Objectives+", lambda: create_objectives_tab(tab_objectives, save_path_var))
+
+    def _tab_present(tab_frame):
+        try:
+            return str(tab_frame) in set(tab_control.tabs())
+        except Exception:
+            return False
+
+    def _set_legacy_tabs_visibility(show):
+        show = bool(show)
+        try:
+            current_tab = str(tab_control.select())
+        except Exception:
+            current_tab = ""
+        current_is_legacy = current_tab in {str(tab_missions), str(tab_contests)}
+
+        try:
+            if _tab_present(tab_missions):
+                tab_control.forget(tab_missions)
+        except Exception:
+            pass
+        try:
+            if _tab_present(tab_contests):
+                tab_control.forget(tab_contests)
+        except Exception:
+            pass
+
+        if show:
+            try:
+                tab_control.insert(tab_objectives, tab_missions, text="Missions")
+            except Exception:
+                pass
+            try:
+                tab_control.insert(tab_objectives, tab_contests, text="Contests")
+            except Exception:
+                pass
+        elif current_is_legacy:
+            try:
+                tab_control.select(tab_objectives)
+            except Exception:
+                pass
+
+    _set_legacy_tabs_visibility(enable_legacy_tabs_var.get())
 
     # TAB: Trials (create_trials_tab)
     tab_trials = ttk.Frame(tab_control)
@@ -12827,6 +21119,10 @@ def launch_gui():
     tab_control.add(tab_garages, text="Garages")
     _register_lazy_tab(tab_garages, "Garages", lambda: create_garages_tab(tab_garages, save_path_var))
 
+    # TAB: Vehicles (create_vehicles_tab)
+    tab_vehicles = ttk.Frame(tab_control)
+    tab_control.add(tab_vehicles, text="Vehicles")
+    _register_lazy_tab(tab_vehicles, "Vehicles", lambda: create_vehicles_tab(tab_vehicles, save_path_var))
 
     # start autosave monitor if autosave enabled in config
     try:
@@ -12906,6 +21202,31 @@ def launch_gui():
 
     tab_control.pack(side="top", expand=1, fill='both')
 
+    def _open_status_logs_file():
+        path = get_status_log_path()
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        try:
+            if not os.path.exists(path):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("")
+        except Exception as e:
+            return set_app_status(f"Could not create status log file: {e}", timeout_ms=9000)
+
+        try:
+            system = platform.system()
+            if system == "Windows" and hasattr(os, "startfile"):
+                os.startfile(path)
+            elif system == "Darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            set_app_status(f"Opened status logs: {path}", timeout_ms=7000)
+        except Exception as e:
+            set_app_status(f"Could not open status logs: {e}", timeout_ms=9000)
+
     status_bar = ttk.Frame(root, style="StatusBar.TFrame")
     status_bar.pack(side="bottom", fill="x")
     ttk.Separator(status_bar, orient="horizontal").pack(fill="x")
@@ -12919,6 +21240,7 @@ def launch_gui():
         fill="x",
         expand=True,
     )
+    ttk.Button(status_row, text="Status logs", width=12, command=_open_status_logs_file).pack(side="right")
 
     # End NOTEBOOK + TAB REGISTRY
     # ensure Settings is last
@@ -12929,27 +21251,59 @@ def launch_gui():
     tab_control.add(tab_settings, text='Settings')
 
     # Restore last selected tab if available
-    config = load_config()
-    last_tab_index = config.get("last_tab", 0)
-    try:
-        restore_tab_index = int(last_tab_index)
-    except Exception:
-        restore_tab_index = 0
-    try:
-        tab_control.select(restore_tab_index)
-    except Exception:
-        pass
+    config = load_config() or {}
+    last_tab_text = str(config.get("last_tab_text", "") or "").strip()
+    # Backward-compat across legacy label naming changes.
+    tab_alias = {
+        "Missions [Legacy]": "Missions",
+        "Contests [Legacy]": "Contests",
+        "Missions": "Missions",
+        "Contests": "Contests",
+    }
+    target_text = tab_alias.get(last_tab_text, last_tab_text)
+    restored = False
+    if target_text:
+        try:
+            for tab_id in tab_control.tabs():
+                try:
+                    if str(tab_control.tab(tab_id, "text")) == target_text:
+                        tab_control.select(tab_id)
+                        restored = True
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            restored = False
+
+    if not restored:
+        last_tab_index = config.get("last_tab", 0)
+        try:
+            restore_tab_index = int(last_tab_index)
+        except Exception:
+            restore_tab_index = 0
+        try:
+            tab_count = max(1, len(tab_control.tabs()))
+            restore_tab_index = max(0, min(restore_tab_index, tab_count - 1))
+            tab_control.select(restore_tab_index)
+        except Exception:
+            pass
 
     # Track tab changes, lazy-load on first open, and save selected tab index.
     def on_tab_change(event):
         try:
-            current_tab_widget = tab_control.nametowidget(tab_control.select())
+            current_tab_id = tab_control.select()
+            current_tab_widget = tab_control.nametowidget(current_tab_id)
             _ensure_lazy_tab_built(current_tab_widget)
         except Exception:
             pass
-        config = load_config()
-        config["last_tab"] = tab_control.index(tab_control.select())
-        save_config(config)
+        try:
+            config = load_config() or {}
+            current_tab_id = tab_control.select()
+            config["last_tab"] = tab_control.index(current_tab_id)
+            config["last_tab_text"] = str(tab_control.tab(current_tab_id, "text") or "")
+            save_config(config)
+        except Exception:
+            pass
 
     tab_control.bind("<<NotebookTabChanged>>", on_tab_change)
 
@@ -13528,10 +21882,22 @@ def launch_gui():
     refresh_theme_preset_values(selected=_ACTIVE_THEME_NAME)
 
     ttk.Button(tab_settings, text="Theme Customizer", command=open_theme_customizer).pack(pady=(6, 0))
+    def _toggle_legacy_tabs_visibility():
+        try:
+            _set_legacy_tabs_visibility(enable_legacy_tabs_var.get())
+        except Exception:
+            pass
+    ttk.Checkbutton(
+        tab_settings,
+        text="Enable legacy tabs (Missions/Contests)",
+        variable=enable_legacy_tabs_var,
+        command=_toggle_legacy_tabs_visibility,
+    ).pack(pady=(6, 0))
     ttk.Checkbutton(tab_settings, text="Don't remember save file path", variable=dont_remember_path_var).pack(pady=(5, 0))
     ttk.Checkbutton(tab_settings, text="Delete saved path on close", variable=delete_path_on_close_var).pack(pady=(5, 10))
     def save_settings_silent():
         config = load_config()
+        config["enable_legacy_tabs"] = bool(enable_legacy_tabs_var.get())
         config["dont_remember_path"] = dont_remember_path_var.get()
         config["delete_path_on_close"] = delete_path_on_close_var.get()
         config["dark_mode"] = bool(dark_mode_var.get())
@@ -13539,9 +21905,19 @@ def launch_gui():
         config["theme_presets"] = _serialize_theme_presets()
         config["make_backup"] = make_backup_var.get()
         config["full_backup"] = full_backup_var.get()
-        config["max_backups"] = int(max_backups_var.get())
-        config["max_autobackups"] = int(max_autobackups_var.get())
+        config["max_backups"] = _parse_nonnegative_int(
+            max_backups_var.get(),
+            _parse_nonnegative_int(config.get("max_backups", 20), 20),
+        )
+        config["max_autobackups"] = _parse_nonnegative_int(
+            max_autobackups_var.get(),
+            _parse_nonnegative_int(config.get("max_autobackups", 50), 50),
+        )
         config["autosave"] = bool(autosave_var.get() if autosave_var is not None else False)
+        try:
+            config["objectives_use_safe_fallback"] = bool(objectives_safe_fallback_var.get())
+        except Exception:
+            pass
         save_config(config)
 
     def save_settings():
@@ -13758,6 +22134,8 @@ def launch_gui():
         try:
             _refresh_all_tabs_from_save(file_path)
             set_app_status(f"Selected save file: {os.path.basename(file_path)}", timeout_ms=5000)
+            if improve_share_var.get():
+                _maybe_upload_improve_samples_from_save_path(file_path)
         except Exception:
             pass
 
@@ -13955,16 +22333,114 @@ def launch_gui():
     center_frame = ttk.Frame(row2)
     center_frame.pack()
 
+    def _attach_simple_hover_tooltip(anchor_widget, tooltip_text):
+        tip_state = {"win": None, "job": None}
+
+        def _cancel_job():
+            job = tip_state.get("job")
+            if job is not None:
+                try:
+                    anchor_widget.after_cancel(job)
+                except Exception:
+                    pass
+                tip_state["job"] = None
+
+        def _hide(_event=None):
+            _cancel_job()
+            tip = tip_state.get("win")
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+                tip_state["win"] = None
+
+        def _show_now():
+            _hide()
+            try:
+                tip = tk.Toplevel(anchor_widget)
+                tip.wm_overrideredirect(True)
+                try:
+                    tip.withdraw()
+                except Exception:
+                    pass
+                try:
+                    tip.attributes("-topmost", True)
+                except Exception:
+                    pass
+                x = int(anchor_widget.winfo_rootx() + anchor_widget.winfo_width() + 8)
+                y = int(anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 6)
+                tip.geometry(f"+{x}+{y}")
+                tk.Label(
+                    tip,
+                    text=str(tooltip_text or ""),
+                    justify="left",
+                    wraplength=430,
+                    bg="#fffbe6",
+                    fg="black",
+                    relief="solid",
+                    bd=1,
+                    padx=8,
+                    pady=6,
+                ).pack()
+                tip_state["win"] = tip
+                try:
+                    tip.deiconify()
+                except Exception:
+                    pass
+            except Exception:
+                _hide()
+
+        def _schedule_show(_event=None):
+            _cancel_job()
+            try:
+                tip_state["job"] = anchor_widget.after(260, _show_now)
+            except Exception:
+                _show_now()
+
+        anchor_widget.bind("<Enter>", _schedule_show, add="+")
+        anchor_widget.bind("<Leave>", _hide, add="+")
+        anchor_widget.bind("<ButtonPress>", _hide, add="+")
+        anchor_widget.bind("<FocusOut>", _hide, add="+")
+
     ttk.Button(center_frame, text="Load Path 1", width=12, command=lambda: _load_saved_path(1)).pack(side="left", padx=(0,6))
     ttk.Button(center_frame, text="Load Path 2", width=12, command=lambda: _load_saved_path(2)).pack(side="left", padx=(0,12))
     ttk.Button(center_frame, text="Browse...", command=browse_file).pack(side="left")
+    improve_share_inline = ttk.Frame(center_frame)
+    improve_share_inline.pack(side="left", padx=(12, 0))
+    ttk.Checkbutton(
+        improve_share_inline,
+        text="Make editor better (optional)",
+        variable=improve_share_var,
+        command=_on_improve_share_checkbox_changed,
+    ).pack(side="left")
+    improve_share_info_badge = tk.Label(
+        improve_share_inline,
+        text="i",
+        width=2,
+        relief="ridge",
+        bd=1,
+        highlightthickness=0,
+        cursor="question_arrow",
+        bg=_theme_color_literal("#e9e9e9", role="button_bg"),
+        fg=_theme_color_literal("black", role="fg"),
+    )
+    improve_share_info_badge.pack(side="left", padx=(5, 0))
+    _attach_simple_hover_tooltip(
+        improve_share_info_badge,
+        "If enabled, a copy of your save file will be uploaded anonymously and used only for improving features and fixing bugs. "
+        "Files are stored privately and never shared.",
+    )
+
+    if improve_share_var.get():
+        _update_improve_share_meta(timeout_ms=6000)
+        _maybe_upload_improve_samples_from_save_path()
 
     # Help / hints below (single label)
     ttk.Label(
         tab_file,
         text=(
-            "⚠️ It's recommended to create a backup of your save file before editing even tho the checkbox above should do them.\n\n"
-            "Instructions for loading:\n"
+            "Instructions for loading:\n\n"
             "Slot 1 → CompleteSave.cfg\n"
             "Slot 2 → CompleteSave1.cfg\n"
             "Slot 3 → CompleteSave2.cfg\n"
@@ -13988,6 +22464,42 @@ def launch_gui():
         style="Warning.TLabel",
         font=("TkDefaultFont", 9, "bold")
     ).pack(pady=(5, 10))
+
+    def _open_save_tab_link(url, label):
+        try:
+            webbrowser.open(str(url), new=2)
+            set_app_status(f"Opened {label}.", timeout_ms=5000)
+        except Exception as e:
+            set_app_status(f"Failed to open {label}: {e}", timeout_ms=9000)
+
+    save_tab_links_left = ttk.Frame(tab_file)
+    save_tab_links_left.place(relx=0.0, rely=1.0, anchor="sw", x=10, y=-10)
+    ttk.Button(
+        save_tab_links_left,
+        text="Buy me a coffee",
+        command=lambda: _open_save_tab_link("https://buymeacoffee.com/mrboxik", "Buy me a coffee"),
+    ).pack(side="left", padx=(0, 6))
+    ttk.Button(
+        save_tab_links_left,
+        text="Discord Tech Support",
+        command=lambda: _open_save_tab_link("https://discord.com/users/638802769393745950", "Discord Tech Support"),
+    ).pack(side="left")
+
+    save_tab_links_right = ttk.Frame(tab_file)
+    save_tab_links_right.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-10)
+    ttk.Button(
+        save_tab_links_right,
+        text="GitHub page",
+        command=lambda: _open_save_tab_link("https://github.com/MrBoxik/SnowRunner-Save-Editor", "GitHub page"),
+    ).pack(side="left", padx=(0, 6))
+    ttk.Button(
+        save_tab_links_right,
+        text="License",
+        command=lambda: _open_save_tab_link(
+            "https://github.com/MrBoxik/SnowRunner-Save-Editor/blob/main/LICENSE",
+            "License",
+        ),
+    ).pack(side="left")
 
     # Footer text pinned to bottom center of the Save File tab
     footer_frame = ttk.Frame(tab_file)
@@ -14567,6 +23079,30 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
         except Exception as e:
             print("[Warning] Auto-sync failed:", e)
 
+    _close_guard = {"done": False}
+
+    def _shutdown_editor():
+        if _close_guard["done"]:
+            return
+        _close_guard["done"] = True
+        try:
+            save_settings_silent()
+        except Exception:
+            pass
+        try:
+            stop_autosave_monitor()
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+    try:
+        root.protocol("WM_DELETE_WINDOW", _shutdown_editor)
+    except Exception:
+        pass
+
     _apply_editor_theme(root, dark_mode=dark_mode_var.get())
 
     # --- Auto-size window to show all tabs and full Rules tab content ---
@@ -14662,6 +23198,13 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
 FogToolFrame = FogToolApp
 if __name__ == "__main__":
     try:
+        argv_flags = {str(a).strip().lower() for a in sys.argv[1:] if str(a).strip()}
+        _cleanup_windows_update_artifacts()
+        _start_windows_update_artifact_cleanup_retry()
+        if "--self-test" in argv_flags:
+            # Lightweight startup probe for the auto-updater:
+            # process must launch and exit cleanly without opening the GUI.
+            sys.exit(0)
         launch_gui()
     except Exception as e:
         print("[Fatal] Editor failed to launch:", e)
