@@ -44,6 +44,7 @@ from datetime import datetime, timezone
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, PhotoImage, colorchooser
+from tkinter import simpledialog
 import tkinter.font as tkfont
 
 # Preserve native messagebox functions so we can fall back when needed.
@@ -54,7 +55,7 @@ _NATIVE_SHOWERROR = messagebox.showerror
 # =============================================================================
 # APP VERSION (manual)
 # =============================================================================
-APP_VERSION = 100
+APP_VERSION = 102
 _UPDATE_STATUS = None  # "update", "dev", "none"
 
 # -----------------------------------------------------------------------------
@@ -2461,21 +2462,23 @@ def _windows_startup_shortcut_path():
     return os.path.join(startup_dir, "SnowRunner Editor.lnk")
 
 
-def _startup_launch_target_and_args():
+def _startup_launch_target_and_args(start_minimized=False):
     if getattr(sys, "frozen", False):
         target = os.path.abspath(sys.executable)
-        args = ""
+        args = "--start-minimized" if bool(start_minimized) else ""
         workdir = os.path.dirname(target)
     else:
         target = os.path.abspath(sys.executable)
         script = os.path.abspath(sys.argv[0])
         args = f"\"{script}\"".strip()
+        if bool(start_minimized):
+            args = f"{args} --start-minimized".strip()
         workdir = os.path.dirname(script)
     return target, args, workdir
 
 
-def _startup_registration_metadata():
-    target, args, workdir = _startup_launch_target_and_args()
+def _startup_registration_metadata(start_minimized=False):
+    target, args, workdir = _startup_launch_target_and_args(start_minimized=bool(start_minimized))
     return {
         "start_with_windows_registered_version": int(APP_VERSION),
         "start_with_windows_registered_target": str(target),
@@ -2506,7 +2509,8 @@ def _sync_windows_startup_registration_if_needed():
     if not _cfg_bool(cfg.get("start_with_windows", False), default=False):
         return
 
-    expected = _startup_registration_metadata()
+    startup_minimized = _cfg_bool(cfg.get("start_with_windows_minimized", False), default=False)
+    expected = _startup_registration_metadata(start_minimized=startup_minimized)
     shortcut_path = _windows_startup_shortcut_path()
     shortcut_exists = bool(shortcut_path and os.path.exists(shortcut_path))
 
@@ -2530,7 +2534,7 @@ def _sync_windows_startup_registration_if_needed():
     if not needs_refresh:
         return
 
-    ok, msg = _apply_startup_mode(True)
+    ok, msg = _apply_startup_mode(True, start_minimized=startup_minimized)
     if not ok:
         print(f"[Startup] auto-refresh failed: {msg}")
         return
@@ -2542,7 +2546,7 @@ def _sync_windows_startup_registration_if_needed():
     )
 
 
-def _set_windows_startup_enabled(enabled):
+def _set_windows_startup_enabled(enabled, start_minimized=False):
     """
     Enable or disable startup shortcut registration on Windows.
     """
@@ -2566,7 +2570,7 @@ def _set_windows_startup_enabled(enabled):
             raise RuntimeError(f"Failed to remove startup shortcut: {e}") from e
         return "Startup launch disabled."
 
-    target, args, workdir = _startup_launch_target_and_args()
+    target, args, workdir = _startup_launch_target_and_args(start_minimized=bool(start_minimized))
     ps = (
         "$W = New-Object -ComObject WScript.Shell; "
         f"$S = $W.CreateShortcut({_ps_quote(shortcut_path)}); "
@@ -2580,7 +2584,7 @@ def _set_windows_startup_enabled(enabled):
     return "Startup launch enabled."
 
 
-def _apply_startup_mode(enabled):
+def _apply_startup_mode(enabled, start_minimized=False):
     """
     Apply startup mode on this OS. Non-Windows platforms keep config only.
     Returns (ok: bool, message: str).
@@ -2588,7 +2592,7 @@ def _apply_startup_mode(enabled):
     if not _is_windows_startup_supported():
         return False, "Startup launch integration is currently only available on Windows."
     try:
-        msg = _set_windows_startup_enabled(enabled)
+        msg = _set_windows_startup_enabled(enabled, start_minimized=bool(start_minimized))
         return True, msg
     except Exception as e:
         return False, str(e)
@@ -5239,47 +5243,48 @@ def modify_time(file_path, time_day, time_night, skip_time):
 # SECTION: Missions Completion (Missions tab)
 # Used In: Missions tab -> Complete Selected Missions
 # =============================================================================
-def complete_seasons_and_maps(file_path, selected_seasons, selected_maps):
-    with open(file_path, 'r', encoding='utf-8') as file:
-        content = file.read()
+def complete_seasons_and_maps(file_path, selected_seasons, selected_maps, notify=True):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as file:
+            content = file.read()
 
-    start = content.find('"objectiveStates"')
-    if start == -1:
-        messagebox.showerror("Error", "'objectiveStates' not found in save file.")
-        return
+        start = content.find('"objectiveStates"')
+        if start == -1:
+            return _action_error("'objectiveStates' not found in save file.", notify=notify)
 
-    block_str, block_start, block_end = extract_brace_block(content, start)
-    obj_states = json.loads(block_str)
-    modified = False
+        block_str, block_start, block_end = extract_brace_block(content, start)
+        obj_states = json.loads(block_str)
+        modified = False
 
-    for key in obj_states:
-        for season in selected_seasons:
-            map_id = SEASON_ID_MAP.get(season)
-            if map_id and map_id in key:
-                obj_states[key]["isFinished"] = True
-                obj_states[key]["wasCompletedAtLeastOnce"] = True
-                modified = True
-            elif f"_{season:02}_" in key:
-                obj_states[key]["isFinished"] = True
-                obj_states[key]["wasCompletedAtLeastOnce"] = True
-                modified = True
+        for key in obj_states:
+            for season in selected_seasons:
+                map_id = SEASON_ID_MAP.get(season)
+                if map_id and map_id in key:
+                    obj_states[key]["isFinished"] = True
+                    obj_states[key]["wasCompletedAtLeastOnce"] = True
+                    modified = True
+                elif f"_{season:02}_" in key:
+                    obj_states[key]["isFinished"] = True
+                    obj_states[key]["wasCompletedAtLeastOnce"] = True
+                    modified = True
 
-        for map_id in selected_maps:
-            if map_id in key:
-                obj_states[key]["isFinished"] = True
-                obj_states[key]["wasCompletedAtLeastOnce"] = True
-                modified = True
+            for map_id in selected_maps:
+                if map_id in key:
+                    obj_states[key]["isFinished"] = True
+                    obj_states[key]["wasCompletedAtLeastOnce"] = True
+                    modified = True
 
-    if not modified:
-        show_info("Notice", "No matching missions found.")
-        return
+        if not modified:
+            return _action_result("Notice", "No matching missions found.", notify=notify)
 
-    new_block_str = json.dumps(obj_states, separators=(",", ":"))
-    content = content[:block_start] + new_block_str + content[block_end:]
-    with open(file_path, 'w', encoding='utf-8') as out_file:
-        out_file.write(content)
+        new_block_str = json.dumps(obj_states, separators=(",", ":"))
+        content = content[:block_start] + new_block_str + content[block_end:]
+        with open(file_path, 'w', encoding='utf-8') as out_file:
+            out_file.write(content)
 
-    show_info("Success", "Selected missions marked complete.")
+        return _action_result("Success", "Selected missions marked complete.", notify=notify)
+    except Exception as e:
+        return _action_error(str(e), notify=notify)
 
 # -----------------------------------------------------------------------------
 # END SECTION: Missions Completion (Missions tab)
@@ -5364,17 +5369,17 @@ def update_all_contest_times_blocks(content, new_entries):
             new_block_str = json.dumps(parsed, separators=(",", ":"))
             updated_content = updated_content[:block_start] + new_block_str + updated_content[block_end:]
     return updated_content
-def mark_discovered_contests_complete(save_path, selected_seasons, selected_maps, debug=False):
+def mark_discovered_contests_complete(save_path, selected_seasons, selected_maps, debug=False, notify=True, make_backup=True):
     """
     save_path: path to save file
     selected_seasons: list of ints (season numbers)
     selected_maps: list of map code strings (e.g. "US_01")
     debug: if True, prints debug info to stdout
     """
-    make_backup_if_enabled(save_path)
+    if make_backup:
+        make_backup_if_enabled(save_path)
     if not os.path.exists(save_path):
-        messagebox.showerror("Error", "Save file not found.")
-        return
+        return _action_error("Save file not found.", notify=notify)
 
     if debug:
         print(f"[DEBUG] mark_discovered_contests_complete called with seasons={selected_seasons} maps={selected_maps}")
@@ -5595,12 +5600,11 @@ def mark_discovered_contests_complete(save_path, selected_seasons, selected_maps
             f.write(content)
 
         if total_added == 0:
-            show_info("Info", "No new contests were modified.")
-        else:
-            show_info("Success", f"{total_added} contests marked as completed.")
+            return _action_result("Info", "No new contests were modified.", notify=notify)
+        return _action_result("Success", f"{total_added} contests marked as completed.", notify=notify)
 
     except Exception as e:
-        messagebox.showerror("Error", repr(e))
+        return _action_error(repr(e), notify=notify)
 
 # -----------------------------------------------------------------------------
 # END SECTION: JSON Block Parsing + Contest/Mission Helpers
@@ -6496,15 +6500,16 @@ def _normalize_feature_states(entry):
         entry["isUpgradable"] = True
     return entry
 
-def unlock_watchtowers(save_path, selected_regions):
-    make_backup_if_enabled(save_path)
+def unlock_watchtowers(save_path, selected_regions, notify=True, make_backup=True):
+    if make_backup:
+        make_backup_if_enabled(save_path)
     try:
         with open(save_path, "r", encoding="utf-8") as f:
             content = f.read()
 
         match = re.search(r'"watchPointsData"\s*:\s*{', content)
         if not match:
-            return messagebox.showerror("Error", "No watchPointsData found in file.")
+            return _action_error("No watchPointsData found in file.", notify=notify)
 
         block, start, end = extract_brace_block(content, match.end() - 1)
         wp_data = json.loads(block)
@@ -6534,12 +6539,13 @@ def unlock_watchtowers(save_path, selected_regions):
         msg = f"Unlocked {updated} watchtowers."
         if added:
             msg += f" Added {added} missing entries."
-        show_info("Success", msg)
+        return _action_result("Success", msg, notify=notify)
     except Exception as e:
-        messagebox.showerror("Error", str(e))
+        return _action_error(str(e), notify=notify)
 
-def unlock_garages(save_path, selected_regions, upgrade_all=False):
-    make_backup_if_enabled(save_path)
+def unlock_garages(save_path, selected_regions, upgrade_all=False, notify=True, make_backup=True):
+    if make_backup:
+        make_backup_if_enabled(save_path)
     try:
         with open(save_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -6547,13 +6553,13 @@ def unlock_garages(save_path, selected_regions, upgrade_all=False):
         # Locate SslValue block (main save data)
         ssl_match = re.search(r'"SslValue"\s*:\s*{', content)
         if not ssl_match:
-            return messagebox.showerror("Error", "SslValue block not found in save file.")
+            return _action_error("SslValue block not found in save file.", notify=notify)
 
         ssl_block, ssl_start, ssl_end = extract_brace_block(content, ssl_match.end() - 1)
         try:
             ssl_data = json.loads(ssl_block)
         except Exception as e:
-            return messagebox.showerror("Error", f"Failed to parse SslValue:\n{e}")
+            return _action_error(f"Failed to parse SslValue:\n{e}", notify=notify)
 
         # levelGarageStatuses
         lg_data = ssl_data.get("levelGarageStatuses", {})
@@ -6643,12 +6649,13 @@ def unlock_garages(save_path, selected_regions, upgrade_all=False):
             msg += f" Upgraded {upgraded_entries} garages."
             if added_upgradable:
                 msg += f" Added {added_upgradable} upgradable garage entries."
-        show_info("Success", msg)
+        return _action_result("Success", msg, notify=notify)
     except Exception as e:
-        messagebox.showerror("Error", str(e))
+        return _action_error(str(e), notify=notify)
 
-def unlock_discoveries(save_path, selected_regions):
-    make_backup_if_enabled(save_path)
+def unlock_discoveries(save_path, selected_regions, notify=True, make_backup=True):
+    if make_backup:
+        make_backup_if_enabled(save_path)
     try:
         with open(save_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -6656,7 +6663,7 @@ def unlock_discoveries(save_path, selected_regions):
         # Only modify discoveredTrucks under persistentProfileData
         pp_match = re.search(r'"persistentProfileData"\s*:\s*{', content)
         if not pp_match:
-            return messagebox.showerror("Error", "persistentProfileData not found in save file.")
+            return _action_error("persistentProfileData not found in save file.", notify=notify)
 
         pp_block, pp_start, pp_end = extract_brace_block(content, pp_match.end() - 1)
 
@@ -6703,12 +6710,13 @@ def unlock_discoveries(save_path, selected_regions):
         msg = f"Updated {updated} discovery entries."
         if added:
             msg += f" Added {added} missing entries."
-        show_info("Success", msg)
+        return _action_result("Success", msg, notify=notify)
     except Exception as e:
-        messagebox.showerror("Error", str(e))
+        return _action_error(str(e), notify=notify)
 
-def unlock_levels(save_path, selected_regions):
-    make_backup_if_enabled(save_path)
+def unlock_levels(save_path, selected_regions, notify=True, make_backup=True):
+    if make_backup:
+        make_backup_if_enabled(save_path)
     try:
         with open(save_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -6716,7 +6724,7 @@ def unlock_levels(save_path, selected_regions):
         # --- persistentProfileData.knownRegions (only this block) ---
         pp_match = re.search(r'"persistentProfileData"\s*:\s*{', content)
         if not pp_match:
-            return messagebox.showerror("Error", "persistentProfileData not found in save file.")
+            return _action_error("persistentProfileData not found in save file.", notify=notify)
 
         pp_block, pp_start, pp_end = extract_brace_block(content, pp_match.end() - 1)
         kr_match = re.search(r'"knownRegions"\s*:\s*\[', pp_block)
@@ -6777,9 +6785,9 @@ def unlock_levels(save_path, selected_regions):
             f"Known regions added: {added_selected_kr}. "
             f"Visited levels added: {added_selected_vl}."
         )
-        show_info("Success", msg)
+        return _action_result("Success", msg, notify=notify)
     except Exception as e:
-        messagebox.showerror("Error", str(e))
+        return _action_error(str(e), notify=notify)
 
 # -----------------------------------------------------------------------------
 # END SECTION: Upgrades + Watchtowers Data & Helpers
@@ -10871,7 +10879,7 @@ def create_backups_tab(tab_backups, save_path_var):
 
     def open_backup_settings():
         """
-        Robust Backup Settings popup with autosave/backup settings and startup integration.
+        Robust Backup Settings popup with autosave and backup settings.
         """
         # Determine parent safely
         try:
@@ -10881,7 +10889,7 @@ def create_backups_tab(tab_backups, save_path_var):
 
         win = _create_themed_toplevel(parent)
         win.title("Backup Settings")
-        win.geometry("580x500")
+        win.geometry("580x400")
         win.resizable(False, False)
         try:
             if parent:
@@ -10937,13 +10945,6 @@ def create_backups_tab(tab_backups, save_path_var):
             win,
             value=str(_sanitize_autosave_poll_interval_seconds(cfg.get("autosave_poll_interval_seconds", 60), default=60)),
         )
-        startup_with_windows_var = tk.BooleanVar(
-            win,
-            value=_cfg_bool(cfg.get("start_with_windows", False), default=False),
-        )
-
-        startup_supported = _is_windows_startup_supported()
-
         def _autosave_toggled(*_):
             """Start/stop autosave monitor when checkbox changes."""
             try:
@@ -10957,10 +10958,6 @@ def create_backups_tab(tab_backups, save_path_var):
                     stop_autosave_monitor()
             except Exception as e:
                 print("[Autosave] toggle error:", e)
-
-        def _on_startup_normal_toggle():
-            # checkbox state is already the desired final state
-            return
 
         def _attach_hover_tooltip(anchor_widget, tooltip_text):
             tip_state = {"win": None, "job": None}
@@ -11115,25 +11112,6 @@ def create_backups_tab(tab_backups, save_path_var):
             tmp_ab_val = tk.StringVar(win, value=str(cfg.get("max_autobackups", "50")))
             ttk.Entry(row2, textvariable=tmp_ab_val, width=8).pack(side="left", padx=(8, 0))
 
-        ttk.Separator(frm, orient="horizontal").pack(fill="x", pady=(12, 8))
-        ttk.Label(frm, text="Startup", font=("TkDefaultFont", 11, "bold")).pack(anchor="w", pady=(0, 6))
-
-        startup_normal_cb = ttk.Checkbutton(
-            frm,
-            text="Start editor with Windows",
-            variable=startup_with_windows_var,
-            command=_on_startup_normal_toggle,
-        )
-        startup_normal_cb.pack(anchor="w", pady=(0, 2))
-
-        if not startup_supported:
-            startup_normal_cb.configure(state="disabled")
-            ttk.Label(
-                frm,
-                text="Windows startup integration is unavailable on this platform.",
-                style="Warning.TLabel",
-            ).pack(anchor="w", pady=(2, 6))
-
         # Buttons
         btn_row = ttk.Frame(frm)
         btn_row.pack(fill="x", pady=(14, 0))
@@ -11172,8 +11150,6 @@ def create_backups_tab(tab_backups, save_path_var):
             except Exception:
                 new_cfg = {}
 
-            startup_normal = bool(startup_with_windows_var.get())
-
             try:
                 new_cfg["make_backup"] = _cfg_bool(make_backup_var_local.get(), default=True)
                 new_cfg["full_backup"] = _cfg_bool(full_backup_var_local.get(), default=False)
@@ -11186,15 +11162,6 @@ def create_backups_tab(tab_backups, save_path_var):
                     default=_sanitize_autosave_poll_interval_seconds(new_cfg.get("autosave_poll_interval_seconds", 60), default=60),
                 )
                 autosave_poll_interval_var.set(str(new_cfg["autosave_poll_interval_seconds"]))
-                new_cfg["start_with_windows"] = bool(startup_normal)
-                new_cfg["start_with_windows_hidden"] = False
-                if startup_normal:
-                    new_cfg.update(_startup_registration_metadata())
-                else:
-                    new_cfg.pop("start_with_windows_registered_version", None)
-                    new_cfg.pop("start_with_windows_registered_target", None)
-                    new_cfg.pop("start_with_windows_registered_args", None)
-                    new_cfg.pop("start_with_windows_registered_workdir", None)
             except Exception:
                 # fallbacks
                 new_cfg.setdefault("max_backups", 20)
@@ -11203,36 +11170,7 @@ def create_backups_tab(tab_backups, save_path_var):
                 save_config(new_cfg)
             except Exception as e:
                 print("[Backup Settings] Failed to save config:", e)
-
-            if startup_supported:
-                ok, startup_msg = _apply_startup_mode(startup_normal)
-                if not ok:
-                    print(f"[Startup] apply failed: {startup_msg}")
-                    if startup_normal:
-                        _delete_config_keys(
-                            [
-                                "start_with_windows_registered_version",
-                                "start_with_windows_registered_target",
-                                "start_with_windows_registered_args",
-                                "start_with_windows_registered_workdir",
-                            ]
-                        )
-                    set_app_status(f"Backup settings saved. Startup setting could not be applied: {startup_msg}", timeout_ms=9000)
-                else:
-                    if startup_normal:
-                        _update_config_values(_startup_registration_metadata())
-                    else:
-                        _delete_config_keys(
-                            [
-                                "start_with_windows_registered_version",
-                                "start_with_windows_registered_target",
-                                "start_with_windows_registered_args",
-                                "start_with_windows_registered_workdir",
-                            ]
-                        )
-                    show_info("Settings", "Backup settings saved.")
-            else:
-                show_info("Settings", "Backup settings saved.")
+            show_info("Settings", "Backup settings saved.")
 
             try:
                 stop_autosave_monitor()
@@ -11332,10 +11270,44 @@ def create_backups_tab(tab_backups, save_path_var):
 
     cols = ("name", "time")
     tree = ttk.Treeview(tree_frame, columns=cols, show="headings", style="Backups.Treeview")
-    tree.heading("name", text="Name")
-    tree.heading("time", text="Saved Time")
     tree.column("name", width=600, anchor="w")
     tree.column("time", width=180, anchor="center")
+    _sort_cfg = _load_config_safe()
+    _saved_sort_column = str(_sort_cfg.get("backups_sort_column", "time") or "time").strip().lower()
+    if _saved_sort_column not in ("name", "time"):
+        _saved_sort_column = "time"
+    _saved_sort_desc_default = (_saved_sort_column == "time")
+    _saved_sort_descending = _cfg_bool(
+        _sort_cfg.get("backups_sort_descending", _saved_sort_desc_default),
+        default=_saved_sort_desc_default,
+    )
+    sort_state = {"column": _saved_sort_column, "descending": bool(_saved_sort_descending)}
+    tree_item_to_folder = {}
+
+    def _refresh_sort_headers():
+        name_text = "Name"
+        time_text = "Saved Time"
+        if sort_state["column"] == "name":
+            name_text = "Name (Z-A)" if sort_state["descending"] else "Name (A-Z)"
+        elif sort_state["column"] == "time":
+            time_text = "Saved Time (Old-New)" if not sort_state["descending"] else "Saved Time (New-Old)"
+        tree.heading("name", text=name_text, command=lambda: _on_sort_heading("name"))
+        tree.heading("time", text=time_text, command=lambda: _on_sort_heading("time"))
+
+    def _on_sort_heading(column_name):
+        if sort_state["column"] == column_name:
+            sort_state["descending"] = not sort_state["descending"]
+        else:
+            sort_state["column"] = column_name
+            sort_state["descending"] = (column_name == "time")
+        _update_config_values(
+            {
+                "backups_sort_column": str(sort_state["column"]),
+                "backups_sort_descending": bool(sort_state["descending"]),
+            }
+        )
+        _refresh_sort_headers()
+        list_backup_folders()
 
     vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=vsb.set)
@@ -11403,6 +11375,7 @@ def create_backups_tab(tab_backups, save_path_var):
         """
         # clear existing rows
         tree.delete(*tree.get_children())
+        tree_item_to_folder.clear()
 
         backup_dir = _get_backup_dir()
         if not backup_dir or not os.path.exists(backup_dir):
@@ -11412,8 +11385,8 @@ def create_backups_tab(tab_backups, save_path_var):
             return
 
         try:
-            items = sorted(os.listdir(backup_dir), reverse=True)
-            if not items:
+            item_names = list(os.listdir(backup_dir))
+            if not item_names:
                 tree.insert("", "end", values=("No backups found", ""))
                 _add_backups_filler_rows(1)
                 recall_btn.config(state="disabled")
@@ -11429,31 +11402,66 @@ def create_backups_tab(tab_backups, save_path_var):
                 # some ttk themes or environments may not allow tag styling — ignore safely
                 pass
 
-            real_count = 0
-            for idx, name in enumerate(items):
-                p = os.path.join(backup_dir, name)
-                label = name + ("/" if os.path.isdir(p) else "")
+            entries = []
+            for name in item_names:
+                full_path = os.path.join(backup_dir, name)
+                if not os.path.isdir(full_path):
+                    continue
 
-                # Try to extract saved time from folder name (backup-DD.MM.YYYY HH-MM-SS)
-                time_str = ""
-                m = re.match(r'^(?:backup|autobackup)-(\d{2}\.\d{2}\.\d{4}) (\d{2}-\d{2}-\d{2})', name)
+                parsed_dt = None
+                m = re.match(r"^(?:backup|autobackup)-(\d{2}\.\d{2}\.\d{4}) (\d{2}-\d{2}-\d{2})", name, flags=re.IGNORECASE)
                 if m:
                     try:
-                        dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%d.%m.%Y %H-%M-%S")
-                        time_str = dt.strftime("%d.%m.%Y %H:%M:%S")
+                        parsed_dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%d.%m.%Y %H-%M-%S")
                     except Exception:
-                        time_str = ""
+                        parsed_dt = None
 
-                # Fallback to filesystem mtime if parsing failed
-                if not time_str:
+                file_mtime = None
+                try:
+                    file_mtime = float(os.path.getmtime(full_path))
+                except Exception:
+                    file_mtime = None
+
+                if parsed_dt is not None:
+                    sort_ts = float(parsed_dt.timestamp())
+                    display_time = parsed_dt.strftime("%d.%m.%Y %H:%M:%S")
+                elif file_mtime is not None:
+                    sort_ts = file_mtime
                     try:
-                        mtime = os.path.getmtime(p)
-                        time_str = datetime.fromtimestamp(mtime).strftime("%d.%m.%Y %H:%M:%S")
+                        display_time = datetime.fromtimestamp(file_mtime).strftime("%d.%m.%Y %H:%M:%S")
                     except Exception:
-                        time_str = "Failed to get time"
+                        display_time = "Failed to get time"
+                else:
+                    sort_ts = 0.0
+                    display_time = "Failed to get time"
 
+                entries.append(
+                    {
+                        "name": name,
+                        "display_name": f"{name}/",
+                        "time_text": display_time,
+                        "sort_ts": sort_ts,
+                    }
+                )
+
+            if not entries:
+                tree.insert("", "end", values=("No backups found", ""))
+                _add_backups_filler_rows(1)
+                recall_btn.config(state="disabled")
+                return
+
+            sort_column = str(sort_state.get("column", "time") or "time")
+            descending = bool(sort_state.get("descending", True))
+            if sort_column == "name":
+                entries.sort(key=lambda e: (e["name"].casefold(), e["sort_ts"]), reverse=descending)
+            else:
+                entries.sort(key=lambda e: (e["sort_ts"], e["name"].casefold()), reverse=descending)
+
+            real_count = 0
+            for idx, entry in enumerate(entries):
                 tag = "even" if (idx % 2 == 0) else "odd"
-                tree.insert("", "end", values=(label, time_str), tags=(tag,))
+                iid = tree.insert("", "end", values=(entry["display_name"], entry["time_text"]), tags=(tag,))
+                tree_item_to_folder[str(iid)] = str(entry["name"])
                 real_count += 1
 
             _add_backups_filler_rows(real_count)
@@ -11470,44 +11478,25 @@ def create_backups_tab(tab_backups, save_path_var):
 
     # list_files_in_backup removed: per-file recall and folder drilling disabled
 
-    def _selected_item():
+    def _selected_backup_folder_name():
         sel = tree.selection()
         if not sel:
             return None
-        iid = sel[0]
+        iid = str(sel[0])
         if str(iid).startswith("filler_"):
             return None
-        vals = tree.item(sel[0], "values")
-        if not vals:
+        folder_name = str(tree_item_to_folder.get(iid, "") or "").strip()
+        if not folder_name:
             return None
-        first = str(vals[0] or "")
-        if (not first.strip()) or first.startswith("No backups found") or first.startswith("Error listing backups:"):
-            return None
-        return vals[0]  # relname or folder label
+        return folder_name
 
     def on_tree_double_click(event):
         # Double-click disabled: do nothing to avoid drilling into backup folders.
         return
 
     def on_tree_select(event):
-        sel = tree.selection()
-        if not sel:
-            recall_btn.config(state="disabled")
-            return
-        iid = sel[0]
-        if str(iid).startswith("filler_"):
-            recall_btn.config(state="disabled")
-            return
-        vals = tree.item(sel[0], "values")
-        if not vals:
-            recall_btn.config(state="disabled")
-            return
-        first = str(vals[0] or "")
-        if (not first.strip()) or first.startswith("No backups found") or first.startswith("Error listing backups:"):
-            recall_btn.config(state="disabled")
-            return
-        # Only folder-level rows are shown; enable recall when an item is selected
-        recall_btn.config(state="normal")
+        folder_name = _selected_backup_folder_name()
+        recall_btn.config(state=("normal" if folder_name else "disabled"))
 
     def on_refresh():
         # Always show folder-level listing; disable drilling into backup folders.
@@ -11529,8 +11518,8 @@ def create_backups_tab(tab_backups, save_path_var):
         If in folders mode: restore the entire selected backup folder into save folder.
         If in files mode: restore the selected CompleteSave file + matching companions (existing logic).
         """
-        sel = _selected_item()
-        if not sel:
+        folder_name = _selected_backup_folder_name()
+        if not folder_name:
             show_info("Recall", "No item selected.")
             return
 
@@ -11540,8 +11529,6 @@ def create_backups_tab(tab_backups, save_path_var):
             return
 
         # Restore the entire selected backup folder
-        folder_label = sel
-        folder_name = folder_label.rstrip("/")
         chosen = os.path.join(backup_dir, folder_name)
         if not os.path.exists(chosen):
             messagebox.showerror("Recall", f"Backup folder not found: {folder_name}")
@@ -11568,6 +11555,97 @@ def create_backups_tab(tab_backups, save_path_var):
         # refresh listing
         list_backup_folders()
 
+    def _validate_backup_name(raw_name):
+        new_name = str(raw_name or "").strip()
+        if not new_name:
+            return False, "Backup name cannot be empty."
+        if new_name in {".", ".."}:
+            return False, "Backup name is not valid."
+        if (os.sep and os.sep in new_name) or (os.altsep and os.altsep in new_name):
+            return False, "Backup name cannot contain path separators."
+        if any(ch in new_name for ch in '<>:"|?*'):
+            return False, "Backup name contains invalid characters."
+        if new_name.endswith(" ") or new_name.endswith("."):
+            return False, "Backup name cannot end with a space or dot."
+        return True, new_name
+
+    def on_rename_selected_backup():
+        folder_name = _selected_backup_folder_name()
+        if not folder_name:
+            messagebox.showinfo("Rename backup", "Select a backup folder first.")
+            return
+
+        backup_dir = _get_backup_dir()
+        if not backup_dir or not os.path.isdir(backup_dir):
+            messagebox.showerror("Rename backup", "Backup folder not found.")
+            return
+
+        old_path = os.path.join(backup_dir, folder_name)
+        if not os.path.isdir(old_path):
+            messagebox.showerror("Rename backup", f"Backup folder not found: {folder_name}")
+            return
+
+        new_name_raw = simpledialog.askstring(
+            "Rename backup",
+            "Enter new backup name:",
+            initialvalue=folder_name,
+            parent=container.winfo_toplevel(),
+        )
+        if new_name_raw is None:
+            return
+
+        ok_name, name_or_msg = _validate_backup_name(new_name_raw)
+        if not ok_name:
+            messagebox.showerror("Rename backup", str(name_or_msg))
+            return
+
+        new_name = str(name_or_msg)
+        if new_name == folder_name:
+            return
+
+        new_path = os.path.join(backup_dir, new_name)
+        if os.path.exists(new_path):
+            messagebox.showerror("Rename backup", f"A backup named '{new_name}' already exists.")
+            return
+
+        try:
+            os.rename(old_path, new_path)
+        except Exception as e:
+            messagebox.showerror("Rename backup", f"Failed to rename backup:\n{e}")
+            return
+
+        list_backup_folders()
+        for iid, mapped_name in tree_item_to_folder.items():
+            if str(mapped_name) == new_name:
+                try:
+                    tree.selection_set(iid)
+                    tree.focus(iid)
+                    tree.see(iid)
+                except Exception:
+                    pass
+                break
+        set_app_status(f"Renamed backup to '{new_name}'.", timeout_ms=4500)
+
+    tree_context_menu = tk.Menu(tree, tearoff=0)
+    tree_context_menu.add_command(label="Rename backup", command=on_rename_selected_backup)
+
+    def on_tree_right_click(event):
+        row_id = str(tree.identify_row(event.y) or "").strip()
+        if not row_id or row_id.startswith("filler_") or row_id not in tree_item_to_folder:
+            return
+        try:
+            tree.selection_set(row_id)
+            tree.focus(row_id)
+        except Exception:
+            pass
+        try:
+            tree_context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                tree_context_menu.grab_release()
+            except Exception:
+                pass
+
     _backups_resize_job = {"id": None}
     def _schedule_backups_resize_refresh(_event=None):
         try:
@@ -11586,6 +11664,8 @@ def create_backups_tab(tab_backups, save_path_var):
     # Bindings
     tree.bind("<Double-1>", on_tree_double_click)
     tree.bind("<<TreeviewSelect>>", on_tree_select)
+    tree.bind("<Button-3>", on_tree_right_click)
+    tree.bind("<Control-Button-1>", on_tree_right_click)
     tree.bind("<Configure>", _schedule_backups_resize_refresh)
     refresh_btn.config(command=on_refresh)
     make_full_backup_btn.config(command=on_make_full_backup)
@@ -11593,6 +11673,7 @@ def create_backups_tab(tab_backups, save_path_var):
     recall_btn.config(command=on_recall_selected)
 
     # initial populate
+    _refresh_sort_headers()
     list_backup_folders()
     
 # ───────────────────────────────────    
@@ -11790,6 +11871,97 @@ def _add_check_all_checkbox(tab, all_vars, before_widget=None, label="Check All"
     # Ensure initial state matches current selections
     sync_all()
     return check_all_var
+
+
+def _action_result(title, message, notify=True):
+    result = {"ok": True, "title": str(title or ""), "message": str(message or "")}
+    if notify:
+        show_info(result["title"], result["message"])
+    return result
+
+
+def _action_error(message, title="Error", notify=True):
+    result = {"ok": False, "title": str(title or "Error"), "message": str(message or "")}
+    if notify:
+        messagebox.showerror(result["title"], result["message"])
+    return result
+
+
+def _attach_hover_tooltip(anchor_widget, tooltip_text, delay_ms=260, wraplength=430):
+    tip_state = {"win": None, "job": None}
+
+    def _cancel_job():
+        job = tip_state.get("job")
+        if job is not None:
+            try:
+                anchor_widget.after_cancel(job)
+            except Exception:
+                pass
+            tip_state["job"] = None
+
+    def _hide(_event=None):
+        _cancel_job()
+        tip = tip_state.get("win")
+        if tip is not None:
+            try:
+                tip.destroy()
+            except Exception:
+                pass
+            tip_state["win"] = None
+
+    def _show_now():
+        _hide()
+        if not tooltip_text:
+            return
+        try:
+            tip = tk.Toplevel(anchor_widget)
+            try:
+                tip.withdraw()
+            except Exception:
+                pass
+            tip.wm_overrideredirect(True)
+            try:
+                tip.attributes("-topmost", True)
+            except Exception:
+                pass
+            tk.Label(
+                tip,
+                text=str(tooltip_text or ""),
+                justify="left",
+                wraplength=wraplength,
+                bg=_theme_color_literal("#fff0f0", role="bg"),
+                fg=_theme_color_literal("#8b0000", role="fg"),
+                relief="solid",
+                bd=1,
+                padx=8,
+                pady=6,
+            ).pack()
+            try:
+                tip.update_idletasks()
+            except Exception:
+                pass
+            x = int(anchor_widget.winfo_rootx() + anchor_widget.winfo_width() + 8)
+            y = int(anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 6)
+            tip.geometry(f"+{x}+{y}")
+            tip_state["win"] = tip
+            try:
+                tip.deiconify()
+            except Exception:
+                pass
+        except Exception:
+            _hide()
+
+    def _schedule_show(_event=None):
+        _cancel_job()
+        try:
+            tip_state["job"] = anchor_widget.after(max(50, int(delay_ms)), _show_now)
+        except Exception:
+            _show_now()
+
+    anchor_widget.bind("<Enter>", _schedule_show, add="+")
+    anchor_widget.bind("<Leave>", _hide, add="+")
+    anchor_widget.bind("<ButtonPress>", _hide, add="+")
+    anchor_widget.bind("<FocusOut>", _hide, add="+")
 
 # UI helper: shared season/base-map selector used by multiple tabs
 def _build_region_selector(
@@ -11991,16 +12163,16 @@ def create_contest_tab(tab, save_path_var):
         justify="center"
     ).pack(pady=(5, 10))
 # Helper for Upgrades tab actions (launch_gui -> tab_upgrades)
-def find_and_modify_upgrades(save_path, selected_region_codes):
-    make_backup_if_enabled(save_path)
+def find_and_modify_upgrades(save_path, selected_region_codes, notify=True, make_backup=True):
+    if make_backup:
+        make_backup_if_enabled(save_path)
     try:
         with open(save_path, "r", encoding="utf-8") as f:
             content = f.read()
 
         match = re.search(r'"upgradesGiverData"\s*:\s*{', content)
         if not match:
-            messagebox.showerror("Error", "No upgradesGiverData found in file.")
-            return
+            return _action_error("No upgradesGiverData found in file.", notify=notify)
 
         start_index = match.end() - 1
         block, block_start, block_end = extract_brace_block(content, start_index)
@@ -12028,9 +12200,9 @@ def find_and_modify_upgrades(save_path, selected_region_codes):
         msg = f"Updated {updated} upgrades."
         if added:
             msg += f" Added {added} missing entries."
-        show_info("Success", msg)
+        return _action_result("Success", msg, notify=notify)
     except Exception as e:
-        messagebox.showerror("Error", str(e))
+        return _action_error(str(e), notify=notify)
         
 ACHIEVEMENT_NAMES = {
     "YouCanDrive_CompleteTutorial": "Yeah, you can drive!",
@@ -13590,6 +13762,294 @@ def create_garages_tab(tab, save_path_var):
         wraplength=1000,
         justify="left"
     ).pack(pady=(6, 0), padx=12)
+
+
+def create_region_tools_tab(tab, save_path_var, enable_legacy_tabs_var=None):
+    missions_info = "You must accept the task or mission in the game before it can be completed."
+    contests_info = (
+        "You must accept or discover the contests for them to be marked as completed.\n\n"
+        "This also completes unfinished tasks found on the same map."
+    )
+    upgrades_info = (
+        "At least one upgrade must already be marked or collected in-game for this to work.\n\n"
+        "If a new season is added, you may need to collect or mark one new upgrade first."
+    )
+    watchtowers_info = "This marks watchtowers as found, but it will not reveal the map. Use Fog Tool for that."
+    discoveries_info = "Sets discovered trucks to their max for selected regions but won't add them to the garage."
+    levels_info = "Lets you view regions you haven't visited yet."
+    garages_info = (
+        "Garages will be unlocked but may still be hidden under fog of war.\n\n"
+        "To make it work correctly, don't open the map itself to enter the garage. In map selection, hover the map and "
+        "use the yellow 'Garage Opened' icon shown at the bottom to port into the garage instantly.\n\n"
+        "Recover can stay semi-broken until you find the garage entrance, and some garage entrances are quest-gated "
+        "(for example Amur - Chernokamensk)."
+    )
+
+    seasons = [(name, i) for i, name in enumerate(SEASON_LABELS, start=1)]
+    maps = [(name, code) for code, name in BASE_MAPS]
+    selector = _build_region_selector(
+        tab,
+        seasons,
+        maps,
+        base_maps_label="Base Game Maps:",
+        base_maps_label_font=("TkDefaultFont", 10, "bold"),
+        season_pady=(10, 8),
+    )
+    season_vars = selector["season_vars"]
+    map_vars = selector["map_vars"]
+    all_region_vars = selector["all_check_vars"]
+    other_season_var = selector["other_var"]
+
+    separator = ttk.Separator(tab, orient="horizontal")
+    separator.pack(fill="x", padx=12, pady=(10, 8))
+    _add_check_all_checkbox(tab, all_region_vars, before_widget=separator, label="Check All Regions")
+
+    features_box = ttk.Frame(tab)
+    features_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    features_center = ttk.Frame(features_box)
+    features_center.pack(anchor="center")
+
+    ttk.Label(
+        features_center,
+        text=(
+            "Pick the regions, then tick the features you want to apply. "
+            "Hover the red i to see the warning text for that feature."
+        ),
+        justify="center",
+        wraplength=980,
+    ).pack(anchor="center", pady=(0, 8))
+
+    feature_specs = [
+        {"key": "missions", "label": "Missions (Legacy)", "info": missions_info, "legacy": True},
+        {"key": "contests", "label": "Contests (Legacy)", "info": contests_info, "legacy": True},
+        {"key": "upgrades", "label": "Upgrades", "info": upgrades_info},
+        {"key": "watchtowers", "label": "Watchtowers", "info": watchtowers_info},
+        {"key": "discoveries", "label": "Discoveries", "info": discoveries_info},
+        {"key": "levels", "label": "Levels", "info": levels_info},
+        {"key": "garages", "label": "Garages", "info": garages_info},
+    ]
+
+    garage_upgrade_all_var = tk.IntVar(value=0)
+    feature_vars = {}
+    feature_check_vars = []
+    feature_rows = {}
+    extra_slot_width = 200
+    rows_box = ttk.Frame(features_center)
+    rows_box.pack(anchor="center")
+    rows_box.grid_columnconfigure(0, minsize=extra_slot_width)
+    rows_box.grid_columnconfigure(4, minsize=extra_slot_width)
+
+    def _build_feature_row(row_index, spec):
+        var = tk.IntVar(value=0)
+        feature_vars[spec["key"]] = var
+        feature_check_vars.append(var)
+
+        row_widgets = []
+
+        main_cb = ttk.Checkbutton(rows_box, variable=var)
+        main_cb.grid(row=row_index, column=1, sticky="w", pady=3)
+        row_widgets.append(main_cb)
+
+        label = ttk.Label(rows_box, text=spec["label"])
+        label.grid(row=row_index, column=2, sticky="w", padx=(6, 26), pady=3)
+        row_widgets.append(label)
+
+        info_badge = tk.Label(
+            rows_box,
+            text="i",
+            width=2,
+            relief="ridge",
+            bd=1,
+            highlightthickness=0,
+            cursor="question_arrow",
+            bg=_theme_color_literal("#f4d6d6", role="button_bg"),
+            fg=_theme_color_literal("#b00000", role="fg"),
+        )
+        info_badge.grid(row=row_index, column=3, sticky="w", pady=3)
+        _attach_hover_tooltip(info_badge, spec.get("info", ""))
+        row_widgets.append(info_badge)
+
+        if spec["key"] == "garages":
+            garages_extra = ttk.Checkbutton(
+                rows_box,
+                text="Upgrade All Garages",
+                variable=garage_upgrade_all_var,
+            )
+            garages_extra.grid(row=row_index, column=4, sticky="w", padx=(18, 0), pady=3)
+            row_widgets.append(garages_extra)
+
+        feature_rows[spec["key"]] = {"widgets": row_widgets, "legacy": bool(spec.get("legacy"))}
+
+    for index, spec in enumerate(feature_specs):
+        _build_feature_row(index, spec)
+
+    def _show_legacy_features():
+        try:
+            return bool(enable_legacy_tabs_var.get()) if enable_legacy_tabs_var is not None else True
+        except Exception:
+            return True
+
+    feature_control_row = ttk.Frame(features_center)
+    feature_control_row.pack(anchor="center", pady=(10, 0))
+
+    def _visible_feature_vars():
+        visible = []
+        for spec in feature_specs:
+            if spec.get("legacy") and not _show_legacy_features():
+                continue
+            visible.append(feature_vars[spec["key"]])
+        return visible
+
+    def _add_check_all_visible_features(parent):
+        guard = {"busy": False}
+        check_all_var = tk.IntVar(value=0)
+
+        def set_all():
+            if guard["busy"]:
+                return
+            guard["busy"] = True
+            try:
+                value = 1 if check_all_var.get() else 0
+                for var in _visible_feature_vars():
+                    try:
+                        var.set(value)
+                    except Exception:
+                        pass
+            finally:
+                guard["busy"] = False
+
+        def sync_all(*_):
+            if guard["busy"]:
+                return
+            guard["busy"] = True
+            try:
+                visible_vars = _visible_feature_vars()
+                all_on = bool(visible_vars) and all(bool(v.get()) for v in visible_vars)
+                check_all_var.set(1 if all_on else 0)
+            finally:
+                guard["busy"] = False
+
+        cb = ttk.Checkbutton(parent, text="Check All Features", variable=check_all_var, command=set_all)
+        cb.pack(anchor="center")
+
+        for var in feature_check_vars:
+            _trace_var_write(var, sync_all)
+        if enable_legacy_tabs_var is not None:
+            _trace_var_write(enable_legacy_tabs_var, sync_all)
+        sync_all()
+        return check_all_var
+
+    _add_check_all_visible_features(feature_control_row)
+
+    def _collect_region_payload():
+        selected_seasons = _collect_checked_values(season_vars)
+        _append_other_season_int(selected_seasons, other_season_var)
+        selected_maps = _collect_checked_values(map_vars)
+        selected_regions = [SEASON_ID_MAP[s] for s in selected_seasons if s in SEASON_ID_MAP]
+        selected_regions.extend(selected_maps)
+        _append_other_region_code(selected_regions, other_season_var)
+
+        deduped_regions = []
+        seen_regions = set()
+        for code in selected_regions:
+            code_key = str(code).upper()
+            if code_key in seen_regions:
+                continue
+            seen_regions.add(code_key)
+            deduped_regions.append(code)
+
+        return selected_seasons, selected_maps, deduped_regions
+
+    def _sync_legacy_feature_rows(*_):
+        show_legacy = _show_legacy_features()
+        for key, payload in feature_rows.items():
+            if not payload.get("legacy"):
+                continue
+            if show_legacy:
+                for widget in payload.get("widgets", []):
+                    if widget.winfo_manager() != "grid":
+                        widget.grid()
+            else:
+                try:
+                    feature_vars[key].set(0)
+                except Exception:
+                    pass
+                for widget in payload.get("widgets", []):
+                    widget.grid_remove()
+
+    if enable_legacy_tabs_var is not None:
+        _trace_var_write(enable_legacy_tabs_var, _sync_legacy_feature_rows)
+    _sync_legacy_feature_rows()
+
+    feature_labels = {spec["key"]: spec["label"] for spec in feature_specs}
+
+    def on_apply():
+        path = save_path_var.get()
+        if not os.path.exists(path):
+            return messagebox.showerror("Error", "Save file not found.")
+
+        selected_keys = []
+        for spec in feature_specs:
+            if spec.get("legacy") and not _show_legacy_features():
+                continue
+            if bool(feature_vars[spec["key"]].get()):
+                selected_keys.append(spec["key"])
+
+        if not selected_keys:
+            return show_info("Info", "No features selected.")
+
+        selected_seasons, selected_maps, selected_regions = _collect_region_payload()
+        if not selected_seasons and not selected_maps:
+            return show_info("Info", "No seasons or maps selected.")
+
+        make_backup_if_enabled(path)
+
+        results = []
+        for key in selected_keys:
+            if key == "missions":
+                result = complete_seasons_and_maps(path, selected_seasons, selected_maps, notify=False)
+            elif key == "contests":
+                result = mark_discovered_contests_complete(
+                    path,
+                    selected_seasons,
+                    selected_maps,
+                    notify=False,
+                    make_backup=False,
+                )
+            elif key == "upgrades":
+                result = find_and_modify_upgrades(path, selected_regions, notify=False, make_backup=False)
+            elif key == "watchtowers":
+                result = unlock_watchtowers(path, selected_regions, notify=False, make_backup=False)
+            elif key == "discoveries":
+                result = unlock_discoveries(path, selected_regions, notify=False, make_backup=False)
+            elif key == "levels":
+                result = unlock_levels(path, selected_regions, notify=False, make_backup=False)
+            elif key == "garages":
+                result = unlock_garages(
+                    path,
+                    selected_regions,
+                    upgrade_all=bool(garage_upgrade_all_var.get()),
+                    notify=False,
+                    make_backup=False,
+                )
+            else:
+                continue
+
+            if not isinstance(result, dict) or not result.get("ok"):
+                title = "Error"
+                message = "Unknown error."
+                if isinstance(result, dict):
+                    title = result.get("title") or title
+                    message = result.get("message") or message
+                messagebox.showerror(title, message)
+                return
+            results.append(f"{feature_labels.get(key, key)}: {result.get('message', '')}")
+
+        set_app_status(f"Applied {len(results)} region features.", timeout_ms=5000)
+        show_info("Success", "Selected region features applied:\n\n" + "\n".join(results))
+
+    ttk.Button(features_center, text="Apply Selected Features", command=on_apply).pack(anchor="center", pady=(10, 0))
 
 # =============================================================================
 # SECTION: Vehicles Tab (STS object editing)
@@ -18293,11 +18753,14 @@ FACTOR_RULE_DEFINITIONS = [
     }),
     ("Truck pricing", "truckPricingFactor", {"default": 1, "free": 0, "2x": 2, "4x": 4, "6x": 6}),
     ("Truck selling price", "truckSellingFactor", {"normal price": 1, "50%": 0.5, "30%": 0.3, "10%": 0.1, "cant be sold": -1}),
-    ("DLC vehicles availability", "isDLCVehiclesAvailable", {"available": True, "unavailable": False}),
+    ("DLC vehicles availability", "needToAddDlcTrucks", {"available": True, "unavailable": False}),
     ("Vehicle storage slots", "vehicleStorageSlots", {"default": 0, "only 3": 3, "only 5": 5, "only 10": 10, "only scouts": -1}),
     ("External addon availability", "externalAddonAvailability", {
         "default": 0,
-        "all addons unlocked": 1
+        "all addons unlocked": 1,
+        "random 5": 2,
+        "random 10": 3,
+        "each garage random 10": 4
     }),
     ("Internal addon availability", "internalAddonAvailability", {
         "default": 0,
@@ -18309,11 +18772,12 @@ FACTOR_RULE_DEFINITIONS = [
         "highway and allroad": 2,
         "highway, allroad, offroad": 3,
         "no mud tires": 4,
-        "no chained tires": 5
+        "no chained tires": 5,
+        "random per garage": 6
     }),
     ("Vehicle addon pricing", "addonPricingFactor", {"default": 1, "free": 0, "2x": 2, "4x": 4, "6x": 6}),
     ("Addon selling price", "addonSellingFactor", {"normal": 1.0, "10%": 0.1, "30%": 0.3, "50%": 0.5, "no refunds": 0}),
-    ("Trailer store availability", "trailerStoreAviability", {"default": 1, "not available": 0}),
+    ("Trailer store availability", "trailerStoreAviability", {"default": 0, "one per region": 1}),
     ("Trailer availability", "trailerAvailability", {"default": 0, "all trailers available": 1, "not available": 2}),
     ("Trailer pricing", "trailerPricingFactor", {"normal price": 1, "free": 0, "2x": 2, "4x": 4, "6x": 6}),
     ("Trailer selling price", "trailerSellingFactor", {"normal price": 1, "50%": 0.5, "30%": 0.3, "10%": 0.1, "cant be sold": -1}),
@@ -18325,8 +18789,8 @@ FACTOR_RULE_DEFINITIONS = [
         "6x": 6
     }),
     ("Garage repair price", "garageRepairePriceFactor", {
-        "default": 1,
-        "no auto repair": -1,
+        "normal price": 1,
+        "free": 0,
         "2x": 2,
         "4x": 4,
         "6x": 6
@@ -18334,7 +18798,6 @@ FACTOR_RULE_DEFINITIONS = [
     ("Garage refuelling", "isGarageRefuelAvailable", {"available": True, "unavailable": False}),
     ("Repair points cost", "repairPointsCostFactor", {
         "default": 1,
-        "hard mode rules": 1,
         "free": 0,
         "2x": 2,
         "4x": 4,
@@ -18343,25 +18806,23 @@ FACTOR_RULE_DEFINITIONS = [
     ("Repair points required", "repairPointsRequiredFactor", {"default": 1, "2x less": 0.5, "2x": 2, "4x": 4, "6x": 6}),
     ("Vehicle repair regional rules", "regionRepaireMoneyFactor", {
         "default": 1,
-        "2x price and points": 2,
-        "3x price and points": 3,
-        "4x price and points": 4,
-        "unavailable": 0
+        "free": 0,
+        "2x": 2,
+        "4x": 4,
+        "6x": 6
     }),
     ("Vehicle damage", "vehicleDamageFactor", {"default": 1, "no damage": 0, "2x": 2, "3x": 3, "5x": 5}),
     ("Recovery price", "recoveryPriceFactor", {
         "default": 1,
-        "hard mode price": 0,
+        "free": 0,
         "2x": 2,
         "4x": 4,
-        "6x": 6,
-        "unavailable": -1
+        "6x": 6
     }),
     ("Automatic cargo loading", "loadingPriceFactor", {"free": 0, "paid": 1, "2x": 2, "4x": 4, "6x": 6}),
     ("Truck switching price (minimap)", "teleportationPrice", {"free": 0, "500": 500, "1000": 1000, "2000": 2000, "5000": 5000}),
     ("Region traveling price", "regionTravellingPriceFactor", {
         "default": 1,
-        "hard mode rules": 1,
         "free": 0,
         "2x": 2,
         "4x": 4,
@@ -18391,7 +18852,13 @@ _RULE_NGP_DICT_META = {
     "truckSellingFactor": ("TRUCK_SELLING", {"normal price": 0, "50%": 1, "30%": 2, "10%": 3, "cant be sold": 4}),
     "isDLCVehiclesAvailable": ("DLC_VEHICLES", {"available": 0, "unavailable": 1}),
     "vehicleStorageSlots": ("VEHICLE_STORAGE", {"default": 0, "only 3": 1, "only 5": 2, "only 10": 3, "only scouts": 4}),
-    "externalAddonAvailability": ("ADDON_AVAILABILITY", {"default": 0, "all addons unlocked": 1}),
+    "externalAddonAvailability": ("ADDON_AVAILABILITY", {
+        "default": 0,
+        "all addons unlocked": 1,
+        "random 5": 2,
+        "random 10": 3,
+        "each garage random 10": 4
+    }),
     "internalAddonAvailability": ("INTENAL_ADDON_AVAILABILITY", {
         "default": 0,
         "all internal addons unlocked": 1
@@ -18402,29 +18869,30 @@ _RULE_NGP_DICT_META = {
         "highway and allroad": 2,
         "highway, allroad, offroad": 3,
         "no mud tires": 4,
-        "no chained tires": 5
+        "no chained tires": 5,
+        "random per garage": 6
     }),
     "trailerStoreAviability": ("TRAILER_STORE_AVAILBILITY", {"default": 1, "not available": 0}),
     "trailerAvailability": ("TRAILER_AVAILABILITY", {"default": 0, "all trailers available": 1, "not available": 2}),
     "trailerPricingFactor": ("TRAILER_PRICING", {"normal price": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
     "trailerSellingFactor": ("TRAILER_SELLING", {"normal price": 0, "50%": 1, "30%": 2, "10%": 3, "cant be sold": 4}),
     "fuelPriceFactor": ("FUEL_PRICE", {"normal price": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
-    "garageRepairePriceFactor": ("GARAGE_REPAIRE", {"default": 0, "no auto repair": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "garageRepairePriceFactor": ("GARAGE_REPAIRE", {"normal price": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
     "isGarageRefuelAvailable": ("GARAGE_REFUEL", {"available": 0, "unavailable": 1}),
-    "repairPointsCostFactor": ("REPAIR_POINTS_COST", {"default": 0, "hard mode rules": 1, "free": 0, "2x": 2, "4x": 3, "6x": 4}),
+    "repairPointsCostFactor": ("REPAIR_POINTS_COST", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
     "repairPointsRequiredFactor": ("REPAIR_POINTS_AMOUNT", {"default": 0, "2x less": 1, "2x": 2, "4x": 3, "6x": 4}),
     "regionRepaireMoneyFactor": ("REGIONAL_REPAIR", {
         "default": 0,
-        "2x price and points": 1,
-        "3x price and points": 2,
-        "4x price and points": 3,
-        "unavailable": 4
+        "free": 1,
+        "2x": 2,
+        "4x": 3,
+        "6x": 4
     }),
     "vehicleDamageFactor": ("VEHICLE_DAMAGE", {"default": 0, "no damage": 1, "2x": 2, "3x": 3, "5x": 4}),
-    "recoveryPriceFactor": ("RECOVERY", {"default": 0, "hard mode price": 1, "2x": 2, "4x": 3, "6x": 4, "unavailable": 5}),
+    "recoveryPriceFactor": ("RECOVERY", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
     "loadingPriceFactor": ("LOADING", {"free": 0, "paid": 1, "2x": 2, "4x": 3, "6x": 4}),
     "teleportationPrice": ("TELEPORTATION", {"free": 0, "500": 1, "1000": 2, "2000": 3, "5000": 4}),
-    "regionTravellingPriceFactor": ("REGION_TRAVELLING", {"default": 0, "hard mode rules": 1, "free": 0, "2x": 2, "4x": 3, "6x": 4}),
+    "regionTravellingPriceFactor": ("REGION_TRAVELLING", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
     "tasksAndContestsPayoutsFactor": ("TASKS_CONTESTS", {"normal": 0, "50%": 1, "150%": 2, "200%": 3, "300%": 4}),
     "contractsPayoutsFactor": ("CONTRACTS", {"normal": 0, "50%": 1, "150%": 2, "200%": 3, "300%": 4}),
     "maxContestAttempts": ("CONTEST_ATTEMPTS", {"default": 0, "1 attempt": 1, "3 attempts": 2, "5 attempts": 3, "gold time only": 4}),
@@ -18547,6 +19015,15 @@ def create_rules_tab(tab_rules, save_path_var):
                     rule["var"].set(_RULE_RANDOM_LABEL)
                 except Exception:
                     pass
+        for rule in FACTOR_RULE_VARS:
+            if rule["key"] != "gameDifficultyMode":
+                continue
+            if "New Game+" in rule["options"]:
+                try:
+                    rule["var"].set("New Game+")
+                except Exception:
+                    pass
+            break
 
     def _on_random_rules_toggle():
         if random_rules_var.get():
@@ -18570,15 +19047,63 @@ def create_rules_tab(tab_rules, save_path_var):
 
     # expose for window auto-sizing
     try:
+        globals()["_RULES_TAB_CONTAINER"] = container
         globals()["_RULES_CONTENT_FRAME"] = wrapper
         globals()["_RULES_CANVAS"] = canvas
     except Exception:
         pass
 
+    _RULES_SCROLL_TOLERANCE = 14
+    _rules_scrollbar_visible = {"value": True}
+
+    def _set_rules_scrollbar_visible(show: bool):
+        show = bool(show)
+        if _rules_scrollbar_visible["value"] == show:
+            return
+        _rules_scrollbar_visible["value"] = show
+        try:
+            if show:
+                vscroll.pack(side="right", fill="y")
+            else:
+                vscroll.pack_forget()
+                canvas.yview_moveto(0)
+        except Exception:
+            pass
+        try:
+            canvas_wrap.after_idle(_refresh_rules_scrollregion)
+        except Exception:
+            pass
+
+    def _refresh_rules_scrollregion(_event=None):
+        try:
+            bbox = canvas.bbox("all")
+            if not bbox:
+                return
+            x1, y1, x2, y2 = bbox
+            content_w = max(0, int(x2 - x1))
+            content_h = max(0, int(y2 - y1))
+            canvas_w = max(1, int(canvas.winfo_width() or 1))
+            canvas_h = max(1, int(canvas.winfo_height() or 1))
+            overflow_h = content_h - canvas_h
+
+            if overflow_h <= _RULES_SCROLL_TOLERANCE:
+                _set_rules_scrollbar_visible(False)
+                canvas.configure(scrollregion=(0, 0, max(content_w, canvas_w), max(content_h, canvas_h)))
+                try:
+                    canvas.yview_moveto(0)
+                except Exception:
+                    pass
+            else:
+                _set_rules_scrollbar_visible(True)
+                canvas.configure(scrollregion=(0, 0, max(content_w, canvas_w), content_h))
+        except Exception:
+            pass
+
     def _on_canvas_config(e):
         canvas.itemconfig(window_id, width=e.width)
+        _refresh_rules_scrollregion()
     canvas.bind("<Configure>", _on_canvas_config)
-    wrapper.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    wrapper.bind("<Configure>", _refresh_rules_scrollregion)
 
     # center layout (left/right spacers)
     wrapper.columnconfigure(0, weight=1)
@@ -18991,6 +19516,10 @@ def create_rules_tab(tab_rules, save_path_var):
     p = save_path_var.get()
     if p and os.path.exists(p):
         sync_all_rules_from_save(p)
+    try:
+        canvas_wrap.after_idle(_refresh_rules_scrollregion)
+    except Exception:
+        pass
 
     return {
         "factor_vars": FACTOR_RULE_VARS,
@@ -20233,7 +20762,7 @@ def _apply_focus_outline_fix(root):
 
 
 # Main GUI entry (builds all tabs + wires callbacks)
-def launch_gui():
+def launch_gui(start_minimized=False):
     # Capture terminal output into the shared status log file.
     install_status_log_stream_tee()
 
@@ -20976,7 +21505,7 @@ def launch_gui():
             justify="center",
         ).pack(fill="both", expand=True, padx=12, pady=12)
 
-    def _ensure_lazy_tab_built(tab_widget):
+    def _ensure_lazy_tab_built(tab_widget, silent=False):
         payload = lazy_tab_builders.pop(str(tab_widget), None)
         if payload is None:
             return
@@ -20988,10 +21517,12 @@ def launch_gui():
         except Exception:
             pass
 
-        set_app_status(f"Loading {tab_name} tab...", timeout_ms=0)
+        if not silent:
+            set_app_status(f"Loading {tab_name} tab...", timeout_ms=0)
         try:
             builder()
-            set_app_status(f"{tab_name} tab loaded.", timeout_ms=2500)
+            if not silent:
+                set_app_status(f"{tab_name} tab loaded.", timeout_ms=2500)
         except Exception as e:
             ttk.Label(
                 tab_widget,
@@ -21025,6 +21556,15 @@ def launch_gui():
     tab_control.add(tab_objectives, text='Objectives+')
     _register_lazy_tab(tab_objectives, "Objectives+", lambda: create_objectives_tab(tab_objectives, save_path_var))
 
+    # TAB: Regions+ (merged region actions)
+    tab_regions = ttk.Frame(tab_control)
+    tab_control.add(tab_regions, text="Regions+")
+    _register_lazy_tab(
+        tab_regions,
+        "Regions+",
+        lambda: create_region_tools_tab(tab_regions, save_path_var, enable_legacy_tabs_var),
+    )
+
     def _tab_present(tab_frame):
         try:
             return str(tab_frame) in set(tab_control.tabs())
@@ -21032,7 +21572,6 @@ def launch_gui():
             return False
 
     def _set_legacy_tabs_visibility(show):
-        show = bool(show)
         try:
             current_tab = str(tab_control.select())
         except Exception:
@@ -21050,18 +21589,9 @@ def launch_gui():
         except Exception:
             pass
 
-        if show:
+        if current_is_legacy:
             try:
-                tab_control.insert(tab_objectives, tab_missions, text="Missions")
-            except Exception:
-                pass
-            try:
-                tab_control.insert(tab_objectives, tab_contests, text="Contests")
-            except Exception:
-                pass
-        elif current_is_legacy:
-            try:
-                tab_control.select(tab_objectives)
+                tab_control.select(tab_regions)
             except Exception:
                 pass
 
@@ -21085,39 +21615,6 @@ def launch_gui():
     tab_pros = ttk.Frame(tab_control)
     tab_control.add(tab_pros, text='PROS')
     _register_lazy_tab(tab_pros, "PROS", lambda: create_pros_tab(tab_pros, save_path_var, plugin_loaders))
-
-    # TAB: Upgrades (create_upgrades_tab)
-    tab_upgrades = ttk.Frame(tab_control)
-    tab_control.add(tab_upgrades, text='Upgrades')
-    _register_lazy_tab(tab_upgrades, "Upgrades", lambda: create_upgrades_tab(tab_upgrades, save_path_var))
-
-    # TAB: Watchtowers (create_watchtowers_tab)
-    tab_watchtowers = ttk.Frame(tab_control)
-    tab_control.add(tab_watchtowers, text="Watchtowers")
-    _register_lazy_tab(
-        tab_watchtowers,
-        "Watchtowers",
-        lambda: create_watchtowers_tab(tab_watchtowers, save_path_var),
-    )
-
-    # TAB: Discoveries (create_discoveries_tab)
-    tab_discoveries = ttk.Frame(tab_control)
-    tab_control.add(tab_discoveries, text="Discoveries")
-    _register_lazy_tab(
-        tab_discoveries,
-        "Discoveries",
-        lambda: create_discoveries_tab(tab_discoveries, save_path_var),
-    )
-
-    # TAB: Levels (create_levels_tab)
-    tab_levels = ttk.Frame(tab_control)
-    tab_control.add(tab_levels, text="Levels")
-    _register_lazy_tab(tab_levels, "Levels", lambda: create_levels_tab(tab_levels, save_path_var))
-
-    # TAB: Garages (create_garages_tab)
-    tab_garages = ttk.Frame(tab_control)
-    tab_control.add(tab_garages, text="Garages")
-    _register_lazy_tab(tab_garages, "Garages", lambda: create_garages_tab(tab_garages, save_path_var))
 
     # TAB: Vehicles (create_vehicles_tab)
     tab_vehicles = ttk.Frame(tab_control)
@@ -21255,10 +21752,15 @@ def launch_gui():
     last_tab_text = str(config.get("last_tab_text", "") or "").strip()
     # Backward-compat across legacy label naming changes.
     tab_alias = {
-        "Missions [Legacy]": "Missions",
-        "Contests [Legacy]": "Contests",
-        "Missions": "Missions",
-        "Contests": "Contests",
+        "Missions [Legacy]": "Regions+",
+        "Contests [Legacy]": "Regions+",
+        "Missions": "Regions+",
+        "Contests": "Regions+",
+        "Upgrades": "Regions+",
+        "Watchtowers": "Regions+",
+        "Discoveries": "Regions+",
+        "Levels": "Regions+",
+        "Garages": "Regions+",
     }
     target_text = tab_alias.get(last_tab_text, last_tab_text)
     restored = False
@@ -21294,6 +21796,10 @@ def launch_gui():
             current_tab_id = tab_control.select()
             current_tab_widget = tab_control.nametowidget(current_tab_id)
             _ensure_lazy_tab_built(current_tab_widget)
+        except Exception:
+            pass
+        try:
+            root.after_idle(_fit_window_to_tabs_and_rules)
         except Exception:
             pass
         try:
@@ -21873,28 +22379,128 @@ def launch_gui():
         except Exception:
             pass
 
-    theme_row = ttk.Frame(tab_settings)
-    theme_row.pack(anchor="center", pady=(10, 0))
+    startup_with_windows_var = tk.BooleanVar(
+        root,
+        value=_cfg_bool(config.get("start_with_windows", False), default=False),
+    )
+    startup_with_windows_minimized_var = tk.BooleanVar(
+        root,
+        value=_cfg_bool(config.get("start_with_windows_minimized", False), default=False),
+    )
+    startup_supported = _is_windows_startup_supported()
+    startup_registration_cfg_keys = [
+        "start_with_windows_registered_version",
+        "start_with_windows_registered_target",
+        "start_with_windows_registered_args",
+        "start_with_windows_registered_workdir",
+    ]
+    startup_minimized_cb = None
+
+    def _get_settings_startup_mode():
+        startup_normal = bool(startup_with_windows_var.get())
+        startup_minimized = bool(startup_normal and startup_with_windows_minimized_var.get())
+        return startup_normal, startup_minimized
+
+    def _sync_settings_startup_controls():
+        try:
+            if startup_minimized_cb is not None:
+                startup_minimized_cb.configure(
+                    state=("normal" if bool(startup_with_windows_var.get()) and startup_supported else "disabled")
+                )
+        except Exception:
+            pass
+        if not bool(startup_with_windows_var.get()):
+            try:
+                startup_with_windows_minimized_var.set(False)
+            except Exception:
+                pass
+
+    def _apply_settings_startup_mode():
+        startup_normal, startup_minimized = _get_settings_startup_mode()
+        if not startup_supported:
+            return True, ""
+        ok, startup_msg = _apply_startup_mode(startup_normal, start_minimized=startup_minimized)
+        if ok:
+            if startup_normal:
+                _update_config_values(_startup_registration_metadata(start_minimized=startup_minimized))
+            else:
+                _delete_config_keys(startup_registration_cfg_keys)
+        else:
+            if startup_normal:
+                _delete_config_keys(startup_registration_cfg_keys)
+        return ok, startup_msg
+
+    settings_top = ttk.Frame(tab_settings, padding=(10, 10, 10, 0))
+    settings_top.pack(fill="x")
+    settings_top.columnconfigure(0, weight=1, uniform="settingscol")
+    settings_top.columnconfigure(1, weight=1, uniform="settingscol")
+
+    appearance_box = ttk.LabelFrame(settings_top, text="Appearance", padding=(10, 8))
+    appearance_box.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+    theme_row = ttk.Frame(appearance_box)
+    theme_row.pack(fill="x")
     ttk.Label(theme_row, text="Theme Preset:").pack(side="left")
-    theme_preset_combo = ttk.Combobox(theme_row, textvariable=theme_preset_var, state="readonly", width=24)
-    theme_preset_combo.pack(side="left", padx=(8, 0))
+    theme_preset_combo = ttk.Combobox(theme_row, textvariable=theme_preset_var, state="readonly", width=20)
+    theme_preset_combo.pack(side="left", fill="x", expand=True, padx=(8, 0))
     theme_preset_combo.bind("<<ComboboxSelected>>", on_theme_preset_changed)
     refresh_theme_preset_values(selected=_ACTIVE_THEME_NAME)
+    ttk.Button(appearance_box, text="Theme Customizer", command=open_theme_customizer).pack(anchor="w", pady=(8, 0))
 
-    ttk.Button(tab_settings, text="Theme Customizer", command=open_theme_customizer).pack(pady=(6, 0))
+    editor_box = ttk.LabelFrame(settings_top, text="Editor", padding=(10, 8))
+    editor_box.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
     def _toggle_legacy_tabs_visibility():
         try:
             _set_legacy_tabs_visibility(enable_legacy_tabs_var.get())
         except Exception:
             pass
     ttk.Checkbutton(
-        tab_settings,
-        text="Enable legacy tabs (Missions/Contests)",
+        editor_box,
+        text="Show legacy actions in Regions+ (Missions/Contests)",
         variable=enable_legacy_tabs_var,
         command=_toggle_legacy_tabs_visibility,
-    ).pack(pady=(6, 0))
-    ttk.Checkbutton(tab_settings, text="Don't remember save file path", variable=dont_remember_path_var).pack(pady=(5, 0))
-    ttk.Checkbutton(tab_settings, text="Delete saved path on close", variable=delete_path_on_close_var).pack(pady=(5, 10))
+    ).pack(anchor="w", pady=(0, 4))
+    ttk.Checkbutton(editor_box, text="Don't remember save file path", variable=dont_remember_path_var).pack(anchor="w", pady=(0, 4))
+    ttk.Checkbutton(editor_box, text="Delete saved path on close", variable=delete_path_on_close_var).pack(anchor="w")
+
+    startup_box = ttk.LabelFrame(settings_top, text="Startup", padding=(10, 8))
+    startup_box.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+    startup_normal_cb = ttk.Checkbutton(
+        startup_box,
+        text="Start editor with Windows",
+        variable=startup_with_windows_var,
+        command=_sync_settings_startup_controls,
+    )
+    startup_normal_cb.pack(anchor="w")
+    startup_minimized_cb = ttk.Checkbutton(
+        startup_box,
+        text="Start editor with Windows minimized to taskbar",
+        variable=startup_with_windows_minimized_var,
+    )
+    startup_minimized_cb.pack(anchor="w", pady=(4, 0))
+    if not startup_supported:
+        try:
+            startup_normal_cb.configure(state="disabled")
+        except Exception:
+            pass
+        try:
+            startup_minimized_cb.configure(state="disabled")
+        except Exception:
+            pass
+        ttk.Label(
+            startup_box,
+            text="Windows startup integration is unavailable on this platform.",
+            style="Warning.TLabel",
+        ).pack(anchor="w", pady=(6, 0))
+    else:
+        _sync_settings_startup_controls()
+
+    actions_box = ttk.LabelFrame(settings_top, text="Actions", padding=(10, 8))
+    actions_box.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
+    actions_grid = ttk.Frame(actions_box)
+    actions_grid.pack(fill="x")
+    actions_grid.columnconfigure(0, weight=1)
+    actions_grid.columnconfigure(1, weight=1)
+
     def save_settings_silent():
         config = load_config()
         config["enable_legacy_tabs"] = bool(enable_legacy_tabs_var.get())
@@ -21918,18 +22524,35 @@ def launch_gui():
             config["objectives_use_safe_fallback"] = bool(objectives_safe_fallback_var.get())
         except Exception:
             pass
+        startup_normal, startup_minimized = _get_settings_startup_mode()
+        config["start_with_windows"] = bool(startup_normal)
+        config["start_with_windows_minimized"] = bool(startup_minimized)
+        config["start_with_windows_hidden"] = False
+        if not startup_normal:
+            for key in startup_registration_cfg_keys:
+                config.pop(key, None)
         save_config(config)
 
     def save_settings():
         save_settings_silent()
-        show_info("Settings", "Settings have been saved.")
+        startup_ok = True
+        startup_msg = ""
+        try:
+            startup_ok, startup_msg = _apply_settings_startup_mode()
+        except Exception as e:
+            startup_ok = False
+            startup_msg = str(e)
 
         if delete_path_on_close_var.get():
             _delete_config_keys(["last_save_path"])
         elif not dont_remember_path_var.get():
             save_path(save_path_var.get())
+        if startup_supported and not startup_ok:
+            set_app_status(f"Settings saved. Startup setting could not be applied: {startup_msg}", timeout_ms=9000)
+            show_info("Settings", f"Settings have been saved.\n\nStartup setting could not be applied:\n{startup_msg}")
+            return
+        show_info("Settings", "Settings have been saved.")
 
-    ttk.Button(tab_settings, text="Save Settings", command=save_settings).pack(pady=(10, 10))
     def create_desktop_shortcut():
         if not getattr(sys, 'frozen', False):
             messagebox.showwarning("Unavailable", "This feature only works in the built version.")
@@ -22033,28 +22656,16 @@ def launch_gui():
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create shortcut:\n{e}")
 
-    ttk.Button(tab_settings, text="Make Desktop Shortcut", command=create_desktop_shortcut).pack(pady=(5, 10))
-
-    def make_backup_now():
-        path = save_path_var.get()
-        if not os.path.exists(path):
-            return messagebox.showerror("Error", "Save file not found.")
-        try:
-            make_backup_if_enabled(path)
-            show_info("Backup", f"Backup created")
-        except Exception as e:
-            messagebox.showerror("Error", f"Backup failed:\n{e}")
-
-    ttk.Button(tab_settings, text="Make a Backup", command=make_backup_now).pack(pady=(5, 10))
-
     def manual_update_check():
         check_for_updates_background(root, debug=True)
 
-    ttk.Button(tab_settings, text="Check for Update", command=manual_update_check).pack(pady=(5, 10))
+    ttk.Button(actions_grid, text="Save Settings", command=save_settings).grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
+    ttk.Button(actions_grid, text="Check for Update", command=manual_update_check).grid(row=0, column=1, sticky="ew", pady=(0, 6))
+    ttk.Button(actions_grid, text="Make Desktop Shortcut", command=create_desktop_shortcut).grid(row=1, column=0, columnspan=2, sticky="ew")
 
     # Separator and embedded Minesweeper
     if MINESWEEPER_AVAILABLE:
-        ttk.Separator(tab_settings, orient='horizontal').pack(fill='x', pady=(10, 5))
+        ttk.Separator(tab_settings, orient='horizontal').pack(fill='x', padx=10, pady=(8, 5))
         ttk.Label(tab_settings, text="Minesweeper", font=("TkDefaultFont", 11, "bold")).pack(pady=(0, 5))
     
         minesweeper_frame = tk.Frame(
@@ -23090,6 +23701,10 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
         except Exception:
             pass
         try:
+            _apply_settings_startup_mode()
+        except Exception:
+            pass
+        try:
             stop_autosave_monitor()
         except Exception:
             pass
@@ -23105,19 +23720,43 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
 
     _apply_editor_theme(root, dark_mode=dark_mode_var.get())
 
+    objectives_width_cache = {"value": 0}
+
     # --- Auto-size window to show all tabs and full Rules tab content ---
     def _fit_window_to_tabs_and_rules():
         try:
+            try:
+                if str(tab_rules) in lazy_tab_builders:
+                    _ensure_lazy_tab_built(tab_rules, silent=True)
+            except Exception:
+                pass
+            try:
+                if str(tab_objectives) in lazy_tab_builders:
+                    _ensure_lazy_tab_built(tab_objectives, silent=True)
+            except Exception:
+                pass
             root.update_idletasks()
             try:
                 tab_count = tab_control.index("end")
             except Exception:
                 tab_count = 0
 
-            nb_req_w = tab_control.winfo_reqwidth()
             nb_req_h = tab_control.winfo_reqheight()
+            objectives_req_w = tab_objectives.winfo_reqwidth() if 'tab_objectives' in locals() else 0
             rules_req_w = tab_rules.winfo_reqwidth() if 'tab_rules' in locals() else 0
             rules_req_h = tab_rules.winfo_reqheight() if 'tab_rules' in locals() else 0
+
+            if objectives_req_w > 0:
+                objectives_width_cache["value"] = max(objectives_width_cache["value"], int(objectives_req_w))
+            objectives_req_w = int(objectives_width_cache["value"] or objectives_req_w or 0)
+
+            rules_container = globals().get("_RULES_TAB_CONTAINER")
+            if rules_container is not None:
+                try:
+                    rules_req_w = max(rules_req_w, rules_container.winfo_reqwidth() + 16)
+                    rules_req_h = max(rules_req_h, rules_container.winfo_reqheight() + 16)
+                except Exception:
+                    pass
 
             # Use full rules content height if available (so all rules are visible)
             rules_frame = globals().get("_RULES_CONTENT_FRAME")
@@ -23149,13 +23788,13 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
                 text_width = sum(font.measure(t) for t in tab_texts)
                 header_width = text_width + (12 * tab_count) + 20
 
-            target_w = int(max(header_width, nb_req_w, rules_req_w) + 16)
+            target_w = int(max(header_width, objectives_req_w, 900) + 16)
             status_h = 0
             try:
                 status_h = status_bar.winfo_reqheight() if "status_bar" in locals() else 0
             except Exception:
                 status_h = 0
-            target_h = int(max(nb_req_h, rules_req_h) + 60 + status_h)
+            target_h = int(max(nb_req_h, rules_req_h) + 72 + status_h)
             if target_w > 0 and target_h > 0:
                 root.geometry(f"{target_w}x{target_h}")
         except Exception as e:
@@ -23168,10 +23807,21 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
         _fit_window_to_tabs_and_rules()
     except Exception:
         pass
-    try:
-        root.deiconify()
-    except Exception:
-        pass
+    if bool(start_minimized):
+        try:
+            # On Windows autostart we want the app available in taskbar but not foreground.
+            root.deiconify()
+            root.after(10, root.iconify)
+        except Exception:
+            try:
+                root.iconify()
+            except Exception:
+                pass
+    else:
+        try:
+            root.deiconify()
+        except Exception:
+            pass
     try:
         root.after(40, lambda: _apply_windows_titlebar_theme(root, dark_mode=dark_mode_var.get()))
         root.after(180, lambda: _apply_windows_titlebar_theme(root, dark_mode=dark_mode_var.get()))
@@ -23205,7 +23855,7 @@ if __name__ == "__main__":
             # Lightweight startup probe for the auto-updater:
             # process must launch and exit cleanly without opening the GUI.
             sys.exit(0)
-        launch_gui()
+        launch_gui(start_minimized=("--start-minimized" in argv_flags))
     except Exception as e:
         print("[Fatal] Editor failed to launch:", e)
         traceback.print_exc()
