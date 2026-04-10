@@ -21,26 +21,23 @@ import traceback
 import shutil
 import threading
 import subprocess
-import csv
 import codecs
 import tempfile
 import ssl
 import gzip
+import zipfile
 import urllib.request
 import urllib.error
 from urllib.parse import urljoin, urlparse
-from typing import List, Dict, Any, Iterator, Optional, Set
+from typing import List, Dict, Any, Iterator, Optional, Set, Tuple
 import random
 import re
 import json
 import math
 import hashlib
 import uuid
+import weakref
 from datetime import datetime, timezone
-
-# Pillow is intentionally not imported. Fog/image features below use
-# tkinter + pure-Python pixel buffers so we can avoid bundling Pillow.
-
 import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, PhotoImage, colorchooser
@@ -51,11 +48,12 @@ import tkinter.font as tkfont
 _NATIVE_SHOWINFO = messagebox.showinfo
 _NATIVE_SHOWWARNING = messagebox.showwarning
 _NATIVE_SHOWERROR = messagebox.showerror
+_NATIVE_ASKYESNO = messagebox.askyesno
 
 # =============================================================================
 # APP VERSION (manual)
 # =============================================================================
-APP_VERSION = 102
+APP_VERSION = 104
 _UPDATE_STATUS = None  # "update", "dev", "none"
 
 # -----------------------------------------------------------------------------
@@ -125,6 +123,17 @@ full_backup_var = None
 max_backups_var = None
 max_autobackups_var = None
 save_path_var = None
+_EDITOR_ROOT = None
+_WGS_SYNC_INTERVAL_MS = 900
+_WGS_SESSION = {
+    "active": False,
+    "mirror_dir": "",
+    "source_dir": "",
+    "display_source": "",
+    "mirror_to_blob": {},
+    "mirror_mtime_ns": {},
+    "sync_job": None,
+}
 money_var = None
 rank_var = None
 xp_var = None
@@ -173,6 +182,7 @@ _APP_ROOT = None
 _APP_STATUS_VAR = None
 _APP_STATUS_CLEAR_JOB = None
 _DEFAULT_STATUS_TEXT = "Status: Ready. Select an action."
+_APP_STATUS_RAW_TEXT = _DEFAULT_STATUS_TEXT
 
 SAVE_FILE_NAME = "snowrunner_editor_save.json"
 _SAVE_FILE_PATH = None
@@ -190,6 +200,15 @@ _OBJECTIVES_PREFETCH_STATE = {
     "error": "",
     "last_completed_ts": 0.0,
 }
+_OBJECTIVES_SOURCE_INFO_LOCK = threading.Lock()
+_OBJECTIVES_SOURCE_INFO = {
+    "kind": "",
+    "message": "",
+    "path": "",
+    "language": "",
+    "row_count": 0,
+}
+_OBJECTIVES_SOURCE_GENERATION = 0
 
 # Optional "Make editor better" upload (desktop app, Save File tab)
 IMPROVE_UPLOAD_ENDPOINT = "https://broad-star-66c2.mrtnhliza.workers.dev/"
@@ -210,10 +229,11 @@ IMPROVE_UPLOAD_BETWEEN_CHUNKS_MS = 5000
 
 def configure_app_status(root, status_var):
     """Register root + StringVar used by the global status bar."""
-    global _APP_ROOT, _APP_STATUS_VAR, _APP_STATUS_CLEAR_JOB
+    global _APP_ROOT, _APP_STATUS_VAR, _APP_STATUS_CLEAR_JOB, _APP_STATUS_RAW_TEXT
     _APP_ROOT = root
     _APP_STATUS_VAR = status_var
     _APP_STATUS_CLEAR_JOB = None
+    _APP_STATUS_RAW_TEXT = _DEFAULT_STATUS_TEXT
 
 def _compact_status_text(message, max_len=280):
     text = "" if message is None else str(message)
@@ -227,24 +247,27 @@ def set_app_status(message, timeout_ms=6000):
     Update the bottom status bar. Safe to call from worker threads.
     timeout_ms <= 0 keeps the message until replaced.
     """
+    global _APP_STATUS_RAW_TEXT
     text = _compact_status_text(message)
     if not text:
         return
+    _APP_STATUS_RAW_TEXT = text
+    display_text = _editor_translate_display_text(text)
     try:
-        _append_status_log_line(text, source="status")
+        _append_status_log_line(display_text, source="status")
     except Exception:
         pass
 
     root = _APP_ROOT
     status_var = _APP_STATUS_VAR
     if root is None or status_var is None:
-        print(f"[Status] {text}")
+        print(f"[Status] {display_text}")
         return
 
     def _apply():
-        global _APP_STATUS_CLEAR_JOB
+        global _APP_STATUS_CLEAR_JOB, _APP_STATUS_RAW_TEXT
         try:
-            status_var.set(text)
+            status_var.set(display_text)
         except Exception:
             return
 
@@ -257,7 +280,11 @@ def set_app_status(message, timeout_ms=6000):
 
         if timeout_ms and timeout_ms > 0:
             try:
-                _APP_STATUS_CLEAR_JOB = root.after(timeout_ms, lambda: status_var.set(_DEFAULT_STATUS_TEXT))
+                def _clear():
+                    global _APP_STATUS_RAW_TEXT
+                    _APP_STATUS_RAW_TEXT = _DEFAULT_STATUS_TEXT
+                    status_var.set(_editor_translate_display_text(_DEFAULT_STATUS_TEXT))
+                _APP_STATUS_CLEAR_JOB = root.after(timeout_ms, _clear)
             except Exception:
                 _APP_STATUS_CLEAR_JOB = None
 
@@ -267,15 +294,15 @@ def set_app_status(message, timeout_ms=6000):
         else:
             root.after(0, _apply)
     except Exception:
-        print(f"[Status] {text}")
+        print(f"[Status] {display_text}")
 
 def show_info(title=None, message=None, popup=False, timeout_ms=6000, **options):
     """
     Default info surface: status bar (non-blocking).
     Set popup=True for rare cases where a modal info dialog is still wanted.
     """
-    title_txt = "" if title is None else str(title).strip()
-    msg_txt = "" if message is None else str(message).strip()
+    title_txt = _editor_translate_display_text("" if title is None else str(title).strip())
+    msg_txt = _editor_translate_display_text("" if message is None else str(message).strip())
     if title_txt and msg_txt:
         set_app_status(f"{title_txt}: {msg_txt}", timeout_ms=timeout_ms)
     else:
@@ -290,6 +317,129 @@ def _ensure_dir(path):
         return True
     except Exception:
         return False
+
+
+def _expand_home_dir_value(raw_value, home_dir):
+    """Expand $HOME-style config values into an absolute path."""
+    text = str(raw_value or "").strip().strip('"').strip("'")
+    if not text:
+        return ""
+    home = str(home_dir or "").strip()
+    if home:
+        text = text.replace("${HOME}", home).replace("$HOME", home)
+        if text == "~":
+            text = home
+        elif text.startswith("~/"):
+            text = os.path.join(home, text[2:])
+    try:
+        return os.path.abspath(os.path.expanduser(text))
+    except Exception:
+        return text
+
+
+def _linux_xdg_desktop_dir(home_dir):
+    """Resolve the effective desktop directory on Linux when customized."""
+    home = str(home_dir or "").strip()
+    if not home:
+        return ""
+    cfg_path = os.path.join(home, ".config", "user-dirs.dirs")
+    if not os.path.isfile(cfg_path):
+        return ""
+    try:
+        with open(cfg_path, "r", encoding="utf-8", errors="ignore") as fh:
+            for raw_line in fh:
+                line = str(raw_line or "").strip()
+                if (not line) or line.startswith("#"):
+                    continue
+                match = re.match(r"XDG_DESKTOP_DIR\s*=\s*(.+)", line)
+                if not match:
+                    continue
+                candidate = _expand_home_dir_value(match.group(1), home)
+                if candidate and os.path.isdir(candidate):
+                    return candidate
+    except Exception:
+        pass
+    return ""
+
+
+def _open_path_with_default_app(path):
+    """Open a local file/folder with the platform default handler."""
+    target = str(path or "").strip()
+    if not target:
+        raise RuntimeError("Path is empty.")
+    try:
+        target = os.path.abspath(os.path.expanduser(target))
+    except Exception:
+        pass
+
+    system = platform.system()
+    if system == "Windows" and hasattr(os, "startfile"):
+        os.startfile(target)
+        return
+
+    launchers = []
+    if system == "Darwin":
+        launchers.append(["open", target])
+    else:
+        launchers.extend(
+            [
+                ["xdg-open", target],
+                ["gio", "open", target],
+            ]
+        )
+
+    last_error = None
+    for argv in launchers:
+        exe_name = str(argv[0] or "").strip()
+        if exe_name and shutil.which(exe_name) is None:
+            continue
+        try:
+            subprocess.Popen(argv)
+            return
+        except Exception as e:
+            last_error = e
+
+    try:
+        file_url = "file://" + urllib.request.pathname2url(target)
+        if webbrowser.open(file_url, new=2):
+            return
+    except Exception as e:
+        last_error = e
+
+    raise RuntimeError(last_error or f"No launcher available for '{target}'.")
+
+
+def _write_text_file_atomic(path, content, encoding="utf-8", newline=None):
+    """Write text to a temp file in the same directory, then replace atomically."""
+    target = os.path.abspath(str(path or "").strip())
+    if not target:
+        raise ValueError("Target path is empty.")
+    folder = os.path.dirname(target) or "."
+    os.makedirs(folder, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(target) + ".",
+        suffix=".tmp",
+        dir=folder,
+        text=True,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline=newline) as fh:
+            fh.write(str(content))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, target)
+        tmp_path = ""
+        return True
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
 def get_editor_data_dir():
@@ -482,7 +632,11 @@ def resource_path(relative_path):
     try:
         base_path = sys._MEIPASS
     except AttributeError:
-        base_path = os.path.dirname(os.path.abspath(__file__))
+        module_path = globals().get("__file__")
+        if module_path:
+            base_path = os.path.dirname(os.path.abspath(module_path))
+        else:
+            base_path = os.getcwd()
     return os.path.join(base_path, relative_path)
 dropdown_widgets = {}
 def _load_iconphotos_from_ico(ico_path):
@@ -1041,6 +1195,827 @@ def load_initial_path():
 # -----------------------------------------------------------------------------
 # END SECTION: Save-Path Discovery (Fog Tool + Save File tab)
 # -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: WGS Save Mirror Helpers
+# Used In: Save File tab (Microsoft Store / Game Pass WGS support)
+# =============================================================================
+def _wgs_get_root_widget():
+    root = _EDITOR_ROOT
+    if root is not None:
+        try:
+            if bool(root.winfo_exists()):
+                return root
+        except Exception:
+            pass
+    root = getattr(tk, "_default_root", None)
+    if root is not None:
+        try:
+            if bool(root.winfo_exists()):
+                return root
+        except Exception:
+            pass
+    return None
+
+
+def _same_or_child_path(path, parent):
+    try:
+        path_abs = os.path.abspath(path)
+        parent_abs = os.path.abspath(parent)
+        return os.path.commonpath([path_abs, parent_abs]) == parent_abs
+    except Exception:
+        return False
+
+
+def _wgs_is_session_path(path):
+    session = _WGS_SESSION if isinstance(_WGS_SESSION, dict) else {}
+    if not session.get("active"):
+        return False
+    mirror_dir = str(session.get("mirror_dir") or "").strip()
+    target = str(path or "").strip()
+    if not mirror_dir or not target:
+        return False
+    return _same_or_child_path(target, mirror_dir)
+
+
+def _wgs_cancel_sync_job():
+    session = _WGS_SESSION if isinstance(_WGS_SESSION, dict) else {}
+    job = session.get("sync_job")
+    if job is None:
+        return
+    root = _wgs_get_root_widget()
+    if root is not None:
+        try:
+            root.after_cancel(job)
+        except Exception:
+            pass
+    session["sync_job"] = None
+
+
+def _wgs_sync_pending_changes(force=False):
+    session = _WGS_SESSION if isinstance(_WGS_SESSION, dict) else {}
+    if not session.get("active"):
+        return 0
+    mapping = session.get("mirror_to_blob") or {}
+    mirror_mtimes = session.get("mirror_mtime_ns") or {}
+    synced = 0
+
+    for mirror_path, blob_path in list(mapping.items()):
+        try:
+            if not os.path.isfile(mirror_path):
+                continue
+            current_mtime = _file_mtime_ns(mirror_path)
+            last_synced = int(mirror_mtimes.get(mirror_path, 0) or 0)
+            if not force and current_mtime and current_mtime <= last_synced:
+                continue
+            blob_dir = os.path.dirname(blob_path)
+            if blob_dir:
+                _ensure_dir(blob_dir)
+            shutil.copyfile(mirror_path, blob_path)
+            mirror_mtimes[mirror_path] = current_mtime or _file_mtime_ns(mirror_path)
+            synced += 1
+        except Exception as e:
+            try:
+                print(f"[WGS] Failed to sync '{mirror_path}' -> '{blob_path}': {e}")
+            except Exception:
+                pass
+    return synced
+
+
+def _wgs_schedule_sync_job():
+    session = _WGS_SESSION if isinstance(_WGS_SESSION, dict) else {}
+    if not session.get("active"):
+        return
+    root = _wgs_get_root_widget()
+    if root is None:
+        return
+
+    _wgs_cancel_sync_job()
+
+    def _tick():
+        session["sync_job"] = None
+        try:
+            _wgs_sync_pending_changes(force=False)
+        finally:
+            if session.get("active"):
+                _wgs_schedule_sync_job()
+
+    try:
+        session["sync_job"] = root.after(_WGS_SYNC_INTERVAL_MS, _tick)
+    except Exception:
+        session["sync_job"] = None
+
+
+def _wgs_reset_session(remove_mirror=True, sync=True):
+    session = _WGS_SESSION if isinstance(_WGS_SESSION, dict) else {}
+    old_mirror_dir = str(session.get("mirror_dir") or "")
+    was_active = bool(session.get("active"))
+
+    _wgs_cancel_sync_job()
+
+    if was_active and sync:
+        try:
+            _wgs_sync_pending_changes(force=True)
+        except Exception:
+            pass
+
+    session.clear()
+    session.update(
+        {
+            "active": False,
+            "mirror_dir": "",
+            "source_dir": "",
+            "display_source": "",
+            "mirror_to_blob": {},
+            "mirror_mtime_ns": {},
+            "sync_job": None,
+        }
+    )
+
+    if remove_mirror and old_mirror_dir and os.path.isdir(old_mirror_dir):
+        try:
+            shutil.rmtree(old_mirror_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _wgs_default_browse_dir():
+    local_app = os.environ.get("LOCALAPPDATA") or ""
+    packages_root = os.path.join(local_app, "Packages") if local_app else ""
+    if packages_root and os.path.isdir(packages_root):
+        try:
+            for name in sorted(os.listdir(packages_root)):
+                if "snowrunner" not in name.lower():
+                    continue
+                candidate = os.path.join(packages_root, name, "SystemAppData", "wgs")
+                if os.path.isdir(candidate):
+                    return candidate
+        except Exception:
+            pass
+        return packages_root
+    return load_initial_path()
+
+
+def _wgs_auto_detect_sources():
+    local_app = os.environ.get("LOCALAPPDATA") or ""
+    packages_root = os.path.join(local_app, "Packages") if local_app else ""
+    if not packages_root or not os.path.isdir(packages_root):
+        return []
+
+    found = []
+    seen = set()
+
+    try:
+        package_names = sorted(os.listdir(packages_root))
+    except Exception:
+        return []
+
+    for package_name in package_names:
+        if "snowrunner" not in package_name.lower():
+            continue
+        wgs_root = os.path.join(packages_root, package_name, "SystemAppData", "wgs")
+        if not os.path.isdir(wgs_root):
+            continue
+        try:
+            discovered = _wgs_discover_sources(wgs_root, max_depth=2)
+        except Exception:
+            discovered = []
+        for item in discovered:
+            source_path = os.path.abspath(str(item.get("path") or ""))
+            if not source_path:
+                continue
+            key = (str(item.get("kind") or ""), os.path.normcase(source_path))
+            if key in seen:
+                continue
+            seen.add(key)
+            label = f"Auto-detected WGS: {package_name} / {os.path.basename(source_path) or source_path}"
+            payload = dict(item)
+            payload["label"] = label
+            found.append(payload)
+
+    return found
+
+
+def _wgs_discover_sources(base_path, max_depth=4):
+    base = os.path.abspath(str(base_path or "").strip())
+    if not base:
+        return []
+
+    found = []
+    seen = set()
+
+    def _add(kind, path):
+        if not path or not os.path.isdir(path):
+            return
+        normalized = os.path.normcase(os.path.abspath(path))
+        key = (kind, normalized)
+        if key in seen:
+            return
+        seen.add(key)
+        label_prefix = "WGS user folder" if kind == "user_dir" else "Copied WGS folder"
+        found.append(
+            {
+                "kind": kind,
+                "path": os.path.abspath(path),
+                "label": f"{label_prefix}: {os.path.basename(path) or path}",
+            }
+        )
+
+    def _inspect(path):
+        if not os.path.isdir(path):
+            return
+        try:
+            names = os.listdir(path)
+        except Exception:
+            return
+        lowered = {name.lower() for name in names}
+        if "containers.index" in lowered:
+            _add("user_dir", path)
+        if any(name.lower().startswith("container.") for name in names):
+            _add("container_dir", path)
+
+    if os.path.isfile(base):
+        name = os.path.basename(base).lower()
+        if name == "containers.index" or name.startswith("container."):
+            base = os.path.dirname(base)
+        else:
+            return []
+
+    _inspect(base)
+
+    extra_roots = []
+    nested_wgs = os.path.join(base, "SystemAppData", "wgs")
+    if os.path.isdir(nested_wgs):
+        extra_roots.append(nested_wgs)
+    if os.path.basename(base).lower() == "packages":
+        try:
+            for name in os.listdir(base):
+                if "snowrunner" not in name.lower():
+                    continue
+                candidate = os.path.join(base, name, "SystemAppData", "wgs")
+                if os.path.isdir(candidate):
+                    extra_roots.append(candidate)
+        except Exception:
+            pass
+
+    walk_roots = []
+    if os.path.basename(base).lower() != "packages":
+        walk_roots.append(base)
+    walk_roots.extend(path for path in extra_roots if path != base and path not in walk_roots)
+    for walk_root in walk_roots:
+        base_depth = os.path.abspath(walk_root).rstrip(os.sep).count(os.sep)
+        for current, dirnames, filenames in os.walk(walk_root):
+            current_depth = os.path.abspath(current).rstrip(os.sep).count(os.sep) - base_depth
+            if current_depth > max_depth:
+                dirnames[:] = []
+                continue
+            lowered_files = {name.lower() for name in filenames}
+            if "containers.index" in lowered_files or any(name.lower().startswith("container.") for name in filenames):
+                _inspect(current)
+                dirnames[:] = []
+                continue
+            if current_depth >= max_depth:
+                dirnames[:] = []
+
+    return found
+
+
+def _wgs_read_utf16_string(handle, fixed_chars=None):
+    if fixed_chars is None:
+        raw_len = handle.read(4)
+        if len(raw_len) != 4:
+            raise ValueError("Unexpected end of WGS data while reading string length.")
+        fixed_chars = struct.unpack("<i", raw_len)[0]
+    raw = handle.read(max(0, int(fixed_chars)) * 2)
+    if len(raw) != max(0, int(fixed_chars)) * 2:
+        raise ValueError("Unexpected end of WGS data while reading UTF-16 string.")
+    return raw.decode("utf-16", errors="ignore").rstrip("\x00")
+
+
+def _wgs_read_filetime(handle):
+    raw = handle.read(8)
+    if len(raw) != 8:
+        raise ValueError("Unexpected end of WGS data while reading FILETIME.")
+    return struct.unpack("<Q", raw)[0]
+
+
+def _wgs_guid_hex_le(raw):
+    if len(raw) != 16:
+        raise ValueError("Unexpected end of WGS data while reading GUID.")
+    return uuid.UUID(bytes_le=raw).hex.upper()
+
+
+def _wgs_pick_blob_path(blob_root, guid_a, guid_b):
+    path_a = os.path.join(blob_root, guid_a)
+    path_b = os.path.join(blob_root, guid_b)
+    exists_a = os.path.isfile(path_a)
+    exists_b = os.path.isfile(path_b)
+
+    if guid_a == guid_b:
+        return path_a
+    if exists_a and not exists_b:
+        return path_a
+    if exists_b and not exists_a:
+        return path_b
+    if exists_b:
+        return path_b
+    return path_a
+
+
+def _wgs_read_container_entries(container_file_path, blob_root=None):
+    blob_root = blob_root or os.path.dirname(container_file_path)
+    entries = []
+    with open(container_file_path, "rb") as handle:
+        header = handle.read(4)
+        if len(header) != 4:
+            raise ValueError(f"Container file is incomplete: {container_file_path}")
+        raw_count = handle.read(4)
+        if len(raw_count) != 4:
+            raise ValueError(f"Container file is incomplete: {container_file_path}")
+        file_count = struct.unpack("<i", raw_count)[0]
+        for _ in range(file_count):
+            logical_name = _wgs_read_utf16_string(handle, 64)
+            guid_a = _wgs_guid_hex_le(handle.read(16))
+            guid_b = _wgs_guid_hex_le(handle.read(16))
+            entries.append(
+                {
+                    "logical_name": logical_name,
+                    "blob_path": _wgs_pick_blob_path(blob_root, guid_a, guid_b),
+                    "container_file": container_file_path,
+                }
+            )
+    return entries
+
+
+def _wgs_collect_entries_from_container_dir(container_dir):
+    entries = []
+    try:
+        names = sorted(os.listdir(container_dir))
+    except Exception as e:
+        raise ValueError(f"Failed to list WGS folder:\n{container_dir}\n\n{e}") from e
+
+    container_files = [os.path.join(container_dir, name) for name in names if name.lower().startswith("container.")]
+    if not container_files:
+        raise ValueError("The selected folder does not contain any WGS container files.")
+
+    for container_file in container_files:
+        entries.extend(_wgs_read_container_entries(container_file, blob_root=container_dir))
+    return entries
+
+
+def _wgs_collect_entries_from_user_dir(user_dir):
+    index_path = os.path.join(user_dir, "containers.index")
+    if not os.path.isfile(index_path):
+        raise ValueError("The selected WGS user folder is missing containers.index.")
+
+    entries = []
+    package_name = ""
+    with open(index_path, "rb") as handle:
+        if len(handle.read(4)) != 4:
+            raise ValueError("The WGS containers.index file is incomplete.")
+        raw_count = handle.read(4)
+        if len(raw_count) != 4:
+            raise ValueError("The WGS containers.index file is incomplete.")
+        container_count = struct.unpack("<i", raw_count)[0]
+        _wgs_read_utf16_string(handle)  # package display name, usually empty on PC
+        package_name = _wgs_read_utf16_string(handle).split("!")[0]
+        _wgs_read_filetime(handle)
+        if len(handle.read(4)) != 4:
+            raise ValueError("The WGS containers.index file is incomplete.")
+        _wgs_read_utf16_string(handle)
+        if len(handle.read(8)) != 8:
+            raise ValueError("The WGS containers.index file is incomplete.")
+
+        for _ in range(container_count):
+            _container_name = _wgs_read_utf16_string(handle)
+            _wgs_read_utf16_string(handle)
+            _wgs_read_utf16_string(handle)
+            raw_num = handle.read(1)
+            if len(raw_num) != 1:
+                raise ValueError("The WGS containers.index file is incomplete.")
+            container_num = struct.unpack("B", raw_num)[0]
+            if len(handle.read(4)) != 4:
+                raise ValueError("The WGS containers.index file is incomplete.")
+            container_guid = _wgs_guid_hex_le(handle.read(16))
+            _wgs_read_filetime(handle)
+            if len(handle.read(16)) != 16:
+                raise ValueError("The WGS containers.index file is incomplete.")
+
+            container_dir = os.path.join(user_dir, container_guid)
+            container_file = os.path.join(container_dir, f"container.{container_num}")
+            if not os.path.isfile(container_file):
+                try:
+                    print(f"[WGS] Missing container file skipped: {container_file}")
+                except Exception:
+                    pass
+                continue
+            entries.extend(_wgs_read_container_entries(container_file, blob_root=container_dir))
+
+    if package_name and "snowrunner" not in package_name.lower():
+        raise ValueError(
+            f"The selected WGS user folder belongs to a different package:\n{package_name}"
+        )
+
+    return entries
+
+
+def _wgs_logical_name_to_relpath(logical_name):
+    text = str(logical_name or "").replace("\x00", "").strip()
+    if not text:
+        return ""
+    parts = []
+    for chunk in re.split(r"[\\/]+", text):
+        chunk = chunk.strip()
+        if not chunk or chunk in {".", ".."}:
+            continue
+        parts.append(re.sub(r'[<>:"|?*]', "_", chunk))
+    if not parts:
+        return ""
+    rel = os.path.join(*parts)
+    if not os.path.splitext(rel)[1]:
+        rel += ".cfg"
+    return rel
+
+
+def _wgs_build_session(source_dir, source_kind="auto"):
+    source_dir = os.path.abspath(str(source_dir or "").strip())
+    if not source_dir or not os.path.isdir(source_dir):
+        raise ValueError("WGS source folder does not exist.")
+
+    kind = source_kind
+    if kind == "auto":
+        if os.path.isfile(os.path.join(source_dir, "containers.index")):
+            kind = "user_dir"
+        else:
+            kind = "container_dir"
+
+    if kind == "user_dir":
+        entries = _wgs_collect_entries_from_user_dir(source_dir)
+    elif kind == "container_dir":
+        entries = _wgs_collect_entries_from_container_dir(source_dir)
+    else:
+        raise ValueError(f"Unsupported WGS source kind: {kind}")
+
+    if not entries:
+        raise ValueError("No files were found in the selected WGS source.")
+
+    session_root = os.path.join(get_editor_data_dir(), "wgs_sessions")
+    _ensure_dir(session_root)
+    mirror_dir = tempfile.mkdtemp(prefix="wgs_", dir=session_root)
+    mirror_to_blob = {}
+    mirror_mtime_ns = {}
+    seen_targets = set()
+
+    try:
+        for entry in entries:
+            rel_path = _wgs_logical_name_to_relpath(entry.get("logical_name"))
+            blob_path = os.path.abspath(str(entry.get("blob_path") or ""))
+            if not rel_path or not blob_path or not os.path.isfile(blob_path):
+                continue
+            key = os.path.normcase(rel_path)
+            if key in seen_targets:
+                try:
+                    print(f"[WGS] Duplicate logical file skipped: {rel_path}")
+                except Exception:
+                    pass
+                continue
+            seen_targets.add(key)
+            mirror_path = os.path.abspath(os.path.join(mirror_dir, rel_path))
+            mirror_parent = os.path.dirname(mirror_path)
+            if mirror_parent:
+                _ensure_dir(mirror_parent)
+            shutil.copy2(blob_path, mirror_path)
+            mirror_to_blob[mirror_path] = blob_path
+            mirror_mtime_ns[mirror_path] = _file_mtime_ns(mirror_path)
+
+        if not mirror_to_blob:
+            raise ValueError("No readable save files were found in the selected WGS source.")
+
+        session = {
+            "active": True,
+            "mirror_dir": mirror_dir,
+            "source_dir": source_dir,
+            "display_source": source_dir,
+            "mirror_to_blob": mirror_to_blob,
+            "mirror_mtime_ns": mirror_mtime_ns,
+            "sync_job": None,
+        }
+        _WGS_SESSION.clear()
+        _WGS_SESSION.update(session)
+        _wgs_schedule_sync_job()
+        return session
+    except Exception:
+        try:
+            shutil.rmtree(mirror_dir, ignore_errors=True)
+        except Exception:
+            pass
+        raise
+
+# -----------------------------------------------------------------------------
+# END SECTION: WGS Save Mirror Helpers
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# SECTION: Save Conversion Helpers
+# Used In: Save File tab ("Convert To..." action)
+# =============================================================================
+def detect_save_platform(path):
+    target = os.path.abspath(str(path or "").strip())
+    if not target:
+        return "unknown"
+    if _wgs_is_session_path(target):
+        return "wgs"
+
+    lowered = target.replace("/", "\\").lower()
+    if "\\steam\\userdata\\" in lowered and "\\1465360\\remote" in lowered:
+        return "steam"
+    if "\\documents\\my games\\snowrunner\\base\\storage\\" in lowered:
+        return "epic"
+
+    ext = os.path.splitext(target)[1].lower()
+    if ext == ".cfg":
+        return "steam"
+    if ext == ".dat":
+        return "epic"
+    return "unknown"
+
+
+def _iter_save_folder_files(folder):
+    base = os.path.abspath(str(folder or "").strip())
+    if not base or not os.path.isdir(base):
+        return []
+    found = []
+    for current, dirnames, filenames in os.walk(base):
+        dirnames[:] = [name for name in dirnames if name not in {".git", "__pycache__"}]
+        for name in sorted(filenames):
+            src = os.path.join(current, name)
+            if not os.path.isfile(src):
+                continue
+            rel = os.path.relpath(src, base)
+            found.append((src, rel))
+    return found
+
+
+def _save_relpath_with_platform_extension(rel_path, target_platform):
+    rel = str(rel_path or "")
+    root, ext = os.path.splitext(rel)
+    ext_lower = ext.lower()
+    if target_platform == "steam" and ext_lower == ".dat":
+        return root + ".cfg"
+    if target_platform == "epic" and ext_lower == ".cfg":
+        return root + ".dat"
+    return rel
+
+
+def _copy_save_folder_to_platform(source_dir, target_dir, target_platform):
+    source_dir = os.path.abspath(str(source_dir or "").strip())
+    target_dir = os.path.abspath(str(target_dir or "").strip())
+    if not os.path.isdir(source_dir):
+        raise ValueError("Source save folder does not exist.")
+    if not target_dir:
+        raise ValueError("Target save folder is missing.")
+    _ensure_dir(target_dir)
+
+    copied = 0
+    overwritten = 0
+    file_entries = _iter_save_folder_files(source_dir)
+    if not file_entries:
+        raise ValueError("No files were found in the source save folder.")
+
+    for src_path, rel_path in file_entries:
+        out_rel = _save_relpath_with_platform_extension(rel_path, target_platform)
+        dst_path = os.path.join(target_dir, out_rel)
+        dst_parent = os.path.dirname(dst_path)
+        if dst_parent:
+            _ensure_dir(dst_parent)
+        if os.path.isfile(dst_path):
+            overwritten += 1
+        shutil.copy2(src_path, dst_path)
+        copied += 1
+
+        if out_rel != rel_path:
+            stale_path = os.path.join(target_dir, rel_path)
+            if os.path.isfile(stale_path):
+                try:
+                    os.remove(stale_path)
+                except Exception:
+                    pass
+
+    return {"copied": copied, "overwritten": overwritten, "target_dir": target_dir}
+
+
+def _steam_sha1_for_file(path):
+    sha1 = hashlib.sha1()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(65536)
+            if not chunk:
+                break
+            sha1.update(chunk)
+    return sha1.hexdigest()
+
+
+def _write_steam_remotecache(remote_dir):
+    remote_dir = os.path.abspath(str(remote_dir or "").strip())
+    if not os.path.isdir(remote_dir):
+        raise ValueError("Steam remote folder does not exist.")
+    parent_dir = os.path.dirname(remote_dir)
+    remcache_path = os.path.join(parent_dir, "remotecache.vdf")
+    file_paths = []
+    for name in sorted(os.listdir(remote_dir)):
+        candidate = os.path.join(remote_dir, name)
+        if os.path.isfile(candidate):
+            file_paths.append(candidate)
+
+    def _vdf_line(level, key="", value=None):
+        pad = "\t" * level
+        if key == "":
+            return f"{pad}}}\n"
+        if value is None:
+            return f'{pad}"{key}"\n{pad}' + "{\n"
+        return f'{pad}"{key}"\t\t"{value}"\n'
+
+    lines = [_vdf_line(0, "1465360")]
+    for file_path in file_paths:
+        stat_info = os.stat(file_path)
+        timestamp = int(math.floor(stat_info.st_mtime))
+        lines.append(_vdf_line(1, os.path.basename(file_path)))
+        lines.append(_vdf_line(2, "root", 0))
+        lines.append(_vdf_line(2, "size", stat_info.st_size))
+        lines.append(_vdf_line(2, "localtime", timestamp))
+        lines.append(_vdf_line(2, "time", timestamp))
+        lines.append(_vdf_line(2, "remotetime", timestamp))
+        lines.append(_vdf_line(2, "sha", _steam_sha1_for_file(file_path)))
+        lines.append(_vdf_line(2, "syncstate", 4))
+        lines.append(_vdf_line(2, "persiststate", 0))
+        lines.append(_vdf_line(2, "platformstosync2", -1))
+        lines.append(_vdf_line(1))
+    lines.append(_vdf_line(0))
+
+    _write_text_file_atomic(remcache_path, "".join(lines), encoding="utf-8", newline="\n")
+    return remcache_path
+
+
+def _wgs_collect_blob_mapping(source_dir, source_kind="auto"):
+    source_dir = os.path.abspath(str(source_dir or "").strip())
+    if not source_dir or not os.path.isdir(source_dir):
+        raise ValueError("WGS folder does not exist.")
+
+    kind = source_kind
+    if kind == "auto":
+        kind = "user_dir" if os.path.isfile(os.path.join(source_dir, "containers.index")) else "container_dir"
+
+    if kind == "user_dir":
+        entries = _wgs_collect_entries_from_user_dir(source_dir)
+    elif kind == "container_dir":
+        entries = _wgs_collect_entries_from_container_dir(source_dir)
+    else:
+        raise ValueError(f"Unsupported WGS folder type: {kind}")
+
+    mapping = {}
+    duplicates = []
+    for entry in entries:
+        rel_path = _wgs_logical_name_to_relpath(entry.get("logical_name"))
+        blob_path = os.path.abspath(str(entry.get("blob_path") or ""))
+        if not rel_path or not blob_path:
+            continue
+        key = os.path.normcase(rel_path)
+        if key in mapping:
+            duplicates.append(rel_path)
+            continue
+        mapping[key] = blob_path
+
+    return {"mapping": mapping, "duplicates": duplicates, "kind": kind, "source_dir": source_dir}
+
+
+def _wgs_target_relpath_for_source(rel_path):
+    rel = str(rel_path or "")
+    root, ext = os.path.splitext(rel)
+    if ext.lower() == ".dat":
+        return root + ".cfg"
+    return rel
+
+
+def _copy_save_folder_to_wgs(source_dir, target_wgs_dir, source_kind="auto"):
+    source_dir = os.path.abspath(str(source_dir or "").strip())
+    target_wgs_dir = os.path.abspath(str(target_wgs_dir or "").strip())
+    if not os.path.isdir(source_dir):
+        raise ValueError("Source save folder does not exist.")
+
+    payload = _wgs_collect_blob_mapping(target_wgs_dir, source_kind=source_kind)
+    mapping = payload.get("mapping") or {}
+    if not mapping:
+        raise ValueError("The target WGS folder does not contain any writable mapped save files.")
+
+    copied = 0
+    overwritten = 0
+    missing = []
+    for src_path, rel_path in _iter_save_folder_files(source_dir):
+        lookup_rel = _wgs_target_relpath_for_source(rel_path)
+        blob_path = mapping.get(os.path.normcase(lookup_rel))
+        if not blob_path:
+            missing.append(rel_path)
+            continue
+        if os.path.isfile(blob_path):
+            overwritten += 1
+        blob_parent = os.path.dirname(blob_path)
+        if blob_parent:
+            _ensure_dir(blob_parent)
+        shutil.copy2(src_path, blob_path)
+        copied += 1
+
+    return {
+        "copied": copied,
+        "overwritten": overwritten,
+        "missing": missing,
+        "target_dir": target_wgs_dir,
+        "kind": payload.get("kind", source_kind),
+    }
+
+
+def _conversion_export_stamp():
+    try:
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
+    except Exception:
+        return str(int(time.time()))
+
+
+def _conversion_export_basename(target_platform):
+    platform_name = str(target_platform or "save").upper()
+    return f"SnowRunner_{platform_name}_Converted_{_conversion_export_stamp()}"
+
+
+def _prepare_platform_export_dirs(parent_dir, target_platform):
+    parent_dir = os.path.abspath(str(parent_dir or "").strip())
+    if not parent_dir:
+        raise ValueError("Export parent folder is missing.")
+    _ensure_dir(parent_dir)
+
+    base_name = _conversion_export_basename(target_platform)
+    root_dir = os.path.join(parent_dir, base_name)
+    if target_platform == "steam":
+        target_dir = os.path.join(root_dir, "1465360", "remote")
+    else:
+        target_dir = root_dir
+    _ensure_dir(target_dir)
+    return {"root_dir": root_dir, "target_dir": target_dir, "base_name": base_name}
+
+
+def _build_platform_export(source_dir, parent_dir, target_platform):
+    layout = _prepare_platform_export_dirs(parent_dir, target_platform)
+    result = _copy_save_folder_to_platform(source_dir, layout["target_dir"], target_platform)
+    result["export_root"] = layout["root_dir"]
+    result["export_name"] = layout["base_name"]
+    result["display_target"] = layout["root_dir"]
+    if target_platform == "steam":
+        result["remotecache_path"] = _write_steam_remotecache(layout["target_dir"])
+    return result
+
+
+def _zip_directory_tree(source_dir, zip_path):
+    source_dir = os.path.abspath(str(source_dir or "").strip())
+    zip_path = os.path.abspath(str(zip_path or "").strip())
+    if not os.path.isdir(source_dir):
+        raise ValueError("ZIP source folder does not exist.")
+    zip_parent = os.path.dirname(zip_path)
+    if zip_parent:
+        _ensure_dir(zip_parent)
+
+    root_parent = os.path.dirname(source_dir)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for current, dirnames, filenames in os.walk(source_dir):
+            dirnames[:] = [name for name in dirnames if name not in {".git", "__pycache__"}]
+            for name in sorted(filenames):
+                file_path = os.path.join(current, name)
+                if not os.path.isfile(file_path):
+                    continue
+                arcname = os.path.relpath(file_path, root_parent)
+                archive.write(file_path, arcname)
+    return zip_path
+
+
+def _build_platform_zip_export(source_dir, downloads_dir, target_platform):
+    temp_parent = tempfile.mkdtemp(prefix="convert_zip_", dir=get_editor_data_dir())
+    cleanup_root = ""
+    try:
+        build = _build_platform_export(source_dir, temp_parent, target_platform)
+        cleanup_root = str(build.get("export_root") or "")
+        export_name = str(build.get("export_name") or _conversion_export_basename(target_platform))
+        zip_path = os.path.join(os.path.abspath(str(downloads_dir or "").strip()), export_name + ".zip")
+        _zip_directory_tree(cleanup_root, zip_path)
+        build["zip_path"] = zip_path
+        build["display_target"] = zip_path
+        return build
+    finally:
+        try:
+            shutil.rmtree(temp_parent, ignore_errors=True)
+        except Exception:
+            pass
+
+# -----------------------------------------------------------------------------
+# END SECTION: Save Conversion Helpers
+# -----------------------------------------------------------------------------
+
 # =============================================================================
 # SECTION: Fog Tool (Editor + Automation UI)
 # Used In: Fog Tool tab -> FogToolFrame
@@ -1334,7 +2309,7 @@ Season / Map Reference
         win.title("Tutorial / Info")
         win.geometry("700x600")
         text = tk.Text(win, wrap="word")
-        text.insert("1.0", info_text)
+        text.insert("1.0", _editor_translate_display_text(info_text))
         text.config(state="disabled")
         text.pack(fill="both", expand=True)
         scroll = ttk.Scrollbar(win, orient="vertical", command=text.yview)
@@ -2142,9 +3117,101 @@ def get_desktop_path():
         if result != 0:
             raise ctypes.WinError(result)
         return out_path.value
-    else:
-        # Linux / macOS → just point to ~/Desktop (safe fallback)
-        return os.path.join(os.path.expanduser("~"), "Desktop")
+
+    home = ""
+    try:
+        home = os.path.abspath(os.path.expanduser("~"))
+    except Exception:
+        home = ""
+
+    candidates = []
+    if platform.system() == "Linux":
+        xdg_desktop = _linux_xdg_desktop_dir(home)
+        if xdg_desktop:
+            candidates.append(xdg_desktop)
+    if home:
+        candidates.append(os.path.join(home, "Desktop"))
+        candidates.append(home)
+    try:
+        candidates.append(os.getcwd())
+    except Exception:
+        pass
+
+    seen = set()
+    for candidate in candidates:
+        path = str(candidate or "").strip()
+        if not path:
+            continue
+        norm = os.path.normcase(os.path.normpath(path))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.isdir(path):
+            return path
+
+    return home or os.getcwd()
+
+
+def get_downloads_path():
+    if platform.system() == "Windows":
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ('Data1', wintypes.DWORD),
+                ('Data2', wintypes.WORD),
+                ('Data3', wintypes.WORD),
+                ('Data4', wintypes.BYTE * 8)
+            ]
+
+        def guid_from_string(guid_str):
+            u = uuid.UUID(guid_str)
+            return GUID(
+                u.time_low,
+                u.time_mid,
+                u.time_hi_version,
+                (wintypes.BYTE * 8).from_buffer_copy(u.bytes[8:])
+            )
+
+        SHGetKnownFolderPath = ctypes.windll.shell32.SHGetKnownFolderPath
+        SHGetKnownFolderPath.argtypes = [
+            ctypes.POINTER(GUID), wintypes.DWORD, wintypes.HANDLE,
+            ctypes.POINTER(ctypes.c_wchar_p)
+        ]
+        SHGetKnownFolderPath.restype = wintypes.HRESULT
+
+        downloads_id = guid_from_string('{374DE290-123F-4565-9164-39C4925E467B}')
+        out_path = ctypes.c_wchar_p()
+        result = SHGetKnownFolderPath(ctypes.byref(downloads_id), 0, 0, ctypes.byref(out_path))
+        if result == 0 and out_path.value:
+            return out_path.value
+
+    home = ""
+    try:
+        home = os.path.abspath(os.path.expanduser("~"))
+    except Exception:
+        home = ""
+
+    candidates = []
+    if home:
+        candidates.append(os.path.join(home, "Downloads"))
+        candidates.append(home)
+    try:
+        candidates.append(os.getcwd())
+    except Exception:
+        pass
+
+    seen = set()
+    for candidate in candidates:
+        path = str(candidate or "").strip()
+        if not path:
+            continue
+        norm = os.path.normcase(os.path.normpath(path))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if os.path.isdir(path):
+            return path
+
+    return home or os.getcwd()
 
 LEGACY_SAVE_PATH_FILE = os.path.join(os.path.expanduser("~"), ".snowrunner_save_path.txt")  # legacy
 SAVE_PATH_FILE = LEGACY_SAVE_PATH_FILE  # read-only migration source
@@ -2171,42 +3238,52 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                return payload
+            print("Failed to load config: expected a JSON object.")
+        except Exception as e:
+            print("Failed to load config:", e)
     return {}
+
+
 def save_config(data):
     try:
-        os.makedirs(os.path.dirname(CONFIG_FILE) or ".", exist_ok=True)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
+        payload = data if isinstance(data, dict) else {}
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        _write_text_file_atomic(CONFIG_FILE, text, encoding="utf-8")
+        return True
     except Exception as e:
         print("Failed to save config:", e)
+        return False
 
 def _load_config_safe():
     try:
-        return load_config() or {}
+        cfg = load_config() or {}
+        return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
 
 def _save_config_safe(cfg):
     try:
-        save_config(cfg)
-        return True
+        return bool(save_config(cfg))
     except Exception:
         return False
 
 def _update_config_values(values: dict):
     cfg = _load_config_safe()
     try:
+        if not isinstance(cfg, dict):
+            cfg = {}
         cfg.update(values)
-        _save_config_safe(cfg)
-        return True
+        return _save_config_safe(cfg)
     except Exception:
         return False
 
 def _delete_config_keys(keys):
     cfg = _load_config_safe()
+    if not isinstance(cfg, dict):
+        cfg = {}
     changed = False
     for k in keys:
         if k in cfg:
@@ -2301,6 +3378,16 @@ def _cfg_bool(value, default=False):
         return bool(default)
 
 
+def _parse_nonnegative_float(value, default):
+    try:
+        parsed = float(str(value).strip())
+        if (not math.isfinite(parsed)) or parsed < 0:
+            return float(default)
+        return parsed
+    except Exception:
+        return float(default)
+
+
 def _parse_nonnegative_int(value, default):
     try:
         parsed = int(str(value).strip())
@@ -2334,6 +3421,125 @@ def _get_autosave_poll_interval_seconds(default=60):
         cfg.get("autosave_poll_interval_seconds", default),
         default=default,
     )
+
+
+BACKGROUND_UPDATE_LAST_CHECK_TS_KEY = "background_update_last_check_ts"
+BACKGROUND_UPDATE_LAST_STATUS_KEY = "background_update_last_status"
+BACKGROUND_OBJECTIVES_PREFETCH_LAST_ATTEMPT_TS_KEY = "background_objectives_prefetch_last_attempt_ts"
+BACKGROUND_OBJECTIVES_PREFETCH_LAST_SUCCESS_TS_KEY = "background_objectives_prefetch_last_success_ts"
+BACKGROUND_OBJECTIVES_PREFETCH_LAST_STATUS_KEY = "background_objectives_prefetch_last_status"
+BACKGROUND_UPDATE_CHECK_COOLDOWN_SECONDS = 12 * 60 * 60
+BACKGROUND_UPDATE_FAILURE_RETRY_SECONDS = 2 * 60 * 60
+BACKGROUND_OBJECTIVES_PREFETCH_SUCCESS_COOLDOWN_SECONDS = 24 * 60 * 60
+BACKGROUND_OBJECTIVES_PREFETCH_FAILURE_RETRY_SECONDS = 2 * 60 * 60
+
+
+def _background_now_ts(now_ts=None):
+    fallback = float(time.time())
+    source = fallback if now_ts is None else now_ts
+    return _parse_nonnegative_float(source, fallback)
+
+
+def _cfg_timestamp_seconds(cfg, key, default=0.0):
+    if not isinstance(cfg, dict):
+        return float(default)
+    return _parse_nonnegative_float(cfg.get(key, default), default)
+
+
+def _should_run_background_update_check(cfg=None, now_ts=None):
+    now = _background_now_ts(now_ts)
+    cfg = cfg if isinstance(cfg, dict) else _load_config_safe()
+    last_check = _cfg_timestamp_seconds(cfg, BACKGROUND_UPDATE_LAST_CHECK_TS_KEY, 0.0)
+    last_status = str(cfg.get(BACKGROUND_UPDATE_LAST_STATUS_KEY, "") or "").strip().lower()
+    if last_check <= 0 or now < last_check:
+        return True
+    cooldown = BACKGROUND_UPDATE_CHECK_COOLDOWN_SECONDS
+    if last_status in ("failed", "inflight"):
+        cooldown = BACKGROUND_UPDATE_FAILURE_RETRY_SECONDS
+    return (now - last_check) >= cooldown
+
+
+def _mark_background_update_check_started(now_ts=None):
+    stamp = _background_now_ts(now_ts)
+    _update_config_values(
+        {
+            BACKGROUND_UPDATE_LAST_CHECK_TS_KEY: stamp,
+            BACKGROUND_UPDATE_LAST_STATUS_KEY: "inflight",
+        }
+    )
+    return stamp
+
+
+def _record_background_update_check_result(status, now_ts=None):
+    state = str(status or "").strip().lower()
+    if state not in ("update", "dev", "none", "failed", "inflight"):
+        state = "failed"
+    stamp = _background_now_ts(now_ts)
+    _update_config_values(
+        {
+            BACKGROUND_UPDATE_LAST_CHECK_TS_KEY: stamp,
+            BACKGROUND_UPDATE_LAST_STATUS_KEY: state,
+        }
+    )
+    return stamp
+
+
+def _root_can_present_popup(root) -> bool:
+    if root is None:
+        return False
+    try:
+        root_state = str(root.state()).strip().lower()
+    except Exception:
+        root_state = "normal"
+    if root_state in ("withdrawn", "iconic", "iconified"):
+        return False
+    try:
+        return bool(root.winfo_viewable())
+    except Exception:
+        return root_state != "withdrawn"
+
+
+def _should_run_background_objectives_prefetch(cfg=None, now_ts=None):
+    now = _background_now_ts(now_ts)
+    cfg = cfg if isinstance(cfg, dict) else _load_config_safe()
+    last_status = str(cfg.get(BACKGROUND_OBJECTIVES_PREFETCH_LAST_STATUS_KEY, "") or "").strip().lower()
+    last_attempt = _cfg_timestamp_seconds(cfg, BACKGROUND_OBJECTIVES_PREFETCH_LAST_ATTEMPT_TS_KEY, 0.0)
+    last_success = _cfg_timestamp_seconds(cfg, BACKGROUND_OBJECTIVES_PREFETCH_LAST_SUCCESS_TS_KEY, 0.0)
+
+    if last_status == "success":
+        ref = last_success if last_success > 0 else last_attempt
+        if ref > 0 and now >= ref:
+            return (now - ref) >= BACKGROUND_OBJECTIVES_PREFETCH_SUCCESS_COOLDOWN_SECONDS
+        return True
+
+    if last_status in ("failed", "inflight"):
+        if last_attempt > 0 and now >= last_attempt:
+            return (now - last_attempt) >= BACKGROUND_OBJECTIVES_PREFETCH_FAILURE_RETRY_SECONDS
+        return True
+
+    return True
+
+
+def _mark_background_objectives_prefetch_attempt(now_ts=None):
+    stamp = _background_now_ts(now_ts)
+    _update_config_values(
+        {
+            BACKGROUND_OBJECTIVES_PREFETCH_LAST_ATTEMPT_TS_KEY: stamp,
+            BACKGROUND_OBJECTIVES_PREFETCH_LAST_STATUS_KEY: "inflight",
+        }
+    )
+    return stamp
+
+
+def _record_background_objectives_prefetch_result(success, attempt_ts=None, now_ts=None):
+    payload = {
+        BACKGROUND_OBJECTIVES_PREFETCH_LAST_STATUS_KEY: ("success" if bool(success) else "failed"),
+    }
+    if attempt_ts is not None:
+        payload[BACKGROUND_OBJECTIVES_PREFETCH_LAST_ATTEMPT_TS_KEY] = _background_now_ts(attempt_ts)
+    if bool(success):
+        payload[BACKGROUND_OBJECTIVES_PREFETCH_LAST_SUCCESS_TS_KEY] = _background_now_ts(now_ts)
+    _update_config_values(payload)
 
 
 def _sleep_with_stop_event(stop_event, seconds):
@@ -2423,18 +3629,38 @@ def _create_timestamped_full_backup(save_dir, prefix="backup"):
     return backup_dir, full_dir, copied
 
 
+def _windows_hidden_subprocess_kwargs():
+    kwargs = {}
+    if platform.system() != "Windows":
+        return kwargs
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+        kwargs["startupinfo"] = startupinfo
+    except Exception:
+        pass
+    try:
+        kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NO_WINDOW", 0) or 0)
+    except Exception:
+        pass
+    return kwargs
+
+
 def _run_powershell_command(ps_command):
     """
     Execute a PowerShell command using either powershell or pwsh.
     Raises RuntimeError when execution fails on all supported shells.
     """
     last_error = ""
+    quiet_kwargs = _windows_hidden_subprocess_kwargs()
     for exe in ("powershell", "pwsh"):
         try:
             result = subprocess.run(
                 [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command],
                 capture_output=True,
                 text=True,
+                **quiet_kwargs,
             )
         except FileNotFoundError:
             last_error = f"{exe} not found"
@@ -2497,6 +3723,14 @@ def _norm_path_compare(value):
         return txt
 
 
+def _should_remove_stale_windows_startup_shortcut(cfg=None, shortcut_path=None):
+    cfg = cfg if isinstance(cfg, dict) else _load_config_safe()
+    if _cfg_bool(cfg.get("start_with_windows", False), default=False):
+        return False
+    path = str(shortcut_path or _windows_startup_shortcut_path() or "").strip()
+    return bool(path and os.path.exists(path))
+
+
 def _sync_windows_startup_registration_if_needed():
     """
     Keep startup shortcut pinned to the currently running build when startup is enabled.
@@ -2506,12 +3740,20 @@ def _sync_windows_startup_registration_if_needed():
         return
 
     cfg = _load_config_safe()
+    shortcut_path = _windows_startup_shortcut_path()
+    if _should_remove_stale_windows_startup_shortcut(cfg=cfg, shortcut_path=shortcut_path):
+        try:
+            _set_windows_startup_enabled(False)
+            print("[Startup] removed stale startup shortcut because startup is disabled in config.")
+        except Exception as e:
+            print(f"[Startup] failed to remove stale startup shortcut: {e}")
+        return
+
     if not _cfg_bool(cfg.get("start_with_windows", False), default=False):
         return
 
     startup_minimized = _cfg_bool(cfg.get("start_with_windows_minimized", False), default=False)
     expected = _startup_registration_metadata(start_minimized=startup_minimized)
-    shortcut_path = _windows_startup_shortcut_path()
     shortcut_exists = bool(shortcut_path and os.path.exists(shortcut_path))
 
     registered_version = _parse_nonnegative_int(cfg.get("start_with_windows_registered_version", 0), 0)
@@ -2533,6 +3775,15 @@ def _sync_windows_startup_registration_if_needed():
     )
     if not needs_refresh:
         return
+
+    cfg = _load_config_safe()
+    if not _cfg_bool(cfg.get("start_with_windows", False), default=False):
+        print("[Startup] skipped shortcut refresh because startup is now disabled.")
+        return
+
+    startup_minimized = _cfg_bool(cfg.get("start_with_windows_minimized", False), default=False)
+    expected = _startup_registration_metadata(start_minimized=startup_minimized)
+    expected_version = int(expected["start_with_windows_registered_version"])
 
     ok, msg = _apply_startup_mode(True, start_minimized=startup_minimized)
     if not ok:
@@ -3418,10 +4669,11 @@ def _show_themed_message(kind, title=None, message="", **options):
     if parent is None:
         return native_fn(title, message, **options)
 
-    msg = "" if message is None else str(message)
+    title = _editor_translate_display_text("" if title is None else str(title))
+    msg = _editor_translate_display_text("" if message is None else str(message))
     detail = options.get("detail")
     if detail:
-        msg = f"{msg}\n\n{detail}"
+        msg = f"{msg}\n\n{_editor_translate_display_text(detail)}"
 
     try:
         win = _create_themed_toplevel(parent)
@@ -4089,6 +5341,20 @@ FACTOR_RULE_VARS = []
 # SECTION: Process Detection + Autosave/Backup Utilities
 # Used In: Settings tab, Backups tab, autosave monitor
 # =============================================================================
+def _looks_like_snowrunner_game_process_line(line):
+    text = str(line or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    if re.search(r"\bsnowrunner(?:[_\-\s]+save)?[_\-\s]*editor\b", lower):
+        return False
+    if re.search(r"\bpgrep\b", lower):
+        return False
+    if re.search(r"(^|[^a-z0-9])snowrunner\.exe([^a-z0-9]|$)", lower):
+        return True
+    return bool(re.search(r"(^|[^a-z0-9])snowrunner([^a-z0-9]|$)", lower))
+
+
 def _is_snowrunner_running():
     """
     Cross-platform check: returns True if any running process name/command line contains 'snowrunner' (case-insensitive).
@@ -4103,7 +5369,7 @@ def _is_snowrunner_running():
             CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
 
             out = subprocess.check_output(
-                ["tasklist"],
+                ["tasklist", "/fo", "csv", "/nh"],
                 stderr=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
@@ -4111,7 +5377,14 @@ def _is_snowrunner_running():
                 startupinfo=si,
                 creationflags=CREATE_NO_WINDOW,
             )
-            return "snowrunner" in out.lower()
+            for raw_line in str(out or "").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                image_name = line.split('","', 1)[0].strip().strip('"').lower()
+                if image_name == "snowrunner.exe":
+                    return True
+            return False
         else:
             # try pgrep for efficiency
             try:
@@ -4122,7 +5395,10 @@ def _is_snowrunner_running():
                     encoding="utf-8",
                     errors="ignore",
                 )
-                return bool(out.strip())
+                for raw_line in str(out or "").splitlines():
+                    if _looks_like_snowrunner_game_process_line(raw_line):
+                        return True
+                return False
             except Exception:
                 # fallback to ps aux
                 out = subprocess.check_output(
@@ -4132,7 +5408,10 @@ def _is_snowrunner_running():
                     encoding="utf-8",
                     errors="ignore",
                 )
-                return "snowrunner" in out.lower()
+                for raw_line in str(out or "").splitlines():
+                    if _looks_like_snowrunner_game_process_line(raw_line):
+                        return True
+                return False
     except Exception:
         # if detection fails for any reason, return False (safe fallback)
         return False
@@ -4273,6 +5552,11 @@ def _scan_folder_mtimes(save_dir):
                     pass
     return mt
 
+
+def _should_treat_autosave_running_scan_as_transient(running, current_mtimes):
+    return bool(running) and not bool(current_mtimes)
+
+
 def _autosave_monitor_loop(stop_event, poll_interval=60):
     """
     Monitor loop (configurable cadence):
@@ -4376,6 +5660,20 @@ def _autosave_monitor_loop(stop_event, poll_interval=60):
                 print(f"[Autosave] most recent file: {most_recent_file} @ {most_recent_human}", flush=True)
             else:
                 print("[Autosave] no .cfg/.dat files found in save folder.", flush=True)
+                if _should_treat_autosave_running_scan_as_transient(running, current_mtimes):
+                    if last_seen_mtimes:
+                        print(
+                            "[Autosave] live save folder appears temporarily empty while the game is running; "
+                            "preserving the previous baseline and retrying later.",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "[Autosave] waiting for a stable live save scan before tracking autosave changes.",
+                            flush=True,
+                        )
+                    _sleep_with_stop_event(stop_event, poll_interval)
+                    continue
 
             # If first time seeing the folder while running, initialise baseline and wait one interval
             if not last_seen_mtimes:
@@ -4428,12 +5726,12 @@ def start_autosave_monitor():
     print(f"[Autosave] monitor started (interval {current_poll}s)")
 
 
-def stop_autosave_monitor():
+def stop_autosave_monitor(wait=True):
     global _AUTOSAVE_THREAD, _AUTOSAVE_STOP_EVENT
     try:
         if _AUTOSAVE_STOP_EVENT:
             _AUTOSAVE_STOP_EVENT.set()
-        if _AUTOSAVE_THREAD:
+        if wait and _AUTOSAVE_THREAD:
             _AUTOSAVE_THREAD.join(timeout=2)
     except Exception:
         pass
@@ -4503,6 +5801,22 @@ def make_backup_if_enabled(path, force_full=False):
 # SECTION: Save-File IO + Version Safety
 # Used In: Save File tab and startup auto-load
 # =============================================================================
+DELAYED_VERSION_CHECK_LAST_PATH_KEY = "delayed_version_check_last_path"
+DELAYED_VERSION_CHECK_LAST_MTIME_NS_KEY = "delayed_version_check_last_mtime_ns"
+DELAYED_VERSION_CHECK_LAST_TS_KEY = "delayed_version_check_last_ts"
+DELAYED_VERSION_CHECK_COOLDOWN_SECONDS = 12 * 60 * 60
+
+
+def _file_mtime_ns(path):
+    try:
+        return int(os.stat(path).st_mtime_ns)
+    except Exception:
+        try:
+            return int(float(os.path.getmtime(path)) * 1_000_000_000)
+        except Exception:
+            return 0
+
+
 def load_last_path():
     cfg = _load_config_safe()
     p = cfg.get("last_save_path", "")
@@ -4524,6 +5838,56 @@ def load_last_path():
     except Exception:
         pass
     return ""
+
+
+def _should_run_delayed_version_check(path, cfg=None, now_ts=None):
+    target = str(path or "").strip()
+    if not target or not os.path.exists(target):
+        return False
+
+    cfg = cfg if isinstance(cfg, dict) else _load_config_safe()
+    now = _background_now_ts(now_ts)
+    target_abs = os.path.abspath(target)
+    current_mtime_ns = _file_mtime_ns(target_abs)
+
+    last_path = str(cfg.get(DELAYED_VERSION_CHECK_LAST_PATH_KEY, "") or "").strip()
+    last_mtime_ns = _parse_nonnegative_int(cfg.get(DELAYED_VERSION_CHECK_LAST_MTIME_NS_KEY, 0), 0)
+    last_ts = _cfg_timestamp_seconds(cfg, DELAYED_VERSION_CHECK_LAST_TS_KEY, 0.0)
+
+    if not last_path:
+        return True
+    try:
+        last_path = os.path.abspath(last_path)
+    except Exception:
+        pass
+    if os.path.normcase(os.path.normpath(last_path)) != os.path.normcase(os.path.normpath(target_abs)):
+        return True
+    if current_mtime_ns > 0 and current_mtime_ns != last_mtime_ns:
+        return True
+    if last_ts <= 0 or now < last_ts:
+        return True
+    return (now - last_ts) >= DELAYED_VERSION_CHECK_COOLDOWN_SECONDS
+
+
+def _mark_delayed_version_check_started(path, now_ts=None):
+    target = str(path or "").strip()
+    if not target:
+        return 0.0
+    try:
+        target = os.path.abspath(target)
+    except Exception:
+        pass
+    stamp = _background_now_ts(now_ts)
+    _update_config_values(
+        {
+            DELAYED_VERSION_CHECK_LAST_PATH_KEY: target,
+            DELAYED_VERSION_CHECK_LAST_MTIME_NS_KEY: _file_mtime_ns(target),
+            DELAYED_VERSION_CHECK_LAST_TS_KEY: stamp,
+        }
+    )
+    return stamp
+
+
 def safe_load_save(path):
     """Try to load a save file, return content or None with popup error."""
     if not os.path.exists(path):
@@ -4535,7 +5899,11 @@ def safe_load_save(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
-    except Exception:
+    except Exception as e:
+        try:
+            print(f"[Save Load] Failed to read '{path}': {e}")
+        except Exception:
+            pass
         messagebox.showerror(
             "Save File Corrupted",
             f"Could not load save file:\n{path}\n\nThe file appears to be corrupted or incomplete."
@@ -4761,6 +6129,8 @@ def try_autoload_last_save(save_path_var):
 
 
 def save_path(path):
+    if _wgs_is_session_path(path):
+        return
     if "dont_remember_path_var" in globals() and dont_remember_path_var.get():
         return
     _update_config_values({"last_save_path": path})
@@ -5231,8 +6601,7 @@ def modify_time(file_path, time_day, time_night, skip_time):
     content = re.sub(r'("timeSettingsDay"\s*:\s*)-?\d+(\.\d+)?(e[-+]?\d+)?', lambda m: f'{m.group(1)}{time_day}', content)
     content = re.sub(r'("timeSettingsNight"\s*:\s*)-?\d+(\.\d+)?(e[-+]?\d+)?', lambda m: f'{m.group(1)}{time_night}', content)
     content = re.sub(r'("isAbleToSkipTime"\s*:\s*)(true|false)', lambda m: f'{m.group(1)}{"true" if skip_time else "false"}', content)
-    with open(file_path, 'w', encoding='utf-8') as out_file:
-        out_file.write(content)
+    _write_text_file_atomic(file_path, content, encoding="utf-8")
     show_info("Success", "Time updated.")
 
 # -----------------------------------------------------------------------------
@@ -5279,8 +6648,7 @@ def complete_seasons_and_maps(file_path, selected_seasons, selected_maps, notify
 
         new_block_str = json.dumps(obj_states, separators=(",", ":"))
         content = content[:block_start] + new_block_str + content[block_end:]
-        with open(file_path, 'w', encoding='utf-8') as out_file:
-            out_file.write(content)
+        _write_text_file_atomic(file_path, content, encoding="utf-8")
 
         return _action_result("Success", "Selected missions marked complete.", notify=notify)
     except Exception as e:
@@ -6797,8 +8165,13 @@ def unlock_levels(save_path, selected_regions, notify=True, make_backup=True):
 # SECTION: Objectives+ Data, Logging, and Virtualized UI
 # Used In: Objectives+ tab (large datasets + virtualized list rendering)
 # =============================================================================
-_pd = None  # placeholder for pandas when loaded
-DEBUG: bool = True
+# Keep expensive Objectives+ debug logging opt-in for release builds.
+DEBUG: bool = str(os.environ.get("SNOWRUNNER_EDITOR_DEBUG", "") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 # Reduce log spam from high-frequency Objectives+ scrolling unless explicitly enabled.
 DEBUG_OBJECTIVES_SCROLL: bool = False
 _APP_START: Optional[float] = None
@@ -6814,7 +8187,7 @@ def _set_objectives_prefetch_state(**updates):
         _OBJECTIVES_PREFETCH_STATE.update(updates)
 
 
-def start_objectives_prefetch_background(force: bool = False) -> bool:
+def start_objectives_prefetch_background(force: bool = False, startup_managed: bool = False) -> bool:
     """
     Start Objectives+ latest-data refresh in background at app startup.
     Returns True when a new worker thread is started.
@@ -6825,6 +8198,12 @@ def start_objectives_prefetch_background(force: bool = False) -> bool:
     if state.get("completed") and (not force):
         return False
 
+    attempt_ts = None
+    if startup_managed:
+        if (not force) and (not _should_run_background_objectives_prefetch()):
+            return False
+        attempt_ts = _mark_background_objectives_prefetch_attempt()
+
     _set_objectives_prefetch_state(
         started=True,
         inflight=True,
@@ -6834,11 +8213,18 @@ def start_objectives_prefetch_background(force: bool = False) -> bool:
     )
 
     def _worker():
-        cache_csv = _objectives_cache_csv_path()
         built = False
         err = ""
+        source_kind = ""
         try:
-            built = _mr_build_csv(cache_csv)
+            source_info = _objectives_get_preferred_source(
+                force_reload=bool(force),
+                language=_objectives_get_language_preference(),
+                allow_download=True,
+            )
+            built = bool(source_info.get("rows"))
+            if built:
+                source_kind = str(source_info.get("kind") or "").strip().lower()
         except Exception as e:
             built = False
             err = str(e)
@@ -6849,15 +8235,35 @@ def start_objectives_prefetch_background(force: bool = False) -> bool:
             built=bool(built),
             error=str(err or ""),
             last_completed_ts=float(time.time()),
+            source=source_kind,
         )
 
+        if startup_managed:
+            _record_background_objectives_prefetch_result(bool(built), attempt_ts=attempt_ts)
+
         if built:
-            set_app_status("Objectives+ latest data cached in background.", timeout_ms=4500)
+            if source_kind == "local":
+                set_app_status("Objectives+ local game data cached in background.", timeout_ms=4500)
+            else:
+                set_app_status("Objectives+ fallback data cached in background.", timeout_ms=4500)
         else:
             # Keep this informational (non-fatal); cached/bundled data is still usable.
-            set_app_status("Objectives+ background refresh failed; cached data will be used.", timeout_ms=5000)
+            set_app_status("Objectives+ background refresh failed; fallback data will be used.", timeout_ms=5000)
 
-    threading.Thread(target=_worker, daemon=True).start()
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        _set_objectives_prefetch_state(
+            inflight=False,
+            completed=True,
+            built=False,
+            error="worker start failed",
+            last_completed_ts=float(time.time()),
+            source="",
+        )
+        if startup_managed:
+            _record_background_objectives_prefetch_result(False, attempt_ts=attempt_ts)
+        raise
     return True
 
 
@@ -6882,18 +8288,14 @@ def log(msg: str) -> None:
             print(msg)
         except Exception:
             pass
-def default_parquet_path() -> str:
-    try:
-        base = get_editor_data_dir()
-    except Exception:
-        base = os.path.dirname(resource_path(""))
-    return os.path.join(base, "maprunner_data.parquet")
 def extract_json_block_by_key(s: str, key: str):
     m = re.search(rf'"{re.escape(key)}"\s*:\s*{{', s)
     if not m:
         raise ValueError("Key not found")
     return extract_brace_block(s, m.end() - 1)
 def _read_finished_contests(path: str) -> Set[str]:
+    # Historical helper name. In practice this reads raw finished IDs from
+    # finishedObjs, which the game uses for contracts and some contest metadata.
     try:
         with open(path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -6920,6 +8322,56 @@ def _read_finished_contests(path: str) -> Set[str]:
     elif isinstance(finished, list):
         return set(finished)
     return set()
+
+
+def _read_recorded_contest_times(path: str) -> Set[str]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return set()
+
+    recorded = set()
+    for match in re.finditer(r'"contestTimes"\s*:\s*{', content):
+        try:
+            block, _, _ = extract_brace_block(content, match.end() - 1)
+            parsed = json.loads(block)
+        except Exception:
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        for key, value in parsed.items():
+            if isinstance(key, str) and key.strip() and value is not None:
+                recorded.add(key)
+    return recorded
+
+
+def _read_checked_objective_ids(path: str, objective_type_by_id: Optional[Dict[str, str]] = None) -> Set[str]:
+    checked = _read_finished_missions(path)
+    non_task_ids = _read_finished_contests(path)
+
+    if not non_task_ids:
+        return checked
+
+    if not objective_type_by_id:
+        checked |= non_task_ids
+        return checked
+
+    contest_ids = _read_recorded_contest_times(path)
+    for oid in non_task_ids:
+        kind = str(objective_type_by_id.get(str(oid), "") or "").strip().upper()
+        if kind == "CONTEST":
+            continue
+        checked.add(oid)
+
+    for oid in contest_ids:
+        kind = str(objective_type_by_id.get(str(oid), "") or "").strip().upper()
+        if kind == "CONTEST":
+            checked.add(oid)
+
+    return checked
+
+
 def _read_finished_missions(save_path: str) -> Set[str]:
     try:
         with open(save_path, "r", encoding="utf-8") as f:
@@ -6932,404 +8384,2673 @@ def _read_finished_missions(save_path: str) -> Set[str]:
         return {k for k, v in obj_states.items() if isinstance(v, dict) and v.get("isFinished")}
     except Exception:
         return set()
-#----------csv loader------------   
-class SimpleFrame:
-    """Tiny DataFrame-like adapter for a list-of-dicts (rows)."""
-    def __init__(self, rows: List[Dict[str, Any]]):
-        self._rows = rows
-        self.columns = list(rows[0].keys()) if rows else []
-        self.shape = (len(self._rows), len(self.columns))
-
-    def __len__(self):
-        return len(self._rows)
-
-    def iterrows(self) -> Iterator:
-        for i, r in enumerate(self._rows):
-            yield i, r
-
-    def to_dict(self, orient="records"):
-        if orient != "records":
-            raise ValueError("SimpleFrame only supports orient='records'")
-        return self._rows
-
-    # convenience: get column as list
-    def get_column(self, col: str) -> List[Any]:
-        return [r.get(col) for r in self._rows]
-
+#----------objectives data loader------------
 # =============================================================================
-# SECTION: Objectives+ CSV Builder (Maprunner)
-# Used In: Objectives+ loader (auto-refresh CSV when online)
+# SECTION: Objectives+ Source Helpers
+# Used In: current Objectives+ source loading and shared text/network helpers
 # =============================================================================
-_MR_URL = "https://www.maprunner.info/michigan/black-river?loc=_CL_1"
-_MR_TIMEOUT_SECONDS = 20
-_MR_CANONICAL_NAMES = {"data": "data.js", "desc": "desc.js"}
-_MR_IN_MEM_FILES: Dict[str, bytes] = {}
-_MR_IN_MEM_META: Dict[str, Dict[str, Any]] = {}
-_MR_CHUNK_MAX = 220
-_MR_ENGLISH_TARGET = 20000
-_MR_DATA_SIGNATURE = "const _=JSON.parse('[{\"name\":\"RU_02_01_SERVHUB_GAS\""
-_MR_DESC_SIGNATURE = "const t={UI_TRUCK_TYPE_HEAVY_DUTY:{t:0,b:{t:2,i:[{t:3}],s:\"HEAVY DUTY\""
-_MR_DEBUG = False
-_MR_SAFE_FALLBACK_URLS = [
-    "https://raw.githubusercontent.com/MrBoxik/SnowRunner-Save-Editor/main/app/objectives/CKSuO70b.js",
-    "https://raw.githubusercontent.com/MrBoxik/SnowRunner-Save-Editor/main/app/objectives/ChUX6nGL.js",
-]
-_MR_SAFE_FALLBACK_ERROR = ""
-
-# Language preference helpers (favor English when multiple locales exist)
-_MR_ENGLISH_WORDS = {
-    "the", "and", "to", "of", "in", "on", "for", "with", "from", "at", "by",
-    "you", "your", "we", "our", "deliver", "find", "task", "contract", "contest",
-    "lost", "trailer", "truck", "cargo", "repair", "bridge", "road", "house",
-    "watchtower", "explore", "exploration", "mission"
-}
-_MR_DIACRITICS = set("ąćęłńóśźżĄĆĘŁŃÓŚŹŻàáâäãåæçèéêëìíîïñòóôöõøùúûüýÿßčďěňřšťůž")
-_MR_ENGLISH_SAMPLE_MAX = 240
-# Avg English score threshold for localization files (higher = stricter)
-_MR_ENGLISH_AVG_MIN = 2.5
-# Minimum distinct English hits required in localization sample
-_MR_ENGLISH_HITS_MIN = 12
-# Allow near-top localization files within this score delta of the best
-_MR_ENGLISH_AVG_DELTA = 0.5
-# If we already have a strong English localization of this size, stop scanning more
-_MR_ENGLISH_MIN_ENTRIES = 12000
-# Max JS files to parse when auto-detecting localization language
-_MR_LOCALIZATION_CANDIDATE_MAX = 40
-# Tracks which localization files were selected (used to filter lazy lookups)
-_MR_LAST_LOCALIZATION_FILES: List[str] = []
-_MR_LAST_LOCALIZATION_BLOCKED = False
-# Minimum localization size required to proceed with CSV build.
-_MR_MIN_LOCALIZATION_ENTRIES = 2000
-# Heuristics to exclude non-English localization files
-_MR_FORBIDDEN_LANG_WORDS = {
-    "palivo", "verlassene", "naturelle", "opuszczone", "privacidad",
-    "perduto", "deslizamento",
-    # Common Polish stems/words seen in MapRunner objectives
-    "zatopion", "ciezarowk", "pojazd", "narzedz", "rolnicz", "zniw",
-    "odbudow", "zagubion", "garaz", "wieza", "cysterna", "przyczep",
-    "utkn", "zaginion", "blokada", "naprawa", "osuwisk", "osusz",
-    "wzgorz", "rozrywka", "swierk",
-}
-_MR_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
-_MR_NON_ASCII_RATIO_MAX = 0.03
-_MR_VALUE_ENGLISH_MIN_SCORE = 0.6
-
-# Objectives+ safe fallback mode (thread-safe, config-backed)
+# Objectives+ now always tries local initial.pak first and automatically falls back
+# when local data is unavailable, so the old safe-fallback toggle is disabled.
 _OBJECTIVES_SAFE_FALLBACK_MODE = False
 _OBJECTIVES_SAFE_FALLBACK_MODE_LOCK = threading.Lock()
-_OBJECTIVES_SAFE_FALLBACK_MODE_SET = False
+_OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
 
 def _set_objectives_safe_fallback_mode(enabled: bool) -> None:
-    global _OBJECTIVES_SAFE_FALLBACK_MODE, _OBJECTIVES_SAFE_FALLBACK_MODE_SET
-    try:
-        with _OBJECTIVES_SAFE_FALLBACK_MODE_LOCK:
-            _OBJECTIVES_SAFE_FALLBACK_MODE = bool(enabled)
-            _OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
-    except Exception:
-        _OBJECTIVES_SAFE_FALLBACK_MODE = bool(enabled)
-        _OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
+    return
 
 def _get_objectives_safe_fallback_mode() -> bool:
-    global _OBJECTIVES_SAFE_FALLBACK_MODE, _OBJECTIVES_SAFE_FALLBACK_MODE_SET
-    try:
-        with _OBJECTIVES_SAFE_FALLBACK_MODE_LOCK:
-            if not _OBJECTIVES_SAFE_FALLBACK_MODE_SET:
-                try:
-                    cfg = load_config() or {}
-                    val = cfg.get("objectives_use_safe_fallback", None)
-                    if val is None:
-                        # Backward compatibility with older backup setting
-                        val = cfg.get("objectives_use_backup", False)
-                    _OBJECTIVES_SAFE_FALLBACK_MODE = bool(val)
-                except Exception:
-                    _OBJECTIVES_SAFE_FALLBACK_MODE = False
-                _OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
-            return bool(_OBJECTIVES_SAFE_FALLBACK_MODE)
-    except Exception:
-        return bool(_OBJECTIVES_SAFE_FALLBACK_MODE)
-
-# Language detection helpers (best-effort / heuristic)
-_MR_LANG_DIACRITICS = {
-    "Polish": set("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ"),
-    "Czech/Slovak": set("áčďéěíňóřšťúůýžÁČĎÉĚÍŇÓŘŠŤÚŮÝŽ"),
-    "German": set("äöüßÄÖÜ"),
-    "French": set("àâäçéèêëîïôöùûüÿœæÀÂÄÇÉÈÊËÎÏÔÖÙÛÜŸŒÆ"),
-    "Spanish": set("áéíñóúüÁÉÍÑÓÚÜ"),
-    "Portuguese": set("áàâãçéêíóôõúüÁÀÂÃÇÉÊÍÓÔÕÚÜ"),
-    "Italian": set("àèéìíîòóùúÀÈÉÌÍÎÒÓÙÚ"),
-    "Turkish": set("çğıöşüÇĞİÖŞÜ"),
-    "Romanian": set("ăâîșşțţĂÂÎȘŞȚŢ"),
-}
-_MR_LANG_STOPWORDS = {
-    "English": ["the", "and", "of", "to", "in", "for", "with", "from", "on"],
-    "Polish": ["i", "oraz", "na", "do", "z", "w", "jest", "nie", "się"],
-    "Czech/Slovak": ["a", "na", "je", "se", "pro", "kter", "nen", "neni"],
-    "German": ["und", "der", "die", "das", "nicht", "mit", "für", "von", "auf", "zu"],
-    "French": ["et", "le", "la", "les", "des", "de", "pour", "avec", "dans"],
-    "Spanish": ["el", "la", "los", "las", "de", "que", "y", "para", "con", "en"],
-    "Portuguese": ["de", "e", "que", "para", "com", "em", "nao", "uma", "um"],
-    "Italian": ["il", "la", "e", "che", "per", "con", "del", "della"],
-    "Turkish": ["ve", "bir", "ile", "icin", "de", "da", "bu"],
-    "Romanian": ["si", "in", "de", "la", "cu", "pentru", "este"],
-    "Russian": ["и", "в", "на", "что", "с", "для", "по", "из"],
-}
-
-def _mr_guess_language_from_values(values: List[str], english_avg: Optional[float] = None) -> str:
-    try:
-        if english_avg is not None and english_avg >= _MR_ENGLISH_AVG_MIN:
-            return "English"
-    except Exception:
-        pass
-    if not values:
-        return "Unknown"
-    sample = " ".join(values[:120])
-    if not sample:
-        return "Unknown"
-    # Script detection
-    try:
-        if re.search(r"[\u0400-\u04FF]", sample):
-            return "Russian"
-        if re.search(r"[\u4E00-\u9FFF]", sample):
-            return "Chinese"
-        if re.search(r"[\u3040-\u30FF]", sample):
-            return "Japanese"
-        if re.search(r"[\uAC00-\uD7AF]", sample):
-            return "Korean"
-    except Exception:
-        pass
-
-    scores: Dict[str, float] = {}
-    for lang, chars in _MR_LANG_DIACRITICS.items():
-        try:
-            count = sum(sample.count(ch) for ch in chars)
-        except Exception:
-            count = 0
-        if count:
-            scores[lang] = scores.get(lang, 0.0) + float(count) * 2.0
-
-    lower = sample.lower()
-    # normalize to spaces
-    try:
-        lower_norm = re.sub(r"[^a-z\u00c0-\u017f\u0400-\u04ff]+", " ", lower)
-    except Exception:
-        lower_norm = lower
-    lower_norm = f" {lower_norm} "
-    for lang, words in _MR_LANG_STOPWORDS.items():
-        for w in words:
-            try:
-                if f" {w} " in lower_norm:
-                    scores[lang] = scores.get(lang, 0.0) + 1.0
-            except Exception:
-                continue
-
-    if scores:
-        best_lang = max(scores, key=scores.get)
-        if scores.get(best_lang, 0.0) >= 3.0:
-            return best_lang
-
-    try:
-        if english_avg is not None and english_avg >= 1.0:
-            return "Mixed"
-    except Exception:
-        pass
-    return "Unknown"
-
-def _mr_text_english_score(s: Any) -> float:
-    try:
-        if s is None:
-            return -999.0
-        if not isinstance(s, str):
-            s = str(s)
-    except Exception:
-        return -999.0
-    if not s:
-        return -999.0
-    score = 0.0
-    # Penalize typical mojibake markers
-    bad_markers = ("Ã", "Â", "�")
-    for bm in bad_markers:
-        if bm in s:
-            score -= 4.0 * s.count(bm)
-    # Prefer mostly-ASCII letters (English tends to be ASCII)
-    letters = sum(ch.isalpha() for ch in s)
-    ascii_letters = sum((ch.isascii() and ch.isalpha()) for ch in s)
-    if letters:
-        score += (ascii_letters / letters) * 4.0
-    # Penalize diacritics commonly used in non-English locales
-    diac = sum(1 for ch in s if ch in _MR_DIACRITICS)
-    score -= diac * 0.4
-    # Common English word boosts
-    lower = s.lower()
-    for w in _MR_ENGLISH_WORDS:
-        if w in lower:
-            score += 0.6
-    # Hard penalties for known non-English markers
-    for w in _MR_FORBIDDEN_LANG_WORDS:
-        if w in lower:
-            score -= 6.0
-    if _MR_CYRILLIC_RE.search(s):
-        score -= 8.0
-    # Penalize ID-like strings
-    if re.fullmatch(r"[A-Z0-9_]+", s):
-        score -= 2.0
-    return score
-
-def _mr_sample_values(values: List[str], max_samples: int = _MR_ENGLISH_SAMPLE_MAX) -> List[str]:
-    if not values:
-        return []
-    n = len(values)
-    if n <= max_samples:
-        return values
-    step = max(1, n // max_samples)
-    out: List[str] = []
-    for i in range(0, n, step):
-        out.append(values[i])
-        if len(out) >= max_samples:
-            break
-    return out
-
-def _mr_localization_avg_score(loc: Dict[str, str]) -> float:
-    if not loc:
-        return -999.0
-    try:
-        values = list(loc.values())
-    except Exception:
-        return -999.0
-    sample = _mr_sample_values(values, _MR_ENGLISH_SAMPLE_MAX)
-    if not sample:
-        return -999.0
-    total = 0.0
-    for v in sample:
-        total += _mr_text_english_score(v)
-    return total / max(1, len(sample))
-
-def _mr_localization_sample_flags(values: List[str]) -> Dict[str, Any]:
-    if not values:
-        return {
-            "has_cyrillic": False,
-            "forbidden_hits": [],
-            "non_ascii_ratio": 0.0,
-            "non_ascii_heavy": False,
-            "english_hits": 0,
-        }
-
-    # Scan full list for forbidden words / cyrillic (early-exit when found).
-    has_cyrillic = False
-    forbidden_hits = set()
-    for v in values:
-        if not v:
-            continue
-        try:
-            s = v if isinstance(v, str) else str(v)
-        except Exception:
-            s = ""
-        if not s:
-            continue
-        if not has_cyrillic and _MR_CYRILLIC_RE.search(s):
-            has_cyrillic = True
-        if not forbidden_hits:
-            low = s.lower()
-            for w in _MR_FORBIDDEN_LANG_WORDS:
-                if w in low:
-                    forbidden_hits.add(w)
-                    break
-        if has_cyrillic or forbidden_hits:
-            break
-
-    # Use a bounded sample for non-ASCII ratio to keep cost low.
-    sample_vals = _mr_sample_values(values, _MR_ENGLISH_SAMPLE_MAX)
-    sample = " ".join(sample_vals or [])
-    letters = sum(1 for ch in sample if ch.isalpha())
-    non_ascii_letters = sum(1 for ch in sample if ch.isalpha() and not ch.isascii())
-    non_ascii_ratio = (non_ascii_letters / letters) if letters else 0.0
-    non_ascii_heavy = bool(letters >= 80 and non_ascii_ratio > _MR_NON_ASCII_RATIO_MAX)
-    english_hits = 0
-    try:
-        lower = sample.lower()
-        lower_norm = re.sub(r"[^a-z0-9]+", " ", lower)
-        lower_norm = f" {lower_norm} "
-        for w in _MR_LANG_STOPWORDS.get("English", []):
-            if f" {w} " in lower_norm:
-                english_hits += 1
-        for w in _MR_ENGLISH_WORDS:
-            if f" {w} " in lower_norm:
-                english_hits += 1
-    except Exception:
-        english_hits = 0
-    return {
-        "has_cyrillic": has_cyrillic,
-        "forbidden_hits": sorted(list(forbidden_hits)),
-        "non_ascii_ratio": non_ascii_ratio,
-        "non_ascii_heavy": non_ascii_heavy,
-        "english_hits": english_hits,
-    }
-
-def _mr_strings_look_non_english(values: List[str]) -> bool:
-    if not values:
-        return False
-    try:
-        sample_vals = _mr_sample_values(values, 200)
-    except Exception:
-        sample_vals = values[:200]
-    flags = _mr_localization_sample_flags(sample_vals)
-    if flags.get("has_cyrillic") or flags.get("forbidden_hits"):
-        return True
-    if flags.get("non_ascii_heavy"):
-        return True
     return False
 
-def _mr_localization_looks_english(avg: float, flags: Optional[Dict[str, Any]] = None) -> bool:
+def _set_objectives_source_info(**updates):
     try:
-        if avg < _MR_ENGLISH_AVG_MIN:
-            return False
+        with _OBJECTIVES_SOURCE_INFO_LOCK:
+            _OBJECTIVES_SOURCE_INFO.update(updates)
     except Exception:
-        return False
-    if flags:
-        if flags.get("has_cyrillic") or flags.get("forbidden_hits") or flags.get("non_ascii_heavy"):
-            return False
-        if flags.get("english_hits", 0) < _MR_ENGLISH_HITS_MIN:
-            return False
-    return True
+        _OBJECTIVES_SOURCE_INFO.update(updates)
 
-def _mr_desc_bytes_look_english(bs: Optional[bytes]) -> bool:
-    try:
-        txt = _mr_decode_bytes_to_text(bs) or ""
-    except Exception:
-        txt = ""
-    if not txt:
-        return False
-    parsed = _mr_parse_localization_from_desc_text(txt)
-    if not parsed or len(parsed) < _MR_MIN_LOCALIZATION_ENTRIES:
-        return False
-    avg = _mr_localization_avg_score(parsed)
-    try:
-        sample_vals = _mr_sample_values(list(parsed.values()), _MR_ENGLISH_SAMPLE_MAX)
-    except Exception:
-        sample_vals = []
-    flags = _mr_localization_sample_flags(sample_vals)
-    return _mr_localization_looks_english(avg, flags)
 
-def _mr_value_allowed(val: Any) -> bool:
-    if val is None:
-        return False
+def _get_objectives_source_info() -> Dict[str, Any]:
     try:
-        s = val if isinstance(val, str) else str(val)
+        with _OBJECTIVES_SOURCE_INFO_LOCK:
+            return dict(_OBJECTIVES_SOURCE_INFO)
     except Exception:
-        return False
-    if not s:
-        return False
-    low = s.lower()
-    for w in _MR_FORBIDDEN_LANG_WORDS:
-        if w in low:
+        return dict(_OBJECTIVES_SOURCE_INFO)
+
+
+def _bump_objectives_source_generation() -> int:
+    global _OBJECTIVES_SOURCE_GENERATION
+    try:
+        with _OBJECTIVES_SOURCE_INFO_LOCK:
+            _OBJECTIVES_SOURCE_GENERATION = int(_OBJECTIVES_SOURCE_GENERATION or 0) + 1
+            return _OBJECTIVES_SOURCE_GENERATION
+    except Exception:
+        _OBJECTIVES_SOURCE_GENERATION = int(_OBJECTIVES_SOURCE_GENERATION or 0) + 1
+        return _OBJECTIVES_SOURCE_GENERATION
+
+
+def _get_objectives_source_generation() -> int:
+    try:
+        with _OBJECTIVES_SOURCE_INFO_LOCK:
+            return int(_OBJECTIVES_SOURCE_GENERATION or 0)
+    except Exception:
+        try:
+            return int(_OBJECTIVES_SOURCE_GENERATION or 0)
+        except Exception:
+            return 0
+
+
+_OBJECTIVES_LOCAL_CACHE_VERSION = 1
+_OBJECTIVES_LOCAL_DEFAULT_LANGUAGE = "english"
+_OBJECTIVES_LOCAL_PAK_RELATIVE = os.path.join("preload", "paks", "client", "initial.pak")
+_OBJECTIVES_LOCAL_STRINGS_PREFIX = "[strings]/strings_"
+_OBJECTIVES_LOCAL_STRINGS_SUFFIX = ".str"
+_OBJECTIVES_LOCAL_KIND_TO_SOURCE = {
+    "TASK": "TASKS",
+    "CONTRACT": "CONTRACTS",
+    "CONTEST": "CONTESTS",
+}
+_OBJECTIVES_LOCAL_LANGUAGE_LABELS = {
+    "english": "English",
+    "czech": "Czech",
+    "german": "German",
+    "french": "French",
+    "italian": "Italian",
+    "japanese": "Japanese",
+    "korean": "Korean",
+    "polish": "Polish",
+    "russian": "Russian",
+    "spanish": "Spanish",
+    "brazilian_portuguese": "Brazilian Portuguese",
+    "chinese_simplified": "Chinese Simplified",
+    "chinese_traditional": "Chinese Traditional",
+}
+_OBJECTIVES_LOCAL_LOCK = threading.Lock()
+_OBJECTIVES_LOCAL_DEFS_MEM_CACHE: Dict[str, Dict[str, Any]] = {}
+_OBJECTIVES_LOCAL_ROWS_MEM_CACHE: Dict[str, List[Dict[str, Any]]] = {}
+_OBJECTIVES_LOCAL_STRINGS_MEM_CACHE: Dict[str, Dict[str, str]] = {}
+_OBJECTIVES_LOCAL_LANGS_MEM_CACHE: Dict[str, List[str]] = {}
+_OBJECTIVES_LOCAL_CACHE_CLEANED = False
+_OBJECTIVES_ACTIVE_VIEW_REF = None
+
+
+def _objectives_normalize_language_code(value: Any) -> str:
+    code = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return code or _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE
+
+
+def _objectives_language_label(code: Any) -> str:
+    lang = _objectives_normalize_language_code(code)
+    label = _OBJECTIVES_LOCAL_LANGUAGE_LABELS.get(lang)
+    if label:
+        return label
+    return " ".join(part.capitalize() for part in lang.split("_") if part)
+
+
+def _objectives_get_language_preference() -> str:
+    try:
+        cfg = _load_config_safe()
+    except Exception:
+        cfg = {}
+    return _objectives_normalize_language_code(cfg.get("objectives_language", _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE))
+
+
+def _objectives_set_language_preference(code: Any) -> str:
+    lang = _objectives_normalize_language_code(code)
+    _update_config_values({"objectives_language": lang})
+    return lang
+
+
+def _objectives_get_pak_override_path() -> str:
+    try:
+        cfg = _load_config_safe()
+    except Exception:
+        cfg = {}
+    raw = str(cfg.get("objectives_initial_pak_path", "") or "").strip()
+    if not raw:
+        return ""
+    try:
+        return os.path.abspath(os.path.expanduser(raw))
+    except Exception:
+        return raw
+
+
+def _objectives_set_pak_override_path(path: str) -> str:
+    clean = str(path or "").strip()
+    if clean:
+        try:
+            clean = os.path.abspath(os.path.expanduser(clean))
+        except Exception:
+            pass
+        _update_config_values({"objectives_initial_pak_path": clean})
+    else:
+        _delete_config_keys(["objectives_initial_pak_path"])
+        clean = ""
+    return clean
+
+
+def _objectives_missing_pak_message(use_fallback: bool = False) -> str:
+    return (
+        "No initial.pak found. Click initial.pak and find it in game files.\n"
+        "initial.pak can be found in SnowRunner\\preload\\paks\\client"
+    )
+
+
+def _objectives_existing_file(path: Any) -> str:
+    clean = str(path or "").strip()
+    if not clean:
+        return ""
+    try:
+        clean = os.path.abspath(os.path.expanduser(clean))
+    except Exception:
+        pass
+    return clean if os.path.isfile(clean) else ""
+
+
+def _objectives_iter_subdirs(parent: str) -> Iterator[str]:
+    try:
+        for name in os.listdir(parent):
+            full = os.path.join(parent, name)
+            if os.path.isdir(full):
+                yield full
+    except Exception:
+        return
+
+
+def _objectives_iter_windows_drive_roots() -> Iterator[str]:
+    if platform.system() != "Windows":
+        return
+    seen = set()
+    try:
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:
+        mask = 0
+    if mask:
+        for idx in range(26):
+            if not (mask & (1 << idx)):
+                continue
+            root = f"{chr(ord('A') + idx)}:\\"
+            if os.path.isdir(root) and root not in seen:
+                seen.add(root)
+                yield root
+        return
+    for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+        root = f"{letter}:\\"
+        if os.path.isdir(root) and root not in seen:
+            seen.add(root)
+            yield root
+
+
+def _objectives_candidate_pak_paths_from_root(root: Any) -> List[str]:
+    base = str(root or "").strip()
+    if not base:
+        return []
+    try:
+        base = os.path.abspath(os.path.expanduser(base))
+    except Exception:
+        pass
+    candidates = [
+        os.path.join(base, _OBJECTIVES_LOCAL_PAK_RELATIVE),
+        os.path.join(base, "SnowRunner", _OBJECTIVES_LOCAL_PAK_RELATIVE),
+        os.path.join(base, "common", "SnowRunner", _OBJECTIVES_LOCAL_PAK_RELATIVE),
+        os.path.join(base, "steamapps", "common", "SnowRunner", _OBJECTIVES_LOCAL_PAK_RELATIVE),
+        os.path.join(base, "SteamLibrary", "steamapps", "common", "SnowRunner", _OBJECTIVES_LOCAL_PAK_RELATIVE),
+        os.path.join(base, "Epic Games", "SnowRunner", _OBJECTIVES_LOCAL_PAK_RELATIVE),
+        os.path.join(base, "Games", "SnowRunner", _OBJECTIVES_LOCAL_PAK_RELATIVE),
+    ]
+    out = []
+    seen = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+def _objectives_parse_steam_libraryfolders(text: str) -> List[str]:
+    paths = []
+    seen = set()
+    for pattern in (
+        r'"path"\s*"([^"]+)"',
+        r'"path"\s*{\s*"([^"]+)"',
+        r'"\d+"\s*{\s*"path"\s*"([^"]+)"',
+        r'"\d+"\s*"([^"]+)"',
+    ):
+        for match in re.finditer(pattern, text or "", flags=re.IGNORECASE):
+            raw = str(match.group(1) or "").replace("\\\\", "\\").strip()
+            if not raw or raw in seen:
+                continue
+            seen.add(raw)
+            paths.append(raw)
+    return paths
+
+
+def _objectives_iter_steam_roots() -> Iterator[str]:
+    system = platform.system()
+    home = os.path.expanduser("~")
+    steamapps_dirs = []
+    if system == "Windows":
+        pf86 = os.environ.get("PROGRAMFILES(X86)") or os.environ.get("PROGRAMFILES") or ""
+        local_app = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+        for root in (
+            os.path.join(pf86, "Steam", "steamapps") if pf86 else "",
+            os.path.join(local_app, "Steam", "steamapps"),
+            os.path.join("C:\\", "Program Files (x86)", "Steam", "steamapps"),
+            os.path.join("D:\\", "Program Files (x86)", "Steam", "steamapps"),
+        ):
+            if root:
+                steamapps_dirs.append(root)
+    elif system == "Darwin":
+        steamapps_dirs.extend(
+            [
+                os.path.join(home, "Library", "Application Support", "Steam", "steamapps"),
+                os.path.join("/Applications", "Steam.app", "Contents", "MacOS", "steamapps"),
+            ]
+        )
+    else:
+        steamapps_dirs.extend(
+            [
+                os.path.join(home, ".local", "share", "Steam", "steamapps"),
+                os.path.join(home, ".steam", "steam", "steamapps"),
+                os.path.join(home, ".steam", "root", "steamapps"),
+                os.path.join(home, ".var", "app", "com.valvesoftware.Steam", "data", "Steam", "steamapps"),
+            ]
+        )
+
+    seen = set()
+    for steamapps in steamapps_dirs:
+        if not steamapps:
+            continue
+        try:
+            steamapps = os.path.abspath(os.path.expanduser(steamapps))
+        except Exception:
+            pass
+        if os.path.isdir(steamapps) and steamapps not in seen:
+            seen.add(steamapps)
+            yield steamapps
+        library_vdf = os.path.join(steamapps, "libraryfolders.vdf")
+        if not os.path.isfile(library_vdf):
+            continue
+        try:
+            with open(library_vdf, "r", encoding="utf-8", errors="ignore") as fh:
+                parsed = _objectives_parse_steam_libraryfolders(fh.read())
+        except Exception:
+            parsed = []
+        for library_root in parsed:
+            for root in (library_root, os.path.join(library_root, "steamapps")):
+                try:
+                    root = os.path.abspath(os.path.expanduser(root))
+                except Exception:
+                    pass
+                if os.path.isdir(root) and root not in seen:
+                    seen.add(root)
+                    yield root
+
+
+def _objectives_iter_manifest_dirs() -> Iterator[str]:
+    system = platform.system()
+    home = os.path.expanduser("~")
+    program_data = os.environ.get("PROGRAMDATA") or os.path.join("C:\\", "ProgramData")
+    candidates = []
+    if system == "Windows":
+        candidates.extend(
+            [
+                os.path.join(program_data, "Epic", "EpicGamesLauncher", "Data", "Manifests"),
+                os.path.join(home, "AppData", "Local", "EpicGamesLauncher", "Saved", "Manifests"),
+            ]
+        )
+    elif system == "Darwin":
+        candidates.extend(
+            [
+                os.path.join(home, "Library", "Application Support", "Epic", "EpicGamesLauncher", "Data", "Manifests"),
+                os.path.join(home, "Library", "Application Support", "Heroic", "legendaryConfig", "legendary"),
+                os.path.join(home, "Library", "Application Support", "legendary"),
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                os.path.join(home, ".config", "heroic", "legendaryConfig", "legendary"),
+                os.path.join(home, ".var", "app", "com.heroicgameslauncher.hgl", "config", "heroic", "legendaryConfig", "legendary"),
+                os.path.join(home, ".config", "legendary"),
+            ]
+        )
+    seen = set()
+    for path in candidates:
+        try:
+            path = os.path.abspath(os.path.expanduser(path))
+        except Exception:
+            pass
+        if os.path.isdir(path) and path not in seen:
+            seen.add(path)
+            yield path
+
+
+def _objectives_collect_manifest_install_roots(node: Any, results: List[str]) -> None:
+    if isinstance(node, dict):
+        install_keys = (
+            "InstallLocation",
+            "installLocation",
+            "install_location",
+            "install_path",
+            "installPath",
+            "path",
+            "app_path",
+        )
+        title_bits = " ".join(
+            str(node.get(key) or "")
+            for key in ("DisplayName", "displayName", "title", "app_name", "AppName", "FolderName")
+        ).lower()
+        if ("snowrunner" in title_bits) or ("1465360" in title_bits):
+            for key in install_keys:
+                raw = str(node.get(key) or "").strip()
+                if raw:
+                    results.append(raw)
+        for key in install_keys:
+            raw = str(node.get(key) or "").strip()
+            if raw and "snowrunner" in raw.lower():
+                results.append(raw)
+        for value in node.values():
+            _objectives_collect_manifest_install_roots(value, results)
+    elif isinstance(node, list):
+        for value in node:
+            _objectives_collect_manifest_install_roots(value, results)
+
+
+def _objectives_iter_manifest_install_roots() -> Iterator[str]:
+    seen = set()
+    for manifest_dir in _objectives_iter_manifest_dirs():
+        try:
+            names = os.listdir(manifest_dir)
+        except Exception:
+            continue
+        for name in names:
+            lower = name.lower()
+            if not lower.endswith((".item", ".json")):
+                continue
+            path = os.path.join(manifest_dir, name)
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                    doc = json.load(fh)
+            except Exception:
+                continue
+            roots = []
+            _objectives_collect_manifest_install_roots(doc, roots)
+            for root in roots:
+                try:
+                    root = os.path.abspath(os.path.expanduser(root))
+                except Exception:
+                    pass
+                if root and root not in seen:
+                    seen.add(root)
+                    yield root
+
+
+def _objectives_iter_generic_search_roots() -> Iterator[str]:
+    system = platform.system()
+    home = os.path.expanduser("~")
+    seeds = [os.getcwd(), home]
+    if system == "Windows":
+        for drive_root in _objectives_iter_windows_drive_roots() or []:
+            seeds.extend(
+                [
+                    drive_root,
+                    os.path.join(drive_root, "SteamLibrary"),
+                    os.path.join(drive_root, "Games"),
+                    os.path.join(drive_root, "Epic Games"),
+                    os.path.join(drive_root, "Program Files"),
+                    os.path.join(drive_root, "Program Files (x86)"),
+                ]
+            )
+    else:
+        seeds.extend([os.path.join(home, "Games"), os.path.join(home, "Applications"), "/Applications"])
+        for mount_root in ("/mnt", "/media", "/Volumes"):
+            if os.path.isdir(mount_root):
+                seeds.append(mount_root)
+                for child in _objectives_iter_subdirs(mount_root):
+                    seeds.append(child)
+
+    seen = set()
+    for root in seeds:
+        try:
+            root = os.path.abspath(os.path.expanduser(root))
+        except Exception:
+            pass
+        if root and os.path.isdir(root) and root not in seen:
+            seen.add(root)
+            yield root
+
+
+def _objectives_detect_initial_pak() -> Dict[str, str]:
+    saved_path = _objectives_get_pak_override_path()
+    override = _objectives_existing_file(saved_path)
+    if override:
+        return {"path": override, "source": "config"}
+    if saved_path:
+        try:
+            _objectives_set_pak_override_path("")
+        except Exception:
+            pass
+
+    env_path = _objectives_existing_file(os.environ.get("SNOWRUNNER_INITIAL_PAK", ""))
+    if env_path:
+        return {"path": env_path, "source": "env"}
+
+    for label, roots in (
+        ("steam", _objectives_iter_steam_roots()),
+        ("manifest", _objectives_iter_manifest_install_roots()),
+        ("scan", _objectives_iter_generic_search_roots()),
+    ):
+        for root in roots:
+            for candidate in _objectives_candidate_pak_paths_from_root(root):
+                resolved = _objectives_existing_file(candidate)
+                if resolved:
+                    try:
+                        _objectives_set_pak_override_path(resolved)
+                    except Exception:
+                        pass
+                    return {"path": resolved, "source": label}
+
+    return {"path": "", "source": ""}
+
+
+def _objectives_local_cache_dir() -> str:
+    try:
+        base = get_editor_data_dir()
+    except Exception:
+        base = os.getcwd()
+    path = os.path.join(base, "objectives_local_cache")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def _objectives_local_cleanup_persistent_cache_once() -> None:
+    global _OBJECTIVES_LOCAL_CACHE_CLEANED
+    if _OBJECTIVES_LOCAL_CACHE_CLEANED:
+        return
+    cache_dir = _objectives_local_cache_dir()
+    try:
+        for name in os.listdir(cache_dir):
+            if not re.fullmatch(r"objectives_local_defs_v\d+_.+\.json", str(name or "")):
+                continue
+            path = os.path.join(cache_dir, name)
+            if os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    _OBJECTIVES_LOCAL_CACHE_CLEANED = True
+
+
+def _objectives_local_pak_signature(pak_path: str) -> str:
+    try:
+        st = os.stat(pak_path)
+        sig = f"{int(st.st_size)}_{int(st.st_mtime_ns)}"
+    except Exception:
+        sig = hashlib.sha1(str(pak_path or "").encode("utf-8", errors="replace")).hexdigest()
+    return sig
+
+
+def _objectives_local_defs_cache_path(signature: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(signature or "unknown"))
+    return os.path.join(_objectives_local_cache_dir(), f"objectives_local_defs_v{_OBJECTIVES_LOCAL_CACHE_VERSION}_{safe}.json")
+
+
+def _objectives_local_cache_key(signature: str, language: str) -> str:
+    return f"{signature}::{_objectives_normalize_language_code(language)}"
+
+
+def _objectives_local_list_languages(pak_path: str) -> List[str]:
+    pak = _objectives_existing_file(pak_path)
+    if not pak:
+        return []
+    signature = _objectives_local_pak_signature(pak)
+    try:
+        with _OBJECTIVES_LOCAL_LOCK:
+            cached = _OBJECTIVES_LOCAL_LANGS_MEM_CACHE.get(signature)
+        if isinstance(cached, list) and cached:
+            return list(cached)
+    except Exception:
+        pass
+
+    langs = []
+    seen = set()
+    try:
+        with zipfile.ZipFile(pak, "r") as zf:
+            for name in zf.namelist():
+                if not name.startswith(_OBJECTIVES_LOCAL_STRINGS_PREFIX) or not name.endswith(_OBJECTIVES_LOCAL_STRINGS_SUFFIX):
+                    continue
+                code = name[len(_OBJECTIVES_LOCAL_STRINGS_PREFIX):-len(_OBJECTIVES_LOCAL_STRINGS_SUFFIX)]
+                code = _objectives_normalize_language_code(code)
+                if code and code not in seen:
+                    seen.add(code)
+                    langs.append(code)
+    except Exception:
+        langs = []
+
+    langs.sort(key=lambda item: (_objectives_language_label(item).lower(), item))
+    if _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE in langs:
+        langs = [_OBJECTIVES_LOCAL_DEFAULT_LANGUAGE] + [code for code in langs if code != _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE]
+    try:
+        with _OBJECTIVES_LOCAL_LOCK:
+            _OBJECTIVES_LOCAL_LANGS_MEM_CACHE[signature] = list(langs)
+    except Exception:
+        pass
+    return langs
+
+
+def _objectives_local_probe() -> Dict[str, Any]:
+    detected = _objectives_detect_initial_pak()
+    pak_path = detected.get("path", "")
+    langs = _objectives_local_list_languages(pak_path) if pak_path else []
+    preferred = _objectives_get_language_preference()
+    if preferred not in langs:
+        if _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE in langs:
+            preferred = _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE
+        elif langs:
+            preferred = langs[0]
+    return {
+        "path": pak_path,
+        "source": detected.get("source", ""),
+        "available_languages": langs,
+        "language": preferred or _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE,
+    }
+
+
+class _ObjectivesLocalSsoParser:
+    __slots__ = ("text", "length", "index")
+
+    def __init__(self, text: str):
+        self.text = text or ""
+        self.length = len(self.text)
+        self.index = 0
+
+    def _skip(self) -> None:
+        text = self.text
+        i = self.index
+        n = self.length
+        while i < n and text[i] in " \t\r\n,":
+            i += 1
+        self.index = i
+
+    def parse(self):
+        self._skip()
+        return self._parse_value()
+
+    def _parse_value(self):
+        self._skip()
+        if self.index >= self.length:
+            return None
+        ch = self.text[self.index]
+        if ch == "{":
+            return self._parse_object()
+        if ch == "[":
+            return self._parse_array()
+        if ch == '"':
+            return self._parse_string()
+        if ch in "-0123456789":
+            return self._parse_number()
+        return self._parse_identifier(raw=False)
+
+    def _parse_object(self):
+        result = {}
+        self.index += 1
+        while True:
+            self._skip()
+            if self.index >= self.length:
+                break
+            if self.text[self.index] == "}":
+                self.index += 1
+                break
+            key = self._parse_string() if self.text[self.index] == '"' else self._parse_identifier(raw=True)
+            self._skip()
+            if self.index < self.length and self.text[self.index] == "=":
+                self.index += 1
+            value = self._parse_value()
+            if key in result:
+                existing = result[key]
+                if isinstance(existing, list):
+                    existing.append(value)
+                else:
+                    result[key] = [existing, value]
+            else:
+                result[key] = value
+            self._skip()
+        return result
+
+    def _parse_array(self):
+        result = []
+        self.index += 1
+        while True:
+            self._skip()
+            if self.index >= self.length:
+                break
+            if self.text[self.index] == "]":
+                self.index += 1
+                break
+            result.append(self._parse_value())
+            self._skip()
+        return result
+
+    def _parse_string(self) -> str:
+        text = self.text
+        i = self.index + 1
+        out = []
+        while i < self.length:
+            ch = text[i]
+            if ch == "\\" and (i + 1) < self.length:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                self.index = i + 1
+                return "".join(out)
+            out.append(ch)
+            i += 1
+        self.index = i
+        return "".join(out)
+
+    def _parse_number(self):
+        text = self.text
+        i = self.index
+        while i < self.length and text[i] in "-+0123456789.eE":
+            i += 1
+        raw = text[self.index:i]
+        self.index = i
+        try:
+            if any(ch in raw for ch in ".eE"):
+                return float(raw)
+            return int(raw)
+        except Exception:
+            return raw
+
+    def _parse_identifier(self, raw: bool):
+        text = self.text
+        i = self.index
+        while i < self.length and text[i] not in " \t\r\n=,{}[]":
+            i += 1
+        token = text[self.index:i]
+        self.index = i
+        if raw:
+            return token
+        low = token.lower()
+        if low == "true":
+            return True
+        if low == "false":
             return False
-    if _MR_CYRILLIC_RE.search(s):
-        return False
-    return True
+        if low in {"null", "none", "nil"}:
+            return None
+        return token
 
-def _mr_normalize_mojibake_text(value: Any) -> str:
-    """
-    Normalize common mojibake/escaped text artifacts from remote MapRunner sources.
-    """
+
+def _objectives_local_clean_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\ufeff", "")
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _objectives_local_is_probably_token(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return False
+    if re.fullmatch(r"[A-Z]{2}_\d{2}_\d{2}_[A-Za-z0-9_]+", text):
+        return True
+    if text.startswith(("UI_", "EXP_", "TUTORIAL_", "TRIAL_")):
+        return True
+    return ("_" in text) and bool(re.fullmatch(r"[A-Z0-9_]+", text))
+
+
+def _objectives_local_humanize_identifier(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("Cargo") and len(text) > 5:
+        text = text[5:]
+    text = text.replace("_", " ")
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
+    text = re.sub(r"([A-Za-z])(\d)", r"\1 \2", text)
+    text = re.sub(r"(\d)([A-Za-z])", r"\1 \2", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or str(value or "")
+
+
+def _objectives_local_translate(token: Any, localization: Dict[str, str]) -> str:
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    if not isinstance(localization, dict) or not localization:
+        return raw
+    candidates = [raw]
+    if raw.startswith("EXP_"):
+        candidates.append(raw[4:])
+    else:
+        candidates.append("EXP_" + raw)
+    expanded = []
+    seen = set()
+    for candidate in candidates:
+        for variant in (candidate, candidate.lower(), candidate.upper()):
+            if variant and variant not in seen:
+                seen.add(variant)
+                expanded.append(variant)
+    for candidate in expanded:
+        val = localization.get(candidate)
+        if val:
+            return str(val)
+    return raw
+
+
+def _objectives_local_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def _objectives_local_infer_kind(key: str, raw_type: Any = None, allow_key: bool = True) -> str:
+    raw_lower = str(raw_type or "").strip().lower()
+    if re.search(r"tsk\d*$", raw_lower):
+        return "TASK"
+    if ("contest" in raw_lower) or re.search(r"(cnt|cst)\d*$", raw_lower):
+        return "CONTEST"
+    if re.search(r"con\d*$", raw_lower):
+        return "CONTRACT"
+    if allow_key:
+        key_upper = str(key or "").strip().upper()
+        if key_upper.endswith("_TSK"):
+            return "TASK"
+        if key_upper.endswith(("_CNT", "_CST")):
+            return "CONTEST"
+        if key_upper.endswith("_CON"):
+            return "CONTRACT"
+        if key_upper.endswith("_OBJ"):
+            return "CONTRACT"
+    return ""
+
+
+def _objectives_local_split_global_zone(raw: Any) -> Dict[str, str]:
+    text = str(raw or "").strip()
+    if "||" in text:
+        level_name, zone_name = [part.strip() for part in text.split("||", 1)]
+        return {"map": level_name, "zone": zone_name}
+    return {"map": "", "zone": text}
+
+
+def _objectives_local_extract_rewards(entry: Dict[str, Any]) -> Dict[str, Optional[int]]:
+    rewards = entry.get("rewards")
+    xp = money = None
+    if isinstance(rewards, dict):
+        exp_info = rewards.get("ObjectiveRewardExperience")
+        if isinstance(exp_info, dict):
+            xp = _objectives_local_int(exp_info.get("amount"))
+        money_info = rewards.get("ObjectiveRewardMoney")
+        if isinstance(money_info, dict):
+            money = _objectives_local_int(money_info.get("amount"))
+        contest_info = rewards.get("ContestRewards")
+        if isinstance(contest_info, dict):
+            time_settings = contest_info.get("timeSettings")
+            if isinstance(time_settings, dict):
+                for medal in ("GOLD", "SILVER", "BRONZE"):
+                    medal_info = time_settings.get(medal)
+                    if not isinstance(medal_info, dict):
+                        continue
+                    if xp is None:
+                        xp = _objectives_local_int(medal_info.get("xp"))
+                    if money is None:
+                        money = _objectives_local_int(medal_info.get("money"))
+                    if xp is not None or money is not None:
+                        break
+    return {"experience": xp, "money": money}
+
+
+def _objectives_local_normalize_stage(stage: Any) -> Dict[str, Any]:
+    result = {"cargo": [], "truck_delivery": [], "visit_zones": []}
+    if not isinstance(stage, dict):
+        return result
+
+    actions = stage.get("actions")
+    if isinstance(actions, dict):
+        for item in actions.get("zoneToFill") or []:
+            if not isinstance(item, dict):
+                continue
+            cargo = item.get("cargo")
+            zone_info = item.get("globalZoneId")
+            if not isinstance(cargo, dict) or not isinstance(zone_info, dict):
+                continue
+            zone = _objectives_local_split_global_zone(zone_info.get("globalZoneId"))
+            cargo_type = str(cargo.get("name") or "").strip()
+            if not cargo_type:
+                continue
+            result["cargo"].append(
+                {
+                    "type": cargo_type,
+                    "count": max(1, _objectives_local_int(cargo.get("count"), 1) or 1),
+                    "map": zone.get("map", ""),
+                    "zone": zone.get("zone", ""),
+                }
+            )
+
+    for item in stage.get("truckDelivery") or []:
+        if not isinstance(item, dict):
+            continue
+        zone_info = item.get("globalZoneDeliveryId")
+        if not isinstance(zone_info, dict):
+            continue
+        zone = _objectives_local_split_global_zone(zone_info.get("globalZoneId"))
+        result["truck_delivery"].append(
+            {
+                "truckId": str(item.get("truckId") or "").strip(),
+                "map": zone.get("map", ""),
+                "zone": zone.get("zone", ""),
+            }
+        )
+
+    visit = stage.get("visitAllZones")
+    if isinstance(visit, dict):
+        for item in visit.get("zones") or []:
+            if not isinstance(item, dict):
+                continue
+            zone_info = item.get("globalZoneId")
+            if not isinstance(zone_info, dict):
+                continue
+            zone = _objectives_local_split_global_zone(zone_info.get("globalZoneId"))
+            result["visit_zones"].append({"map": zone.get("map", ""), "zone": zone.get("zone", "")})
+
+    return result
+
+
+def _objectives_local_normalize_entry(
+    key: str,
+    raw_entry: Dict[str, Any],
+    kind_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    raw_type = str(raw_entry.get("__type") or "").strip()
+    kind = str(kind_override or "").strip().upper()
+    if not kind:
+        kind = {"TaskSettings": "TASK", "ContractSettings": "CONTRACT", "ContestSettings": "CONTEST"}.get(raw_type, "")
+    if not kind:
+        kind = _objectives_local_infer_kind(key, raw_type)
+    region = str(raw_entry.get("region") or "").strip().upper()
+    if not region:
+        parts = str(key or "").split("_")
+        if len(parts) >= 2:
+            region = "_".join(parts[:2]).upper()
+    if region not in REGION_NAME_MAP and not str(key or "").upper().startswith(("LEVEL_TUTORIAL_", "TUTORIAL_")):
+        kind = ""
+
+    stages = []
+    for stage in raw_entry.get("stages") or []:
+        normalized_stage = _objectives_local_normalize_stage(stage)
+        if normalized_stage["cargo"] or normalized_stage["truck_delivery"] or normalized_stage["visit_zones"]:
+            stages.append(normalized_stage)
+        else:
+            stages.append({"cargo": [], "truck_delivery": [], "visit_zones": []})
+
+    objective_type = "exploration"
+    for stage in stages:
+        if stage["truck_delivery"]:
+            objective_type = "truckDelivery"
+            break
+        if stage["cargo"]:
+            objective_type = "cargoDelivery"
+            break
+
+    cargo_totals = []
+    cargo_index = {}
+    for stage in stages:
+        for cargo in stage["cargo"]:
+            cargo_type = str(cargo.get("type") or "").strip()
+            if not cargo_type:
+                continue
+            count = max(1, _objectives_local_int(cargo.get("count"), 1) or 1)
+            if cargo_type not in cargo_index:
+                cargo_index[cargo_type] = {"type": cargo_type, "count": 0}
+                cargo_totals.append(cargo_index[cargo_type])
+            cargo_index[cargo_type]["count"] += count
+
+    rewards = _objectives_local_extract_rewards(raw_entry)
+    base_token = str(key or "").strip()
+    if base_token.endswith("_OBJ"):
+        base_desc_token = base_token[:-4]
+    else:
+        base_desc_token = base_token
+
+    description_token = str(raw_entry.get("uiDesc") or "").strip()
+    if (not description_token) and kind:
+        description_token = f"{base_desc_token}_DESC"
+    completion_token = str(raw_entry.get("description") or "").strip()
+    if (not completion_token) and kind:
+        completion_token = f"{base_desc_token}_REW"
+    return {
+        "key": key,
+        "kind": kind,
+        "raw_type": raw_type,
+        "region": region,
+        "display_token": str(raw_entry.get("uiName") or key or "").strip(),
+        "description_token": description_token,
+        "completion_token": completion_token,
+        "type": objective_type,
+        "experience": rewards.get("experience"),
+        "money": rewards.get("money"),
+        "cargo": cargo_totals,
+        "stages": stages,
+    }
+
+
+_OBJECTIVES_LOCAL_ROOT_CONTAINER_KIND = {
+    "tasksSettings": "TASK",
+    "contractsSettings": "CONTRACT",
+    "contestSettings": "CONTEST",
+}
+
+
+def _objectives_local_extract_braced_block(text: str, brace_start: int) -> str:
+    if brace_start < 0 or brace_start >= len(text):
+        return ""
+    depth = 0
+    for idx in range(brace_start, len(text)):
+        ch = text[idx]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_start:idx + 1]
+    return ""
+
+
+def _objectives_local_find_container_blocks(text: str, container_name: str) -> List[str]:
+    blocks = []
+    pattern = re.compile(re.escape(container_name) + r"\s*=\s*\{")
+    for match in pattern.finditer(text):
+        brace_start = text.find("{", match.start())
+        block = _objectives_local_extract_braced_block(text, brace_start)
+        if block:
+            blocks.append(block)
+    return blocks
+
+
+def _objectives_local_iter_immediate_named_blocks(container_block: str) -> Iterator[Tuple[str, str]]:
+    text = str(container_block or "")
+    depth = 0
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            i += 1
+            continue
+        if depth == 1:
+            match = re.match(r"\s*([A-Za-z0-9_]+)\s*=\s*\{", text[i:])
+            if match:
+                key = str(match.group(1) or "").strip()
+                local = text[i:]
+                brace_start = local.find("{")
+                block = _objectives_local_extract_braced_block(local, brace_start)
+                if key and block:
+                    yield key, block
+                    i += brace_start + len(block)
+                    continue
+        i += 1
+
+
+def _objectives_local_parse_cache_block(text: str) -> Dict[str, Dict[str, Any]]:
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    entries = {}
+    objective_key_re = re.compile(r"^[A-Z]{2}_\d{2}_\d{2}_[A-Za-z0-9_]+$")
+    for container_name, kind in _OBJECTIVES_LOCAL_ROOT_CONTAINER_KIND.items():
+        for container_block in _objectives_local_find_container_blocks(normalized, container_name):
+            for key, block_text in _objectives_local_iter_immediate_named_blocks(container_block):
+                if not objective_key_re.fullmatch(str(key or "")):
+                    continue
+                try:
+                    parsed = _ObjectivesLocalSsoParser(block_text).parse()
+                except Exception:
+                    continue
+                if not isinstance(parsed, dict):
+                    continue
+                entry = _objectives_local_normalize_entry(key, parsed, kind_override=kind)
+                if entry.get("kind"):
+                    entries[key] = entry
+    return entries
+
+
+def _objectives_local_load_definitions(pak_path: str, force_reload: bool = False) -> Dict[str, Dict[str, Any]]:
+    pak = _objectives_existing_file(pak_path)
+    if not pak:
+        return {}
+    _objectives_local_cleanup_persistent_cache_once()
+    signature = _objectives_local_pak_signature(pak)
+    if not force_reload:
+        try:
+            with _OBJECTIVES_LOCAL_LOCK:
+                cached = _OBJECTIVES_LOCAL_DEFS_MEM_CACHE.get(signature)
+            if isinstance(cached, dict) and cached:
+                return cached
+        except Exception:
+            pass
+
+    entries = {}
+    try:
+        with zipfile.ZipFile(pak, "r") as zf:
+            raw_text = zf.read("initial.cache_block").decode("utf-8", errors="replace")
+        entries = _objectives_local_parse_cache_block(raw_text)
+    except Exception:
+        entries = {}
+
+    if entries:
+        try:
+            with _OBJECTIVES_LOCAL_LOCK:
+                _OBJECTIVES_LOCAL_DEFS_MEM_CACHE[signature] = entries
+        except Exception:
+            pass
+    return entries
+
+
+def _objectives_parse_strings_table(text: str) -> Dict[str, str]:
+    strings = {}
+    for raw_line in str(text or "").splitlines():
+        line = raw_line.lstrip("\ufeff").strip()
+        if not line or "\t" not in line:
+            continue
+        token, rest = line.split("\t", 1)
+        token = token.strip()
+        if not token:
+            continue
+        match = re.search(r'"(.*)"\s*$', rest)
+        value = match.group(1) if match else rest.strip().strip('"')
+        strings[token] = value.replace('\\"', '"')
+    return strings
+
+
+def _objectives_local_load_strings(pak_path: str, language: str, force_reload: bool = False) -> Dict[str, str]:
+    pak = _objectives_existing_file(pak_path)
+    if not pak:
+        return {}
+    signature = _objectives_local_pak_signature(pak)
+    available = _objectives_local_list_languages(pak)
+    lang = _objectives_normalize_language_code(language)
+    if lang not in available:
+        if _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE in available:
+            lang = _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE
+        elif available:
+            lang = available[0]
+    cache_key = _objectives_local_cache_key(signature, lang)
+    if not force_reload:
+        try:
+            with _OBJECTIVES_LOCAL_LOCK:
+                cached = _OBJECTIVES_LOCAL_STRINGS_MEM_CACHE.get(cache_key)
+            if isinstance(cached, dict) and cached:
+                return cached
+        except Exception:
+            pass
+
+    path_in_pak = f"{_OBJECTIVES_LOCAL_STRINGS_PREFIX}{lang}{_OBJECTIVES_LOCAL_STRINGS_SUFFIX}"
+    strings = {}
+    try:
+        with zipfile.ZipFile(pak, "r") as zf:
+            text = zf.read(path_in_pak).decode("utf-16le", errors="replace")
+        strings = _objectives_parse_strings_table(text)
+    except Exception:
+        strings = {}
+
+    try:
+        with _OBJECTIVES_LOCAL_LOCK:
+            _OBJECTIVES_LOCAL_STRINGS_MEM_CACHE[cache_key] = strings
+    except Exception:
+        pass
+    return strings
+
+
+def _objectives_local_cargo_summary(cargos: List[Dict[str, Any]], localization: Dict[str, str]) -> str:
+    parts = []
+    for cargo in cargos or []:
+        if not isinstance(cargo, dict):
+            continue
+        cargo_type = str(cargo.get("type") or "").strip()
+        if not cargo_type:
+            continue
+        label = _objectives_local_clean_text(_objectives_local_translate(cargo_type, localization))
+        if (not label) or _objectives_local_is_probably_token(label):
+            label = _objectives_local_humanize_identifier(cargo_type)
+        count = max(1, _objectives_local_int(cargo.get("count"), 1) or 1)
+        parts.append(f"{count}× {label}")
+    return "; ".join(parts)
+
+
+def _objectives_local_build_rows(definitions: Dict[str, Dict[str, Any]], localization: Dict[str, str]) -> List[Dict[str, Any]]:
+    rows = []
+    for key in sorted(definitions.keys()):
+        entry = definitions.get(key)
+        if not isinstance(entry, dict):
+            continue
+        display = _objectives_local_clean_text(_objectives_local_translate(entry.get("display_token") or key, localization))
+        if (not display) or _objectives_local_is_probably_token(display):
+            display = _objectives_local_humanize_identifier(key)
+
+        description = _objectives_local_clean_text(_objectives_local_translate(entry.get("description_token"), localization))
+        if _objectives_local_is_probably_token(description):
+            description = ""
+
+        region_code = str(entry.get("region") or "").strip().upper()
+        kind = str(entry.get("kind") or "").strip().upper()
+        rows.append(
+            {
+                "key": key,
+                "displayname": display,
+                "category": _OBJECTIVES_LOCAL_KIND_TO_SOURCE.get(kind, kind),
+                "region": region_code,
+                "region_name": REGION_NAME_MAP.get(region_code, region_code),
+                "type": str(entry.get("type") or "").strip(),
+                "cargo_needed": _objectives_local_cargo_summary(entry.get("cargo") or [], localization),
+                "experience": entry.get("experience"),
+                "money": entry.get("money"),
+                "descriptiontext": description,
+                "source": _OBJECTIVES_LOCAL_KIND_TO_SOURCE.get(kind, kind),
+            }
+        )
+    return rows
+
+
+def _objectives_local_get_source(force_reload: bool = False, language: Optional[str] = None) -> Dict[str, Any]:
+    probe = _objectives_local_probe()
+    pak_path = probe.get("path", "")
+    if not pak_path:
+        return {
+            "path": "",
+            "source": "",
+            "signature": "",
+            "available_languages": [],
+            "language": _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE,
+            "definitions": {},
+            "localization": {},
+            "rows": [],
+            "error": "initial.pak not found",
+        }
+
+    signature = _objectives_local_pak_signature(pak_path)
+    available = list(probe.get("available_languages") or [])
+    lang = _objectives_normalize_language_code(language if language is not None else probe.get("language"))
+    if lang not in available:
+        if _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE in available:
+            lang = _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE
+        elif available:
+            lang = available[0]
+
+    cache_key = _objectives_local_cache_key(signature, lang)
+    if not force_reload:
+        try:
+            with _OBJECTIVES_LOCAL_LOCK:
+                cached_rows = _OBJECTIVES_LOCAL_ROWS_MEM_CACHE.get(cache_key)
+                cached_defs = _OBJECTIVES_LOCAL_DEFS_MEM_CACHE.get(signature)
+                cached_loc = _OBJECTIVES_LOCAL_STRINGS_MEM_CACHE.get(cache_key)
+            if isinstance(cached_rows, list) and isinstance(cached_defs, dict) and isinstance(cached_loc, dict):
+                return {
+                    "path": pak_path,
+                    "source": probe.get("source", ""),
+                    "signature": signature,
+                    "available_languages": available,
+                    "language": lang,
+                    "definitions": cached_defs,
+                    "localization": cached_loc,
+                    "rows": cached_rows,
+                    "error": "",
+                }
+        except Exception:
+            pass
+
+    definitions = _objectives_local_load_definitions(pak_path, force_reload=force_reload)
+    localization = _objectives_local_load_strings(pak_path, lang, force_reload=force_reload)
+    rows = _objectives_local_build_rows(definitions, localization)
+    try:
+        with _OBJECTIVES_LOCAL_LOCK:
+            _OBJECTIVES_LOCAL_ROWS_MEM_CACHE[cache_key] = rows
+    except Exception:
+        pass
+    return {
+        "path": pak_path,
+        "source": probe.get("source", ""),
+        "signature": signature,
+        "available_languages": available,
+        "language": lang,
+        "definitions": definitions,
+        "localization": localization,
+        "rows": rows,
+        "error": "",
+    }
+
+
+def _objectives_invalidate_runtime_caches() -> None:
+    global _EXPERIMENTS_OBJECTIVE_ROW_BY_KEY
+    global _EXPERIMENTS_OBJECTIVE_INDEX_CACHE
+    global _EXPERIMENTS_OBJECTIVE_LOCALIZATION_CACHE
+    global _EXPERIMENTS_OBJECTIVE_LOAD_INFO
+    global _EXPERIMENTS_META_OBJECTIVE_KIND
+    _bump_objectives_source_generation()
+    _EXPERIMENTS_OBJECTIVE_ROW_BY_KEY = None
+    _EXPERIMENTS_OBJECTIVE_INDEX_CACHE = None
+    _EXPERIMENTS_OBJECTIVE_LOCALIZATION_CACHE = None
+    _EXPERIMENTS_OBJECTIVE_LOAD_INFO = None
+    _EXPERIMENTS_META_OBJECTIVE_KIND = None
+    try:
+        with _OBJECTIVES_FALLBACK_LOCK:
+            _OBJECTIVES_FALLBACK_JSON_MEM_CACHE.clear()
+    except Exception:
+        pass
+    try:
+        _vehicle_invalidate_metadata_caches(clear_disk=True)
+    except Exception:
+        pass
+    try:
+        _vehicle_notify_metadata_refresh_listeners()
+    except Exception:
+        pass
+
+
+def _objectives_register_active_view(view) -> None:
+    global _OBJECTIVES_ACTIVE_VIEW_REF
+    if view is None:
+        _OBJECTIVES_ACTIVE_VIEW_REF = None
+        return
+    try:
+        _OBJECTIVES_ACTIVE_VIEW_REF = weakref.ref(view)
+    except Exception:
+        _OBJECTIVES_ACTIVE_VIEW_REF = None
+
+
+def _objectives_get_active_view():
+    global _OBJECTIVES_ACTIVE_VIEW_REF
+    ref = _OBJECTIVES_ACTIVE_VIEW_REF
+    if ref is None:
+        return None
+    try:
+        view = ref()
+    except Exception:
+        view = None
+    if view is None:
+        _OBJECTIVES_ACTIVE_VIEW_REF = None
+    return view
+
+
+def _objectives_refresh_active_view_for_shared_language() -> bool:
+    view = _objectives_get_active_view()
+    if view is None:
+        return False
+    try:
+        frame = getattr(view, "frame", None)
+        if frame is not None and hasattr(frame, "winfo_exists") and (not bool(frame.winfo_exists())):
+            _objectives_register_active_view(None)
+            return False
+    except Exception:
+        pass
+    try:
+        view._refresh_local_source_controls()
+    except Exception:
+        pass
+    try:
+        view.load_data_thread(
+            allow_build=True,
+            preserve_changes=True,
+            keep_existing_items=False,
+            show_loading=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+_OBJECTIVES_FALLBACK_VERSION = 1
+_OBJECTIVES_FALLBACK_MANIFEST_NAME = "objectives_manifest.json"
+_OBJECTIVES_FALLBACK_DEFS_NAME = "objectives_defs.json"
+_OBJECTIVES_FALLBACK_LOCALE_TEMPLATE = "objectives_locale_{lang}.json"
+# Publish the generated fallback/upload contents to this repo folder.
+_OBJECTIVES_FALLBACK_REMOTE_BASE_URL = (
+    "https://raw.githubusercontent.com/MrBoxik/SnowRunner-Save-Editor/main/app/objectives/"
+)
+_OBJECTIVES_FALLBACK_LOCK = threading.Lock()
+_OBJECTIVES_FALLBACK_JSON_MEM_CACHE: Dict[str, Any] = {}
+
+
+def _objectives_fallback_upload_dir() -> str:
+    return resource_path(os.path.join("fallback", "upload"))
+
+
+def _objectives_fallback_raw_dir() -> str:
+    return resource_path("fallback")
+
+
+def _objectives_fallback_cache_dir() -> str:
+    try:
+        base = get_editor_data_dir()
+    except Exception:
+        base = os.getcwd()
+    path = os.path.join(base, "objectives_fallback_cache")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def _objectives_fallback_locale_name(lang: str) -> str:
+    return _OBJECTIVES_FALLBACK_LOCALE_TEMPLATE.format(lang=_objectives_normalize_language_code(lang))
+
+
+def _objectives_read_json_file(path: str) -> Any:
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _objectives_write_json_file(path: str, payload: Any) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _objectives_collect_public_locale_tokens(definitions: Dict[str, Dict[str, Any]]) -> Set[str]:
+    tokens: Set[str] = set()
+
+    def add_token_variants(raw_token: Any) -> None:
+        token = str(raw_token or "").strip()
+        if not token:
+            return
+        tokens.add(token)
+        tokens.add(token.lower())
+        tokens.add(token.upper())
+
+    for entry in (definitions or {}).values():
+        if not isinstance(entry, dict):
+            continue
+        for field_name in ("display_token", "description_token", "completion_token"):
+            add_token_variants(entry.get(field_name))
+        for cargo in entry.get("cargo") or []:
+            if isinstance(cargo, dict):
+                add_token_variants(cargo.get("type"))
+        for stage in entry.get("stages") or []:
+            if not isinstance(stage, dict):
+                continue
+            for cargo in stage.get("cargo") or []:
+                if isinstance(cargo, dict):
+                    add_token_variants(cargo.get("type"))
+    return tokens
+
+
+def _objectives_build_public_fallback_package(raw_dir: Optional[str] = None, out_dir: Optional[str] = None) -> Dict[str, Any]:
+    raw_base = raw_dir or _objectives_fallback_raw_dir()
+    out_base = out_dir or _objectives_fallback_upload_dir()
+    cache_block_path = os.path.join(raw_base, "initial.cache_block")
+    if not os.path.isfile(cache_block_path):
+        raise FileNotFoundError(f"Missing fallback source file: {cache_block_path}")
+
+    with open(cache_block_path, "r", encoding="utf-8", errors="replace") as fh:
+        definitions = _objectives_local_parse_cache_block(fh.read())
+    if not definitions:
+        raise RuntimeError("Failed to parse any objective definitions from fallback initial.cache_block.")
+
+    token_filter = _objectives_collect_public_locale_tokens(definitions)
+    languages = []
+    locale_counts = {}
+    os.makedirs(out_base, exist_ok=True)
+
+    for name in sorted(os.listdir(raw_base)):
+        lower = name.lower()
+        if not lower.startswith("strings_") or not lower.endswith(".str"):
+            continue
+        lang = _objectives_normalize_language_code(name[len("strings_"):-len(".str")])
+        path = os.path.join(raw_base, name)
+        try:
+            with open(path, "r", encoding="utf-16le", errors="replace") as fh:
+                strings = _objectives_parse_strings_table(fh.read())
+        except Exception:
+            continue
+        filtered = {k: v for k, v in strings.items() if k in token_filter}
+        _objectives_write_json_file(os.path.join(out_base, _objectives_fallback_locale_name(lang)), filtered)
+        languages.append(lang)
+        locale_counts[lang] = len(filtered)
+
+    languages = sorted(set(languages), key=lambda item: (_objectives_language_label(item).lower(), item))
+    if _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE in languages:
+        languages = [_OBJECTIVES_LOCAL_DEFAULT_LANGUAGE] + [lang for lang in languages if lang != _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE]
+
+    definitions_payload = {
+        "version": _OBJECTIVES_FALLBACK_VERSION,
+        "definition_count": len(definitions),
+        "definitions": definitions,
+    }
+    _objectives_write_json_file(os.path.join(out_base, _OBJECTIVES_FALLBACK_DEFS_NAME), definitions_payload)
+
+    manifest = {
+        "version": _OBJECTIVES_FALLBACK_VERSION,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "definition_count": len(definitions),
+        "languages": languages,
+        "locale_token_counts": locale_counts,
+        "files": {
+            "definitions": _OBJECTIVES_FALLBACK_DEFS_NAME,
+            "manifest": _OBJECTIVES_FALLBACK_MANIFEST_NAME,
+            "locales": {lang: _objectives_fallback_locale_name(lang) for lang in languages},
+        },
+    }
+    _objectives_write_json_file(os.path.join(out_base, _OBJECTIVES_FALLBACK_MANIFEST_NAME), manifest)
+    return manifest
+
+
+def _objectives_fallback_ensure_local_upload_package() -> None:
+    upload_dir = _objectives_fallback_upload_dir()
+    manifest_path = os.path.join(upload_dir, _OBJECTIVES_FALLBACK_MANIFEST_NAME)
+    if os.path.isfile(manifest_path):
+        return
+    raw_dir = _objectives_fallback_raw_dir()
+    if not os.path.isdir(raw_dir):
+        return
+    cache_block = os.path.join(raw_dir, "initial.cache_block")
+    if not os.path.isfile(cache_block):
+        return
+    try:
+        _objectives_build_public_fallback_package(raw_dir=raw_dir, out_dir=upload_dir)
+    except Exception:
+        pass
+
+
+def _objectives_fallback_cache_path(name: str) -> str:
+    return os.path.join(_objectives_fallback_cache_dir(), name)
+
+
+def _objectives_fallback_load_json_asset(
+    name: str,
+    *,
+    force_refresh: bool = False,
+    allow_download: bool = True,
+) -> Dict[str, Any]:
+    mem_key = f"{name}::download={int(bool(allow_download))}"
+    if not force_refresh:
+        try:
+            with _OBJECTIVES_FALLBACK_LOCK:
+                if mem_key in _OBJECTIVES_FALLBACK_JSON_MEM_CACHE:
+                    return {"payload": _OBJECTIVES_FALLBACK_JSON_MEM_CACHE[mem_key], "source": "memory", "error": ""}
+        except Exception:
+            pass
+
+    _objectives_fallback_ensure_local_upload_package()
+    local_path = os.path.join(_objectives_fallback_upload_dir(), name)
+    if os.path.isfile(local_path):
+        try:
+            payload = _objectives_read_json_file(local_path)
+            with _OBJECTIVES_FALLBACK_LOCK:
+                _OBJECTIVES_FALLBACK_JSON_MEM_CACHE[mem_key] = payload
+            return {"payload": payload, "source": f"local:{local_path}", "error": ""}
+        except Exception as e:
+            local_error = str(e)
+        else:
+            local_error = ""
+    else:
+        local_error = ""
+
+    cache_path = _objectives_fallback_cache_path(name)
+    if (not force_refresh) and os.path.isfile(cache_path):
+        try:
+            payload = _objectives_read_json_file(cache_path)
+            with _OBJECTIVES_FALLBACK_LOCK:
+                _OBJECTIVES_FALLBACK_JSON_MEM_CACHE[mem_key] = payload
+            return {"payload": payload, "source": f"cache:{cache_path}", "error": ""}
+        except Exception:
+            pass
+
+    if allow_download:
+        url = urljoin(_OBJECTIVES_FALLBACK_REMOTE_BASE_URL, name)
+        try:
+            data, _ = _http_get_bytes(url, timeout=20)
+            payload = json.loads((data or b"").decode("utf-8", errors="replace"))
+            _objectives_write_json_file(cache_path, payload)
+            with _OBJECTIVES_FALLBACK_LOCK:
+                _OBJECTIVES_FALLBACK_JSON_MEM_CACHE[mem_key] = payload
+            return {"payload": payload, "source": url, "error": ""}
+        except Exception as e:
+            download_error = str(e)
+        else:
+            download_error = ""
+    else:
+        download_error = ""
+
+    if os.path.isfile(cache_path):
+        try:
+            payload = _objectives_read_json_file(cache_path)
+            with _OBJECTIVES_FALLBACK_LOCK:
+                _OBJECTIVES_FALLBACK_JSON_MEM_CACHE[mem_key] = payload
+            return {"payload": payload, "source": f"cache:{cache_path}", "error": ""}
+        except Exception:
+            pass
+
+    error = download_error or local_error or f"Fallback asset not available: {name}"
+    return {"payload": None, "source": "", "error": error}
+
+
+def _objectives_fallback_get_manifest(force_refresh: bool = False, allow_download: bool = True) -> Dict[str, Any]:
+    result = _objectives_fallback_load_json_asset(
+        _OBJECTIVES_FALLBACK_MANIFEST_NAME,
+        force_refresh=force_refresh,
+        allow_download=allow_download,
+    )
+    payload = result.get("payload")
+    if not isinstance(payload, dict):
+        return {"manifest": {}, "source": "", "error": str(result.get("error") or "")}
+    return {"manifest": payload, "source": str(result.get("source") or ""), "error": ""}
+
+
+def _objectives_fallback_get_source(
+    force_reload: bool = False,
+    language: Optional[str] = None,
+    allow_download: bool = True,
+) -> Dict[str, Any]:
+    manifest_result = _objectives_fallback_get_manifest(force_refresh=force_reload, allow_download=allow_download)
+    manifest = manifest_result.get("manifest") if isinstance(manifest_result, dict) else {}
+    if not isinstance(manifest, dict) or not manifest:
+        return {
+            "path": "",
+            "source": "",
+            "signature": "",
+            "available_languages": [],
+            "language": _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE,
+            "definitions": {},
+            "localization": {},
+            "rows": [],
+            "error": str(manifest_result.get("error") or "Fallback package manifest not available."),
+        }
+
+    languages = list(manifest.get("languages") or [])
+    lang = _objectives_normalize_language_code(language or _objectives_get_language_preference())
+    if lang not in languages:
+        if _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE in languages:
+            lang = _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE
+        elif languages:
+            lang = languages[0]
+
+    defs_name = str((manifest.get("files") or {}).get("definitions") or _OBJECTIVES_FALLBACK_DEFS_NAME)
+    defs_result = _objectives_fallback_load_json_asset(defs_name, force_refresh=force_reload, allow_download=allow_download)
+    defs_payload = defs_result.get("payload")
+    definitions = {}
+    if isinstance(defs_payload, dict):
+        definitions = defs_payload.get("definitions") if isinstance(defs_payload.get("definitions"), dict) else defs_payload
+    if not isinstance(definitions, dict):
+        definitions = {}
+
+    locale_name = str(((manifest.get("files") or {}).get("locales") or {}).get(lang) or _objectives_fallback_locale_name(lang))
+    loc_result = _objectives_fallback_load_json_asset(locale_name, force_refresh=force_reload, allow_download=allow_download)
+    localization = loc_result.get("payload")
+    if not isinstance(localization, dict):
+        localization = {}
+
+    rows = _objectives_local_build_rows(definitions, localization)
+    source_path = str(defs_result.get("source") or manifest_result.get("source") or "")
+    return {
+        "path": source_path,
+        "source": "fallback-package",
+        "signature": f"fallback::{manifest.get('version', _OBJECTIVES_FALLBACK_VERSION)}",
+        "available_languages": languages,
+        "language": lang,
+        "definitions": definitions,
+        "localization": localization,
+        "rows": rows,
+        "error": "" if rows else str(loc_result.get("error") or defs_result.get("error") or "Fallback package is empty."),
+    }
+
+
+def _objectives_get_preferred_source(
+    force_reload: bool = False,
+    language: Optional[str] = None,
+    allow_download: bool = True,
+    prefer_fallback: Optional[bool] = None,
+) -> Dict[str, Any]:
+    if prefer_fallback is None:
+        try:
+            prefer_fallback = bool(_get_objectives_safe_fallback_mode())
+        except Exception:
+            prefer_fallback = False
+
+    loaders = [
+        ("fallback", lambda: _objectives_fallback_get_source(force_reload=force_reload, language=language, allow_download=allow_download)),
+        ("local", lambda: _objectives_local_get_source(force_reload=force_reload, language=language)),
+    ]
+    if not prefer_fallback:
+        loaders.reverse()
+
+    errors = []
+    for kind, loader in loaders:
+        try:
+            info = loader() or {}
+        except Exception as e:
+            info = {"rows": [], "error": str(e)}
+        rows = info.get("rows") if isinstance(info, dict) else []
+        if isinstance(rows, list) and rows:
+            result = dict(info)
+            result["kind"] = kind
+            return result
+        err = str(info.get("error") or "").strip() if isinstance(info, dict) else ""
+        if err:
+            errors.append(f"{kind}: {err}")
+
+    return {
+        "kind": "",
+        "path": "",
+        "source": "",
+        "signature": "",
+        "available_languages": [],
+        "language": _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE,
+        "definitions": {},
+        "localization": {},
+        "rows": [],
+        "error": " | ".join(errors) if errors else "No objectives source available.",
+    }
+
+# =============================================================================
+# SECTION: Editor Translation Overlay
+# Used In: Settings tab + runtime UI text translation
+# =============================================================================
+_EDITOR_TRANSLATION_DEFAULT_LANGUAGE = "english"
+_EDITOR_TRANSLATION_REMOTE_BASE_URL = (
+    "https://raw.githubusercontent.com/MrBoxik/SnowRunner-Save-Editor/main/app/translations/"
+)
+_EDITOR_TRANSLATION_FILE_TEMPLATE = "editor_locale_{lang}.json"
+_EDITOR_TRANSLATION_LOCK = threading.Lock()
+_EDITOR_TRANSLATION_CACHE: Dict[str, Dict[str, Any]] = {}
+_EDITOR_TRANSLATION_STATE: Dict[str, Any] = {
+    "requested_language": _EDITOR_TRANSLATION_DEFAULT_LANGUAGE,
+    "resolved_language": _EDITOR_TRANSLATION_DEFAULT_LANGUAGE,
+    "strings": {},
+    "patterns": [],
+    "source": "builtin",
+    "error": "",
+}
+_EDITOR_TRANSLATION_WIDGET_STATE = weakref.WeakKeyDictionary()
+_EDITOR_TRANSLATION_REGISTERED_TEXTVARS: Dict[str, str] = {}
+_EDITOR_TRANSLATION_WINDOWS = weakref.WeakSet()
+_EDITOR_TRANSLATION_HOOKS_INSTALLED = False
+_EDITOR_TRANSLATION_PATCHED_CLASSES = set()
+_EDITOR_TRANSLATION_STRINGVARS_BY_NAME: Dict[str, tk.StringVar] = {}
+_EDITOR_TRANSLATION_RAW_WIDGET_CONFIGURE: Dict[Any, Any] = {}
+_EDITOR_TRANSLATION_RAW_STRINGVAR_SET = tk.StringVar.set
+_EDITOR_TRANSLATION_RAW_STRINGVAR_INIT = tk.StringVar.__init__
+_EDITOR_TRANSLATION_RAW_STRINGVAR_GET = tk.StringVar.get
+_EDITOR_TRANSLATION_RAW_TK_TITLE = tk.Tk.title
+_EDITOR_TRANSLATION_RAW_TOPLEVEL_TITLE = tk.Toplevel.title
+_EDITOR_TRANSLATION_RAW_TOPLEVEL_INIT = tk.Toplevel.__init__
+_EDITOR_TRANSLATION_RAW_TREEVIEW_HEADING = ttk.Treeview.heading
+_EDITOR_TRANSLATION_RAW_TREEVIEW_INSERT = ttk.Treeview.insert
+_EDITOR_TRANSLATION_RAW_TREEVIEW_ITEM = ttk.Treeview.item
+_EDITOR_TRANSLATION_COMBOBOX_VARS: Dict[str, Dict[str, Any]] = {}
+
+
+def _editor_normalize_language_code(value: Any) -> str:
+    code = str(value or "").strip().lower().replace("-", "_")
+    return code or _EDITOR_TRANSLATION_DEFAULT_LANGUAGE
+
+
+def _editor_get_language_preference() -> str:
+    try:
+        cfg = _load_config_safe()
+    except Exception:
+        cfg = {}
+    return _editor_normalize_language_code(cfg.get("editor_language", _EDITOR_TRANSLATION_DEFAULT_LANGUAGE))
+
+
+def _editor_set_language_preference(code: Any) -> str:
+    lang = _editor_normalize_language_code(code)
+    _update_config_values({"editor_language": lang})
+    return lang
+
+
+def _editor_translation_local_dir() -> str:
+    return resource_path(os.path.join("translations", "upload"))
+
+
+def _editor_translation_cache_dir() -> str:
+    try:
+        base = os.path.dirname(CONFIG_FILE)
+    except Exception:
+        base = ""
+    if not base:
+        try:
+            base = get_editor_data_dir()
+        except Exception:
+            base = os.getcwd()
+    path = os.path.join(base, "editor_translations_cache")
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+def _editor_translation_cache_path(name: str) -> str:
+    return os.path.join(_editor_translation_cache_dir(), name)
+
+
+def _editor_translation_filename(language: Any) -> str:
+    return _EDITOR_TRANSLATION_FILE_TEMPLATE.format(lang=_editor_normalize_language_code(language))
+
+
+def _editor_translation_read_json(path: str) -> Dict[str, Any]:
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _editor_translation_write_json(path: str, payload: Dict[str, Any]) -> None:
+    if not path or not isinstance(payload, dict):
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    except Exception:
+        pass
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+_EDITOR_TRANSLATION_TEMPLATE_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def _editor_compile_translation_template(template: str):
+    text = str(template or "")
+    parts = []
+    last = 0
+    seen = set()
+    for match in _EDITOR_TRANSLATION_TEMPLATE_TOKEN_RE.finditer(text):
+        parts.append(re.escape(text[last:match.start()]))
+        name = str(match.group(1) or "")
+        if name in seen:
+            parts.append(fr"(?P={name})")
+        else:
+            parts.append(fr"(?P<{name}>.*?)")
+            seen.add(name)
+        last = match.end()
+    parts.append(re.escape(text[last:]))
+    try:
+        return re.compile("^" + "".join(parts) + "$", re.DOTALL)
+    except Exception:
+        return None
+
+
+def _editor_translation_catalog_from_payload(language: str, payload: Any, source: str = "", error: str = "") -> Dict[str, Any]:
+    strings_payload = {}
+    if isinstance(payload, dict):
+        raw_strings = payload.get("strings") if isinstance(payload.get("strings"), dict) else payload
+        if isinstance(raw_strings, dict):
+            strings_payload = raw_strings
+
+    exact = {}
+    patterns = []
+    for raw_key, raw_value in list(strings_payload.items()):
+        key = str(raw_key or "")
+        if not key:
+            continue
+        value = str(raw_value) if raw_value is not None else key
+        if _EDITOR_TRANSLATION_TEMPLATE_TOKEN_RE.search(key):
+            compiled = _editor_compile_translation_template(key)
+            if compiled is not None:
+                patterns.append((compiled, value or key))
+                continue
+        exact[key] = value or key
+
+    return {
+        "requested_language": _editor_normalize_language_code(language),
+        "resolved_language": _editor_normalize_language_code(language) if (exact or patterns) else _EDITOR_TRANSLATION_DEFAULT_LANGUAGE,
+        "strings": exact,
+        "patterns": patterns,
+        "source": str(source or "builtin"),
+        "error": str(error or ""),
+    }
+
+
+def _editor_translation_load_catalog(
+    language: Any,
+    *,
+    force_reload: bool = False,
+    allow_download: bool = True,
+) -> Dict[str, Any]:
+    lang = _editor_normalize_language_code(language)
+    if lang == _EDITOR_TRANSLATION_DEFAULT_LANGUAGE:
+        return _editor_translation_catalog_from_payload(lang, {}, source="builtin")
+
+    cache_key = f"{lang}::download={int(bool(allow_download))}"
+    if not force_reload:
+        try:
+            with _EDITOR_TRANSLATION_LOCK:
+                cached = _EDITOR_TRANSLATION_CACHE.get(cache_key)
+            if isinstance(cached, dict) and cached:
+                return dict(cached)
+        except Exception:
+            pass
+
+    file_name = _editor_translation_filename(lang)
+    local_path = os.path.join(_editor_translation_local_dir(), file_name)
+    cache_path = _editor_translation_cache_path(file_name)
+
+    candidates = [
+        (local_path, f"local:{local_path}"),
+        (cache_path, f"cache:{cache_path}"),
+    ]
+    for path, source in candidates:
+        payload = _editor_translation_read_json(path)
+        if payload:
+            catalog = _editor_translation_catalog_from_payload(lang, payload, source=source)
+            with _EDITOR_TRANSLATION_LOCK:
+                _EDITOR_TRANSLATION_CACHE[cache_key] = dict(catalog)
+            return catalog
+
+    if allow_download:
+        url = urljoin(_EDITOR_TRANSLATION_REMOTE_BASE_URL, file_name)
+        try:
+            data, _ = _http_get_bytes(url, timeout=15)
+            payload = json.loads((data or b"").decode("utf-8", errors="replace"))
+            if isinstance(payload, dict):
+                _editor_translation_write_json(cache_path, payload)
+                catalog = _editor_translation_catalog_from_payload(lang, payload, source=url)
+                with _EDITOR_TRANSLATION_LOCK:
+                    _EDITOR_TRANSLATION_CACHE[cache_key] = dict(catalog)
+                return catalog
+        except Exception as e:
+            download_error = str(e)
+        else:
+            download_error = ""
+    else:
+        download_error = ""
+
+    catalog = _editor_translation_catalog_from_payload(
+        lang,
+        {},
+        source="builtin",
+        error=(download_error or f"Translation file not available: {file_name}"),
+    )
+    with _EDITOR_TRANSLATION_LOCK:
+        _EDITOR_TRANSLATION_CACHE[cache_key] = dict(catalog)
+    return catalog
+
+
+def _editor_translation_get_state() -> Dict[str, Any]:
+    try:
+        with _EDITOR_TRANSLATION_LOCK:
+            state = dict(_EDITOR_TRANSLATION_STATE)
+    except Exception:
+        state = dict(_EDITOR_TRANSLATION_STATE)
+    state["patterns"] = list(state.get("patterns") or [])
+    state["strings"] = dict(state.get("strings") or {})
+    return state
+
+
+def _editor_translate_display_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    if not text:
+        return ""
+    try:
+        with _EDITOR_TRANSLATION_LOCK:
+            strings = dict(_EDITOR_TRANSLATION_STATE.get("strings") or {})
+            patterns = list(_EDITOR_TRANSLATION_STATE.get("patterns") or [])
+            resolved_language = str(_EDITOR_TRANSLATION_STATE.get("resolved_language") or _EDITOR_TRANSLATION_DEFAULT_LANGUAGE)
+    except Exception:
+        strings = {}
+        patterns = []
+        resolved_language = _EDITOR_TRANSLATION_DEFAULT_LANGUAGE
+
+    if resolved_language == _EDITOR_TRANSLATION_DEFAULT_LANGUAGE:
+        return text
+    if text in strings:
+        return str(strings.get(text) or text)
+    trailing_colon = re.match(r"^(.*\S)(\s*:\s*)$", text, flags=re.DOTALL)
+    if trailing_colon:
+        base_text = str(trailing_colon.group(1) or "")
+        suffix = str(trailing_colon.group(2) or "")
+        if base_text:
+            translated_base = _editor_translate_display_text(base_text)
+            if translated_base != base_text:
+                return translated_base + suffix
+    for compiled, template in patterns:
+        try:
+            match = compiled.match(text)
+        except Exception:
+            match = None
+        if not match:
+            continue
+        groups = {k: ("" if v is None else str(v)) for k, v in match.groupdict().items()}
+        try:
+            rendered = str(template).format(**groups)
+        except Exception:
+            rendered = str(template or text)
+        if rendered != text:
+            return rendered
+    return text
+
+
+def _editor_available_languages(allow_download: bool = False) -> List[str]:
+    available = []
+    try:
+        probe = _objectives_local_probe()
+        available = list(probe.get("available_languages") or [])
+    except Exception:
+        available = []
+    if not available:
+        try:
+            fallback_info = _objectives_fallback_get_manifest(force_refresh=False, allow_download=allow_download)
+            fallback_manifest = fallback_info.get("manifest") if isinstance(fallback_info, dict) else {}
+            if isinstance(fallback_manifest, dict):
+                available = list(fallback_manifest.get("languages") or [])
+        except Exception:
+            available = []
+    if _EDITOR_TRANSLATION_DEFAULT_LANGUAGE not in available:
+        available = [_EDITOR_TRANSLATION_DEFAULT_LANGUAGE] + [code for code in available if code != _EDITOR_TRANSLATION_DEFAULT_LANGUAGE]
+    else:
+        available = [_EDITOR_TRANSLATION_DEFAULT_LANGUAGE] + [code for code in available if code != _EDITOR_TRANSLATION_DEFAULT_LANGUAGE]
+    out = []
+    seen = set()
+    for code in available:
+        lang = _editor_normalize_language_code(code)
+        if lang and lang not in seen:
+            out.append(lang)
+            seen.add(lang)
+    return out or [_EDITOR_TRANSLATION_DEFAULT_LANGUAGE]
+
+
+def _editor_translation_widget_state(widget) -> Dict[str, Any]:
+    state = _EDITOR_TRANSLATION_WIDGET_STATE.get(widget)
+    if not isinstance(state, dict):
+        state = {}
+        try:
+            _EDITOR_TRANSLATION_WIDGET_STATE[widget] = state
+        except Exception:
+            pass
+    return state
+
+
+def _editor_store_widget_text(widget, text: Any) -> None:
+    if text is None:
+        return
+    state = _editor_translation_widget_state(widget)
+    state["text"] = str(text)
+
+
+def _editor_get_widget_text(widget) -> str:
+    state = _editor_translation_widget_state(widget)
+    if "text" in state:
+        return str(state.get("text") or "")
+    try:
+        raw = widget.cget("text")
+    except Exception:
+        raw = None
+    if raw is None:
+        return ""
+    state["text"] = str(raw)
+    return str(raw)
+
+
+def _editor_store_widget_title(widget, title: Any) -> None:
+    if title is None:
+        return
+    state = _editor_translation_widget_state(widget)
+    state["title"] = str(title)
+
+
+def _editor_get_widget_title(widget) -> str:
+    state = _editor_translation_widget_state(widget)
+    if "title" in state:
+        return str(state.get("title") or "")
+    try:
+        raw = widget.title()
+    except Exception:
+        raw = None
+    if raw is None:
+        return ""
+    state["title"] = str(raw)
+    return str(raw)
+
+
+def _editor_apply_window_title(widget, raw_title: Any) -> None:
+    if widget is None:
+        return
+    title_text = "" if raw_title is None else str(raw_title)
+    if not title_text:
+        return
+    translated = _editor_translate_display_text(title_text)
+    try:
+        if isinstance(widget, tk.Tk):
+            _EDITOR_TRANSLATION_RAW_TK_TITLE(widget, translated)
+            return
+        if isinstance(widget, tk.Toplevel):
+            _EDITOR_TRANSLATION_RAW_TOPLEVEL_TITLE(widget, translated)
+            return
+    except Exception:
+        pass
+    try:
+        widget.title(translated)
+    except Exception:
+        pass
+
+
+def _editor_register_window(window) -> None:
+    if window is None:
+        return
+    try:
+        _EDITOR_TRANSLATION_WINDOWS.add(window)
+    except Exception:
+        pass
+
+
+def _editor_apply_widget_text(widget) -> None:
+    raw_text = _editor_get_widget_text(widget)
+    if raw_text == "":
+        return
+    translated = _editor_translate_display_text(raw_text)
+    raw_configure = _EDITOR_TRANSLATION_RAW_WIDGET_CONFIGURE.get(type(widget))
+    try:
+        if callable(raw_configure):
+            raw_configure(widget, text=translated)
+        else:
+            widget.configure(text=translated)
+    except Exception:
+        try:
+            widget.config(text=translated)
+        except Exception:
+            pass
+
+
+def _editor_register_stringvar(var) -> None:
+    if var is None:
+        return
+    try:
+        var_key = str(var._name or "").strip()
+    except Exception:
+        var_key = str(var or "").strip()
+    if not var_key:
+        return
+    try:
+        raw = _EDITOR_TRANSLATION_REGISTERED_TEXTVARS.get(var_key)
+    except Exception:
+        raw = None
+    if raw is None:
+        try:
+            raw = str(var.get() or "")
+        except Exception:
+            raw = ""
+    try:
+        _EDITOR_TRANSLATION_REGISTERED_TEXTVARS[var_key] = raw
+    except Exception:
+        return
+    try:
+        _EDITOR_TRANSLATION_RAW_STRINGVAR_SET(var, _editor_translate_display_text(raw))
+    except Exception:
+        pass
+
+
+def _editor_lookup_stringvar(name: Any):
+    key = str(name or "").strip()
+    if not key:
+        return None
+    return _EDITOR_TRANSLATION_STRINGVARS_BY_NAME.get(key)
+
+
+def _editor_values_to_string_list(values: Any) -> List[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        return [values]
+    try:
+        return [("" if item is None else str(item)) for item in list(values)]
+    except Exception:
+        return [str(values)]
+
+
+def _editor_combobox_var_key(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, tk.Variable):
+        try:
+            return str(value._name or "").strip()
+        except Exception:
+            return ""
+    return str(value or "").strip()
+
+
+def _editor_get_stringvar_display_value(var) -> str:
+    if var is None:
+        return ""
+    try:
+        return str(_EDITOR_TRANSLATION_RAW_STRINGVAR_GET(var) or "")
+    except Exception:
+        try:
+            return str(var.get() or "")
+        except Exception:
+            return ""
+
+
+def _editor_current_combobox_raw_value(var_key: Any) -> str:
+    key = _editor_combobox_var_key(var_key)
+    if not key:
+        return ""
+    combo_state = _EDITOR_TRANSLATION_COMBOBOX_VARS.get(key) or {}
+    current_raw = ""
+    if isinstance(combo_state, dict):
+        current_raw = str(combo_state.get("current_raw") or "")
+    if current_raw:
+        return current_raw
+    var = _editor_lookup_stringvar(key)
+    if var is None:
+        return ""
+    display_value = _editor_get_stringvar_display_value(var)
+    reverse = combo_state.get("display_to_raw") if isinstance(combo_state, dict) else {}
+    if isinstance(reverse, dict):
+        return str(reverse.get(display_value, display_value) or "")
+    return display_value
+
+
+def _editor_refresh_combobox(widget) -> None:
+    if not isinstance(widget, ttk.Combobox):
+        return
+    state = _editor_translation_widget_state(widget)
+    raw_values = _editor_values_to_string_list(state.get("combobox_values_raw"))
+    if not raw_values:
+        try:
+            raw_values = _editor_values_to_string_list(widget.cget("values"))
+        except Exception:
+            raw_values = []
+        if raw_values:
+            state["combobox_values_raw"] = list(raw_values)
+    var_key = _editor_combobox_var_key(state.get("combobox_var") or widget.cget("textvariable"))
+    if var_key and (not state.get("combobox_var")):
+        state["combobox_var"] = var_key
+    previous_state = _EDITOR_TRANSLATION_COMBOBOX_VARS.get(var_key) if var_key else {}
+    previous_reverse = previous_state.get("display_to_raw") if isinstance(previous_state, dict) else {}
+    previous_raw_value = ""
+    if isinstance(previous_state, dict):
+        previous_raw_value = str(previous_state.get("current_raw") or "")
+    var = _editor_lookup_stringvar(var_key) if var_key else None
+    current_display_value = _editor_get_stringvar_display_value(var) if var is not None else ""
+    if (not previous_raw_value) and isinstance(previous_reverse, dict):
+        previous_raw_value = str(previous_reverse.get(current_display_value, current_display_value) or "")
+    if (not previous_raw_value) and current_display_value:
+        previous_raw_value = current_display_value
+
+    raw_to_display = {raw: _editor_translate_display_text(raw) for raw in raw_values}
+    display_to_raw = {}
+    for raw, display in raw_to_display.items():
+        display_to_raw.setdefault(display, raw)
+    if var_key:
+        _EDITOR_TRANSLATION_COMBOBOX_VARS[var_key] = {
+            "raw_to_display": raw_to_display,
+            "display_to_raw": display_to_raw,
+            "current_raw": previous_raw_value,
+        }
+
+    translated_values = tuple(raw_to_display.get(raw, raw) for raw in raw_values)
+    raw_configure = _EDITOR_TRANSLATION_RAW_WIDGET_CONFIGURE.get(ttk.Combobox)
+    try:
+        if callable(raw_configure):
+            raw_configure(widget, values=translated_values)
+        else:
+            widget.configure(values=translated_values)
+    except Exception:
+        try:
+            widget.configure(values=translated_values)
+        except Exception:
+            pass
+
+    if not var_key:
+        return
+    if var is None:
+        return
+    raw_value = previous_raw_value or _editor_current_combobox_raw_value(var_key)
+    combo_state = _EDITOR_TRANSLATION_COMBOBOX_VARS.get(var_key)
+    if isinstance(combo_state, dict):
+        combo_state["current_raw"] = raw_value
+    display_value = raw_to_display.get(raw_value, _editor_translate_display_text(raw_value))
+    try:
+        _EDITOR_TRANSLATION_RAW_STRINGVAR_SET(var, display_value)
+    except Exception:
+        pass
+
+
+def _editor_refresh_widget_textvariable(widget) -> None:
+    if not isinstance(widget, (tk.Label, ttk.Label, tk.Button, ttk.Button, tk.Checkbutton, ttk.Checkbutton, tk.Radiobutton, ttk.Radiobutton)):
+        return
+    try:
+        var_name = str(widget.cget("textvariable") or "").strip()
+    except Exception:
+        var_name = ""
+    if not var_name:
+        return
+    var = _editor_lookup_stringvar(var_name)
+    if var is not None:
+        _editor_register_stringvar(var)
+
+
+def _editor_refresh_notebook_texts(notebook) -> None:
+    if not isinstance(notebook, ttk.Notebook):
+        return
+    state = _editor_translation_widget_state(notebook)
+    tabs_state = state.setdefault("tabs", {})
+    for tab_id in notebook.tabs():
+        tab_key = str(tab_id)
+        if tab_key not in tabs_state:
+            try:
+                tabs_state[tab_key] = str(notebook.tab(tab_id, "text") or "")
+            except Exception:
+                tabs_state[tab_key] = ""
+        raw_text = str(tabs_state.get(tab_key) or "")
+        if not raw_text:
+            continue
+        try:
+            notebook.tab(tab_id, text=_editor_translate_display_text(raw_text))
+        except Exception:
+            pass
+
+
+def _editor_refresh_treeview_headings(tree) -> None:
+    if not isinstance(tree, ttk.Treeview):
+        return
+    state = _editor_translation_widget_state(tree)
+    heading_state = state.setdefault("headings", {})
+    columns = ["#0"]
+    try:
+        columns.extend(list(tree.cget("columns") or ()))
+    except Exception:
+        pass
+    for column in columns:
+        col_id = str(column or "")
+        if not col_id:
+            continue
+        if col_id not in heading_state:
+            try:
+                heading_state[col_id] = str(tree.heading(col_id, option="text") or "")
+            except Exception:
+                heading_state[col_id] = ""
+        raw_text = str(heading_state.get(col_id) or "")
+        if not raw_text:
+            continue
+        try:
+            tree.heading(col_id, text=_editor_translate_display_text(raw_text))
+        except Exception:
+            pass
+
+
+def _editor_refresh_treeview_rows(tree) -> None:
+    if not isinstance(tree, ttk.Treeview):
+        return
+    state = _editor_translation_widget_state(tree)
+    item_state = state.setdefault("items", {})
+    for iid, raw_values in list(item_state.items()):
+        iid_text = str(iid or "")
+        if not iid_text:
+            continue
+        try:
+            if not bool(tree.exists(iid_text)):
+                item_state.pop(iid_text, None)
+                continue
+        except Exception:
+            continue
+        translated_values = tuple(_editor_translate_display_text(value) for value in _editor_values_to_string_list(raw_values))
+        try:
+            _EDITOR_TRANSLATION_RAW_TREEVIEW_ITEM(tree, iid_text, values=translated_values)
+        except Exception:
+            try:
+                tree.item(iid_text, values=translated_values)
+            except Exception:
+                pass
+
+
+def _editor_apply_language_to_widget_tree(widget) -> None:
+    if widget is None:
+        return
+    try:
+        if not bool(widget.winfo_exists()):
+            return
+    except Exception:
+        return
+
+    try:
+        if isinstance(widget, (tk.Tk, tk.Toplevel)):
+            raw_title = _editor_get_widget_title(widget)
+            if raw_title:
+                _editor_apply_window_title(widget, raw_title)
+    except Exception:
+        pass
+
+    _editor_refresh_widget_textvariable(widget)
+    _editor_apply_widget_text(widget)
+    _editor_refresh_combobox(widget)
+    _editor_refresh_notebook_texts(widget)
+    _editor_refresh_treeview_headings(widget)
+    _editor_refresh_treeview_rows(widget)
+
+    try:
+        children = list(widget.winfo_children() or [])
+    except Exception:
+        children = []
+    for child in children:
+        _editor_apply_language_to_widget_tree(child)
+
+
+def _editor_apply_language_to_all_windows(root=None) -> None:
+    windows = []
+    if root is not None:
+        windows.append(root)
+    try:
+        windows.extend(list(_EDITOR_TRANSLATION_WINDOWS))
+    except Exception:
+        pass
+    seen = set()
+    for window in windows:
+        try:
+            key = str(window)
+        except Exception:
+            key = str(id(window))
+        if key in seen:
+            continue
+        seen.add(key)
+        _editor_apply_language_to_widget_tree(window)
+
+    try:
+        for var_name, raw in list(_EDITOR_TRANSLATION_REGISTERED_TEXTVARS.items()):
+            var = _editor_lookup_stringvar(var_name)
+            if var is None:
+                continue
+            _EDITOR_TRANSLATION_RAW_STRINGVAR_SET(var, _editor_translate_display_text(raw))
+    except Exception:
+        pass
+
+    try:
+        if _APP_STATUS_VAR is not None:
+            _APP_STATUS_VAR.set(_editor_translate_display_text(_APP_STATUS_RAW_TEXT))
+    except Exception:
+        pass
+
+
+def _editor_apply_language(
+    root=None,
+    *,
+    language: Any = None,
+    allow_download: bool = True,
+    force_reload: bool = False,
+) -> Dict[str, Any]:
+    lang = _editor_normalize_language_code(language if language is not None else _editor_get_language_preference())
+    catalog = _editor_translation_load_catalog(lang, force_reload=force_reload, allow_download=allow_download)
+    try:
+        with _EDITOR_TRANSLATION_LOCK:
+            _EDITOR_TRANSLATION_STATE.update(catalog)
+    except Exception:
+        _EDITOR_TRANSLATION_STATE.update(catalog)
+    _editor_apply_language_to_all_windows(root=root)
+    return _editor_translation_get_state()
+
+
+def _editor_translation_status_message() -> str:
+    state = _editor_translation_get_state()
+    requested = _editor_normalize_language_code(state.get("requested_language"))
+    resolved = _editor_normalize_language_code(state.get("resolved_language"))
+    source = str(state.get("source") or "builtin")
+    error = str(state.get("error") or "")
+    github_base = str(_EDITOR_TRANSLATION_REMOTE_BASE_URL or "").strip().lower()
+    if requested == _EDITOR_TRANSLATION_DEFAULT_LANGUAGE:
+        return "Using built-in English editor text."
+    if resolved == requested and source != "builtin":
+        source_lower = source.lower()
+        if github_base and source_lower.startswith(github_base):
+            return "Editor translation downloaded from GitHub app/translations."
+        if source_lower.startswith("cache:"):
+            return "Editor translation loaded from cached download."
+        if source_lower.startswith("local:"):
+            return "Editor translation loaded from local file."
+        return f"Editor translation loaded from {source}."
+    if error:
+        return f"Translation for {requested} was not found. Using English."
+    return f"Translation for {requested} is using English fallback."
+
+
+def _editor_translation_wrap_messagebox(raw_fn):
+    def _wrapped(title=None, message=None, **options):
+        translated_options = dict(options or {})
+        if "detail" in translated_options:
+            translated_options["detail"] = _editor_translate_display_text(translated_options.get("detail"))
+        return raw_fn(
+            _editor_translate_display_text("" if title is None else str(title)),
+            _editor_translate_display_text("" if message is None else str(message)),
+            **translated_options,
+        )
+    return _wrapped
+
+
+def _editor_translation_patch_widget_class(widget_cls) -> None:
+    if widget_cls in _EDITOR_TRANSLATION_PATCHED_CLASSES:
+        return
+    raw_configure = widget_cls.configure
+    _EDITOR_TRANSLATION_RAW_WIDGET_CONFIGURE[widget_cls] = raw_configure
+
+    def _configure(self, cnf=None, **kw):
+        if (cnf is None) and (not kw):
+            return raw_configure(self)
+        if isinstance(cnf, str) and (not kw):
+            return raw_configure(self, cnf)
+
+        payload = {}
+        mode = "kwargs"
+        if isinstance(cnf, dict):
+            payload.update(cnf)
+            payload.update(kw)
+            mode = "dict"
+        elif cnf is None:
+            payload.update(kw)
+        else:
+            return raw_configure(self, cnf, **kw)
+
+        is_combobox = isinstance(self, ttk.Combobox)
+        if "text" in payload:
+            _editor_store_widget_text(self, payload.get("text"))
+            payload["text"] = _editor_translate_display_text(payload.get("text"))
+        if is_combobox and ("values" in payload):
+            state = _editor_translation_widget_state(self)
+            state["combobox_values_raw"] = _editor_values_to_string_list(payload.get("values"))
+            payload["values"] = tuple(_editor_translate_display_text(value) for value in state.get("combobox_values_raw", ()))
+        if is_combobox and ("textvariable" in payload):
+            state = _editor_translation_widget_state(self)
+            state["combobox_var"] = _editor_combobox_var_key(payload.get("textvariable"))
+        if "textvariable" in payload:
+            result = raw_configure(self, payload) if mode == "dict" else raw_configure(self, **payload)
+            try:
+                if is_combobox:
+                    _editor_refresh_combobox(self)
+                else:
+                    _editor_register_stringvar(payload.get("textvariable"))
+            except Exception:
+                pass
+            return result
+        result = raw_configure(self, payload) if mode == "dict" else raw_configure(self, **payload)
+        if is_combobox and ("values" in payload):
+            try:
+                _editor_refresh_combobox(self)
+            except Exception:
+                pass
+        return result
+
+    widget_cls.configure = _configure
+    widget_cls.config = _configure
+    _EDITOR_TRANSLATION_PATCHED_CLASSES.add(widget_cls)
+
+
+def _editor_translation_install_hooks() -> None:
+    global _EDITOR_TRANSLATION_HOOKS_INSTALLED
+    if _EDITOR_TRANSLATION_HOOKS_INSTALLED:
+        return
+
+    for widget_cls in (
+        tk.Label,
+        ttk.Label,
+        tk.Button,
+        ttk.Button,
+        tk.Checkbutton,
+        ttk.Checkbutton,
+        tk.Radiobutton,
+        ttk.Radiobutton,
+        tk.LabelFrame,
+        ttk.LabelFrame,
+        ttk.Combobox,
+    ):
+        try:
+            _editor_translation_patch_widget_class(widget_cls)
+        except Exception:
+            pass
+
+    def _stringvar_init(self, *args, **kwargs):
+        _EDITOR_TRANSLATION_RAW_STRINGVAR_INIT(self, *args, **kwargs)
+        try:
+            _EDITOR_TRANSLATION_STRINGVARS_BY_NAME[str(self._name)] = self
+        except Exception:
+            pass
+
+    def _stringvar_set(self, value):
+        try:
+            var_key = str(self._name or "").strip()
+        except Exception:
+            var_key = str(self or "").strip()
+        combo_state = _EDITOR_TRANSLATION_COMBOBOX_VARS.get(var_key)
+        if isinstance(combo_state, dict) and combo_state:
+            raw_value = "" if value is None else str(value)
+            reverse = combo_state.get("display_to_raw") if isinstance(combo_state.get("display_to_raw"), dict) else {}
+            forward = combo_state.get("raw_to_display") if isinstance(combo_state.get("raw_to_display"), dict) else {}
+            canonical = str(reverse.get(raw_value, raw_value) or "")
+            combo_state["current_raw"] = canonical
+            value = forward.get(canonical, _editor_translate_display_text(canonical))
+            return _EDITOR_TRANSLATION_RAW_STRINGVAR_SET(self, value)
+        if var_key and (var_key in _EDITOR_TRANSLATION_REGISTERED_TEXTVARS):
+            raw = "" if value is None else str(value)
+            _EDITOR_TRANSLATION_REGISTERED_TEXTVARS[var_key] = raw
+            value = _editor_translate_display_text(raw)
+        return _EDITOR_TRANSLATION_RAW_STRINGVAR_SET(self, value)
+
+    def _stringvar_get(self):
+        value = _EDITOR_TRANSLATION_RAW_STRINGVAR_GET(self)
+        try:
+            var_key = str(self._name or "").strip()
+        except Exception:
+            var_key = str(self or "").strip()
+        combo_state = _EDITOR_TRANSLATION_COMBOBOX_VARS.get(var_key)
+        if isinstance(combo_state, dict) and combo_state:
+            reverse = combo_state.get("display_to_raw") if isinstance(combo_state.get("display_to_raw"), dict) else {}
+            return reverse.get(value, value)
+        return value
+
+    def _wrap_window_title(raw_fn):
+        def _title(self, *args):
+            if not args:
+                return raw_fn(self)
+            raw_title = "" if args[0] is None else str(args[0])
+            _editor_store_widget_title(self, raw_title)
+            return raw_fn(self, _editor_translate_display_text(raw_title))
+        return _title
+
+    def _treeview_heading(self, column, option=None, **kw):
+        if (option is None) and (not kw):
+            return _EDITOR_TRANSLATION_RAW_TREEVIEW_HEADING(self, column)
+        if (option is not None) and (not kw):
+            return _EDITOR_TRANSLATION_RAW_TREEVIEW_HEADING(self, column, option=option)
+        payload = dict(kw or {})
+        if "text" in payload:
+            state = _editor_translation_widget_state(self)
+            heading_state = state.setdefault("headings", {})
+            heading_state[str(column or "")] = str(payload.get("text") or "")
+            payload["text"] = _editor_translate_display_text(payload.get("text"))
+        if option is None:
+            return _EDITOR_TRANSLATION_RAW_TREEVIEW_HEADING(self, column, **payload)
+        return _EDITOR_TRANSLATION_RAW_TREEVIEW_HEADING(self, column, option=option, **payload)
+
+    def _treeview_insert(self, parent, index, iid=None, **kw):
+        payload = dict(kw or {})
+        raw_values = None
+        if "values" in payload:
+            raw_values = _editor_values_to_string_list(payload.get("values"))
+            payload["values"] = tuple(_editor_translate_display_text(value) for value in raw_values)
+        inserted = _EDITOR_TRANSLATION_RAW_TREEVIEW_INSERT(self, parent, index, iid=iid, **payload)
+        if raw_values is not None:
+            state = _editor_translation_widget_state(self)
+            item_state = state.setdefault("items", {})
+            item_state[str(inserted)] = list(raw_values)
+        return inserted
+
+    def _treeview_item(self, item, option=None, **kw):
+        if (option is None) and (not kw):
+            return _EDITOR_TRANSLATION_RAW_TREEVIEW_ITEM(self, item)
+        if (option is not None) and (not kw):
+            return _EDITOR_TRANSLATION_RAW_TREEVIEW_ITEM(self, item, option)
+        payload = dict(kw or {})
+        if "values" in payload:
+            raw_values = _editor_values_to_string_list(payload.get("values"))
+            state = _editor_translation_widget_state(self)
+            item_state = state.setdefault("items", {})
+            item_state[str(item)] = list(raw_values)
+            payload["values"] = tuple(_editor_translate_display_text(value) for value in raw_values)
+        if option is None:
+            return _EDITOR_TRANSLATION_RAW_TREEVIEW_ITEM(self, item, **payload)
+        return _EDITOR_TRANSLATION_RAW_TREEVIEW_ITEM(self, item, option, **payload)
+
+    def _toplevel_init(self, *args, **kwargs):
+        _EDITOR_TRANSLATION_RAW_TOPLEVEL_INIT(self, *args, **kwargs)
+        _editor_register_window(self)
+        try:
+            self.after_idle(lambda w=self: _editor_apply_language_to_widget_tree(w))
+        except Exception:
+            pass
+
+    tk.StringVar.__init__ = _stringvar_init
+    tk.StringVar.set = _stringvar_set
+    tk.StringVar.get = _stringvar_get
+    tk.Tk.title = _wrap_window_title(_EDITOR_TRANSLATION_RAW_TK_TITLE)
+    tk.Toplevel.title = _wrap_window_title(_EDITOR_TRANSLATION_RAW_TOPLEVEL_TITLE)
+    tk.Toplevel.__init__ = _toplevel_init
+    ttk.Treeview.heading = _treeview_heading
+    ttk.Treeview.insert = _treeview_insert
+    ttk.Treeview.item = _treeview_item
+
+    messagebox.showinfo = _editor_translation_wrap_messagebox(messagebox.showinfo)
+    messagebox.showwarning = _editor_translation_wrap_messagebox(messagebox.showwarning)
+    messagebox.showerror = _editor_translation_wrap_messagebox(messagebox.showerror)
+    messagebox.askyesno = _editor_translation_wrap_messagebox(messagebox.askyesno)
+
+    _EDITOR_TRANSLATION_HOOKS_INSTALLED = True
+
+# END SECTION: Editor Translation Overlay
+
+# Shared text/network helpers
+def _normalize_text_artifacts(value: Any) -> str:
+    """Normalize common mojibake and escaped-text artifacts from remote or cached sources."""
     if value is None:
         return ""
     if isinstance(value, bytes):
@@ -7390,16 +11111,14 @@ def _mr_normalize_mojibake_text(value: Any) -> str:
         t = str(txt or "")
         t = t.replace("â€”", " - ")
         t = t.replace("â€“", " - ")
-        t = t.replace("\u00e2\u0080\u0094", " - ")
-        t = t.replace("\u00e2\u0080\u0093", " - ")
+        t = t.replace("â", " - ")
+        t = t.replace("â", " - ")
         t = t.replace("—", " - ")
         t = t.replace("–", " - ")
         t = t.replace("â€˜", "'").replace("â€™", "'")
-        t = t.replace("â€œ", "\"").replace("â€�", "\"")
+        t = t.replace("â€œ", '"').replace("â€�", '"')
         t = t.replace("Ã—", "x")
-        # Some locales render the mojibake dash artifact as standalone "à".
         t = re.sub(r"(?<=[A-Za-z0-9])\s+à\s+(?=[A-Za-z0-9])", " - ", t)
-        # Another common artifact is a literal '?' replacing a dash between words.
         t = re.sub(r"(?<=[A-Za-z0-9])\?(?=[A-Za-z0-9])", " - ", t)
         t = re.sub(r"\s+", " ", t).strip()
         return t
@@ -7421,184 +11140,12 @@ def _mr_normalize_mojibake_text(value: Any) -> str:
 
     return min(polished, key=_score)
 
-def _mr_log(msg: str) -> None:
-    return
 
-def _mr_log_exc(context: str) -> None:
-    return
-
-# Build region list from the editor's season config so it stays in sync.
-_MR_REGION_LIST = BASE_MAPS + [(code, REGION_NAME_MAP.get(code, code)) for code, _ in SEASON_CODE_LABELS]
-_MR_REGION_ORDER = [r for r, _ in _MR_REGION_LIST]
-_MR_REGION_LOOKUP = dict(_MR_REGION_LIST)
-_MR_CATEGORY_PRIORITY = ["_CONTRACTS", "_TASKS", "_CONTESTS"]
-_MR_TYPE_PRIORITY = ["truckDelivery", "cargoDelivery", "exploration"]
-_MR_ALLOWED_CATEGORIES = set(_MR_CATEGORY_PRIORITY)
-
-def _mr_store_in_memory(name: str, data: bytes, url: Optional[str] = None) -> None:
-    if not name or data is None:
-        return
-    _MR_IN_MEM_FILES[name] = data
-    if url:
-        _MR_IN_MEM_META[name] = {"url": url}
-
-def _mr_get_file_bytes_or_mem(name: str) -> Optional[bytes]:
-    if name in _MR_IN_MEM_FILES:
-        return _MR_IN_MEM_FILES[name]
-    try:
-        if os.path.exists(name) and os.path.isfile(name):
-            with open(name, "rb") as f:
-                return f.read()
-    except Exception:
-        pass
-    try:
-        base = os.path.basename(name)
-        if base in _MR_IN_MEM_FILES:
-            return _MR_IN_MEM_FILES[base]
-        if os.path.exists(base) and os.path.isfile(base):
-            with open(base, "rb") as f:
-                return f.read()
-    except Exception:
-        pass
-    return None
-
-def _mr_extract_js_string_literal(text: str, start_idx: int) -> Optional[str]:
-    """Extract a JS string literal starting at the given quote index."""
-    if start_idx >= len(text):
-        return None
-    quote = text[start_idx]
-    if quote not in ("'", '"'):
-        return None
-    k = start_idx + 1
-    escaped = False
-    out = []
-    while k < len(text):
-        ch = text[k]
-        if escaped:
-            out.append(ch)
-            escaped = False
-            k += 1
-            continue
-        if ch == "\\":
-            escaped = True
-            k += 1
-            continue
-        if ch == quote:
-            return "".join(out)
-        out.append(ch)
-        k += 1
-    return None
-
-def _mr_parse_localization_from_desc_text(txt: str) -> Dict[str, str]:
-    """Parse localization entries from MapRunner desc.js text."""
-    result: Dict[str, str] = {}
-    if not txt:
-        return result
-    if not isinstance(txt, str):
-        try:
-            txt = _mr_decode_bytes_to_text(txt) or ""
-        except Exception:
-            try:
-                txt = txt.decode("utf-8", errors="replace")
-            except Exception:
-                txt = str(txt)
-    if not txt:
-        return result
-
-    # Fast-path: if there's no localization marker, skip heavy parsing.
-    if ("s:\"" not in txt) and ("s:'" not in txt) and ("s :" not in txt):
-        return result
-
-    # Regex pass: capture KEY:{...s:"..."} with quoted or bare keys.
-    pattern = re.compile(
-        r'(?:\"([^\"]+)\"|([A-Za-z0-9_\\-]+))\s*:\s*\{.*?s\s*:\s*(?:\"((?:\\.|[^\"\\])*)\"|\'((?:\\.|[^\'\\])*)\')',
-        re.DOTALL
-    )
-    for match in pattern.finditer(txt):
-        key = match.group(1) or match.group(2)
-        val = match.group(3) or match.group(4) or ""
-        if not key:
-            continue
-        try:
-            val = codecs.decode(val.replace(r"\/", "/"), "unicode_escape")
-        except Exception:
-            pass
-        result[key] = (val or "").strip()
-
-    # If regex didn't capture enough, fall back to a fast windowed scan.
-    if len(result) < 200:
-        key_re = re.compile(r'([A-Za-z0-9_\\-]+)\s*:\s*\{')
-        for m in key_re.finditer(txt):
-            key = m.group(1)
-            if not key or key in result:
-                continue
-            start = m.end()
-            window_end = min(len(txt), start + 600)
-            segment = txt[start:window_end]
-            sm = re.search(r's\s*:\s*(\"|\')', segment)
-            if not sm:
-                continue
-            quote_idx = start + sm.start(1)
-            val = _mr_extract_js_string_literal(txt, quote_idx)
-            if val is None:
-                continue
-            try:
-                val = codecs.decode(val.replace(r"\/", "/"), "unicode_escape")
-            except Exception:
-                pass
-            result[key] = (val or "").strip()
-
-    return result
-
-def _mr_decode_bytes_to_text(bs: Optional[bytes]) -> Optional[str]:
-    if bs is None:
-        return None
-    if isinstance(bs, str):
-        return bs
-    # Detect compressed payloads by magic bytes (in case headers are missing)
-    try:
-        if bs[:2] == b"\x1f\x8b":
-            try:
-                bs = gzip.decompress(bs)
-            except Exception:
-                pass
-        elif bs[:2] in (b"\x78\x01", b"\x78\x9c", b"\x78\xda"):
-            try:
-                bs = zlib.decompress(bs)
-            except Exception:
-                pass
-    except Exception:
-        pass
-    try:
-        return bs.decode("utf-8")
-    except Exception:
-        pass
-    try:
-        import brotli  # type: ignore
-        try:
-            out = brotli.decompress(bs)
-            return out.decode("utf-8", errors="replace")
-        except Exception:
-            pass
-    except Exception:
-        pass
-    for enc in ("utf-8", "latin-1", "windows-1252", "iso-8859-1"):
-        try:
-            return bs.decode(enc, errors="replace")
-        except Exception:
-            continue
-    try:
-        return str(bs)
-    except Exception:
-        return None
-
-def _mr_http_get(url: str, timeout: int = 15, range_bytes: Optional[tuple] = None):
+def _http_get_bytes(url: str, timeout: int = 15, range_bytes: Optional[tuple] = None):
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "*/*",
         "Accept-Encoding": "identity",
-        "Referer": "https://www.maprunner.info/",
-        "Origin": "https://www.maprunner.info",
         "Accept-Language": "en-US,en;q=0.9",
     }
     if range_bytes is not None:
@@ -7608,16 +11155,14 @@ def _mr_http_get(url: str, timeout: int = 15, range_bytes: Optional[tuple] = Non
         except Exception:
             pass
     req = urllib.request.Request(url, headers=headers)
+
     def _open_with_ctx(ctx=None):
         if ctx is None:
             return urllib.request.urlopen(req, timeout=timeout)
         return urllib.request.urlopen(req, timeout=timeout, context=ctx)
 
-    try:
-        with _open_with_ctx() as resp:
-            data = resp.read()
-            headers = {k.lower(): v for k, v in resp.headers.items()}
-        enc = (headers.get("content-encoding") or "").lower()
+    def _decode_payload(data: bytes, resp_headers: Dict[str, str]) -> bytes:
+        enc = (resp_headers.get("content-encoding") or "").lower()
         if enc == "gzip":
             try:
                 data = gzip.decompress(data)
@@ -7634,10 +11179,14 @@ def _mr_http_get(url: str, timeout: int = 15, range_bytes: Optional[tuple] = Non
                 data = brotli.decompress(data)
             except Exception:
                 pass
-        return data, headers
+        return data
+
+    try:
+        with _open_with_ctx() as resp:
+            data = resp.read()
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+        return _decode_payload(data, resp_headers), resp_headers
     except Exception as e:
-        # Retry with unverified TLS only if certificate validation fails
-        # (best-effort to avoid total feature failure in constrained setups).
         if isinstance(e, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(e):
             try:
                 ctx = ssl.create_default_context()
@@ -7645,1541 +11194,63 @@ def _mr_http_get(url: str, timeout: int = 15, range_bytes: Optional[tuple] = Non
                 ctx.verify_mode = ssl.CERT_NONE
                 with _open_with_ctx(ctx) as resp:
                     data = resp.read()
-                    headers = {k.lower(): v for k, v in resp.headers.items()}
-                enc = (headers.get("content-encoding") or "").lower()
-                if enc == "gzip":
-                    try:
-                        data = gzip.decompress(data)
-                    except Exception:
-                        pass
-                elif enc == "deflate":
-                    try:
-                        data = zlib.decompress(data)
-                    except Exception:
-                        pass
-                elif enc == "br":
-                    try:
-                        import brotli  # type: ignore
-                        data = brotli.decompress(data)
-                    except Exception:
-                        pass
-                return data, headers
-            except Exception:
-                pass
-        if _MR_DEBUG:
-            try:
-                _mr_log(f"_mr_http_get failed for {url}: {e}")
+                    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+                return _decode_payload(data, resp_headers), resp_headers
             except Exception:
                 pass
         raise
 
-def _mr_looks_like_js_response(headers: Dict[str, str], url: str) -> bool:
-    ctype = (headers.get("content-type") or "").lower()
-    return ("javascript" in ctype) or ("/mr/" in url) or url.endswith(".js")
 
-def _mr_probe_js_head(url: str, max_bytes: int = 16384) -> str:
-    """Fetch a small prefix of a JS file to detect its signature."""
-    try:
-        data, headers = _mr_http_get(url, timeout=15, range_bytes=(0, max_bytes - 1))
-        txt = _mr_decode_bytes_to_text(data) or ""
-        return txt
-    except Exception:
-        return ""
-
-def _mr_head_has_data_signature(head: str) -> bool:
-    if not head:
-        return False
-    h = head.lstrip()
-    if h.startswith(_MR_DATA_SIGNATURE):
-        return True
-    return ("const _=JSON.parse" in h) and ("RU_02_01_SERVHUB_GAS" in h)
-
-def _mr_head_has_desc_signature(head: str) -> bool:
-    if not head:
-        return False
-    h = head.lstrip()
-    if h.startswith(_MR_DESC_SIGNATURE):
-        return True
-    return ("const t={" in h) and ("UI_TRUCK_TYPE_HEAVY_DUTY" in h) and ("HEAVY DUTY" in h)
-
-def _mr_find_precise_js_from_urls(urls: List[str], head_bytes: int = 65536) -> Dict[str, bool]:
-    """Scan URLs by head signature to find the data/desc JS regardless of filename."""
-    found = {"data": False, "desc": False}
-    for url in urls:
-        head = _mr_probe_js_head(url, max_bytes=head_bytes)
-        if not head:
-            continue
-        if (not found["data"]) and _mr_head_has_data_signature(head):
-            try:
-                data, headers = _mr_http_get(url, timeout=20)
-                _mr_store_in_memory(_MR_CANONICAL_NAMES["data"], data, url)
-                found["data"] = True
-                if _MR_DEBUG:
-                    _mr_log(f"precise_js: data={os.path.basename(urlparse(url).path)} url={url}")
-            except Exception:
-                pass
-        if (not found["desc"]) and _mr_head_has_desc_signature(head):
-            try:
-                data, headers = _mr_http_get(url, timeout=20)
-                _mr_store_in_memory(_MR_CANONICAL_NAMES["desc"], data, url)
-                found["desc"] = True
-                if _MR_DEBUG:
-                    _mr_log(f"precise_js: desc={os.path.basename(urlparse(url).path)} url={url}")
-            except Exception:
-                pass
-        if found["data"] and found["desc"]:
-            break
-    return found
-
-def _mr_score_data_js(text: str) -> int:
-    if not text:
-        return 0
-    tl = text.lower()
-    if "json.parse" not in tl:
-        return 0
-    score = 0
-    if '"category"' in tl:
-        score += 10
-    if '"objectives"' in tl:
-        score += 8
-    if '"rewards"' in tl:
-        score += 8
-    if '"key"' in tl:
-        score += 10
-    if "_contracts" in tl or "_tasks" in tl or "_contests" in tl:
-        score += 12
-    if '"truckdelivery"' in tl or '"cargodelivery"' in tl or '"exploration"' in tl:
-        score += 6
-    score += min(len(text) // 5000, 20)
-    score += min(tl.count('"category"'), 30)
-    score += min(tl.count('"key"'), 30)
-    return score
-
-def _mr_score_desc_js(text: str) -> int:
-    if not text:
-        return 0
-    # Require localization-style entries (s:"...") to avoid false positives
-    if not re.search(r'\bs\s*:\s*(?:"|\')', text):
-        return 0
-    score = 0
-    if "UI_" in text:
-        score += min(text.count("UI_"), 50)
-    if re.search(r'\bs\s*:\s*(?:"|\')', text):
-        score += 10
-    if "_NAME" in text or "_DESC" in text:
-        score += 6
-    score += min(len(text) // 5000, 20)
-    return score
-
-def _mr_choose_best_js_roles() -> None:
-    best_data = (0, None, False)
-    best_desc = (0, None, False)
-    for name, bs in _MR_IN_MEM_FILES.items():
-        if not name.lower().endswith(".js"):
-            continue
-        text = _mr_decode_bytes_to_text(bs)
-        if not text:
-            continue
-        data_score = _mr_score_data_js(text)
-        desc_score = _mr_score_desc_js(text)
-        meta_url = _MR_IN_MEM_META.get(name, {}).get("url", "")
-        is_mr = ("maprunner.info" in meta_url) or ("/mr/" in meta_url)
-        if is_mr:
-            data_score += 3
-            desc_score += 3
-        else:
-            # Strongly downrank non-MapRunner JS (ads, analytics)
-            data_score = max(0, data_score - 50)
-            desc_score = max(0, desc_score - 50)
-        if data_score > best_data[0]:
-            best_data = (data_score, name, is_mr)
-        if desc_score > best_desc[0]:
-            best_desc = (desc_score, name, is_mr)
-    if best_data[1]:
-        _mr_store_in_memory(_MR_CANONICAL_NAMES["data"], _MR_IN_MEM_FILES[best_data[1]])
-        if _MR_DEBUG:
-            try:
-                _mr_log(f"choose_best: data={best_data[1]} score={best_data[0]} url={_MR_IN_MEM_META.get(best_data[1],{}).get('url','')}")
-            except Exception:
-                pass
-    # Prefer desc from MapRunner domain; if not, fall back to the data file
-    desc_name = None
-    if best_desc[1] and best_desc[2]:
-        desc_name = best_desc[1]
-    elif best_data[1]:
-        desc_name = best_data[1]
-    if desc_name:
-        _mr_store_in_memory(_MR_CANONICAL_NAMES["desc"], _MR_IN_MEM_FILES[desc_name])
-        if _MR_DEBUG:
-            try:
-                _mr_log(f"choose_best: desc={desc_name} score={best_desc[0]} url={_MR_IN_MEM_META.get(desc_name,{}).get('url','')}")
-            except Exception:
-                pass
-
-def _mr_expand_chunks_from_bundle() -> None:
+def _load_objectives_rows(allow_refresh: bool = True) -> List[Dict[str, Any]]:
     """
-    If we only have the main bundle, try downloading its dynamic chunks directly
-    (from the same CDN base) and rescore to find the data/desc JS.
+    Objectives loader with source priority:
+      - local initial.pak
+      - public fallback package
     """
-    if _MR_DEBUG:
-        _mr_log("expand_chunks: start")
-    # Pick a bundle that actually contains chunk references.
-    primary = None
-    primary_url = None
-    primary_text = None
-    chunk_names: List[str] = []
-    max_chunks = 0
     try:
-        for name, bs in _MR_IN_MEM_FILES.items():
-            url = _MR_IN_MEM_META.get(name, {}).get("url", "")
-            if "/mr/" not in url or not name.lower().endswith(".js"):
-                continue
-            try:
-                text = _mr_decode_bytes_to_text(bs) or ""
-            except Exception:
-                continue
-            names = sorted(set(re.findall(r'\./([A-Za-z0-9_-]+\.js)', text)))
-            if len(names) > max_chunks:
-                max_chunks = len(names)
-                primary = name
-                primary_url = url
-                chunk_names = names
-                primary_text = text
-    except Exception:
-        pass
+        source_info = _objectives_get_preferred_source(
+            force_reload=bool(allow_refresh),
+            language=_objectives_get_language_preference(),
+            allow_download=True,
+        )
+    except Exception as e:
+        source_info = {"rows": [], "error": str(e)}
+    source_rows = source_info.get("rows") if isinstance(source_info, dict) else []
+    if isinstance(source_rows, list) and source_rows:
+        source_kind = str(source_info.get("kind") or "fallback").strip().lower()
+        lang = str(source_info.get("language") or "")
+        path = str(source_info.get("path") or "")
+        msg = (
+            f"Loaded {len(source_rows)} objectives from initial.pak"
+            if source_kind == "local"
+            else f"Loaded {len(source_rows)} objectives from fallback package"
+        )
+        _set_objectives_source_info(
+            kind=source_kind,
+            message=msg,
+            path=path,
+            language=lang,
+            row_count=len(source_rows),
+        )
+        return [dict(row) for row in source_rows if isinstance(row, dict)]
+    if isinstance(source_info, dict):
+        source_error = str(source_info.get("error") or "").strip()
+        if source_error:
+            log(f"Objectives+ source unavailable: {source_error}")
 
-    if not primary or not primary_url or not chunk_names:
-        if _MR_DEBUG:
-            _mr_log("expand_chunks: no chunk names found")
-        return
-
-    base_url = primary_url.rsplit("/", 1)[0] + "/"
-    if _MR_DEBUG:
-        _mr_log(f"expand_chunks: primary={primary} chunks={len(chunk_names)} base={base_url}")
-        _mr_log(f"expand_chunks: first_chunks={chunk_names[:8]}")
-
-    # First, try precise signature-based detection using chunk URLs.
-    try:
-        urls = [base_url + ch for ch in chunk_names]
-        sig_found = _mr_find_precise_js_from_urls(urls, head_bytes=65536)
-        if _MR_DEBUG:
-            _mr_log(f"expand_chunks: precise_found data={sig_found.get('data')} desc={sig_found.get('desc')}")
-    except Exception:
-        sig_found = {"data": False, "desc": False}
-
-    # Extract locale chunk mapping from the primary bundle to prioritize English locales.
-    english_locale_chunks: List[str] = []
-    if primary_text:
-        try:
-            pattern = re.compile(r'key:\"(locale_[^\"]+)\"[^\\n]*?import\\(\"\\.\\/([A-Za-z0-9_-]+\\.js)\"\\)')
-            locale_items = pattern.findall(primary_text)
-            if locale_items:
-                english_locale_chunks = sorted({
-                    chunk for key, chunk in locale_items
-                    if key.startswith("locale_en_") or "english" in key
-                })
-        except Exception:
-            english_locale_chunks = []
-
-    # Probe all chunks lightly to find localization candidates.
-    loc_candidates: List[tuple] = []
-    data_candidates: List[str] = []
-    desc_candidates: List[str] = []
-    for ch in chunk_names:
-        url = base_url + ch
-        head = _mr_probe_js_head(url)
-        if not head:
-            continue
-        if ("JSON.parse" in head) and ("const" in head):
-            data_candidates.append(ch)
-        if ("_DESC_DESC" in head) or ("_DESC\"" in head) or ("_DESC'" in head):
-            desc_candidates.append(ch)
-        if ("s:\"" in head) or ("s:'" in head) or ("const t=" in head) or ("const t={" in head):
-            score = _mr_text_english_score(head)
-            try:
-                low = head.lower()
-                for w in _MR_FORBIDDEN_LANG_WORDS:
-                    if w in low:
-                        score -= 5.0
-                if _MR_CYRILLIC_RE.search(head):
-                    score -= 8.0
-            except Exception:
-                pass
-            loc_candidates.append((score, ch))
-        # Limit probe list to a reasonable size
-        if len(loc_candidates) >= 120 and len(data_candidates) >= 3:
-            break
-
-    # Download chunks; aim to capture enough English localization coverage.
-    best_data_score = 0
-    best_desc_score = 0
-    english_entries = 0
-    english_chunks = 0
-    best_loc_name = None
-    best_loc_avg = -999.0
-    best_loc_count = 0
-    downloaded = 0
-    ok = 0
-    fail = 0
-
-    # Prioritize localization + description candidates (likely contain strings)
-    try:
-        loc_candidates_sorted = [c for _, c in sorted(loc_candidates, key=lambda x: x[0], reverse=True)]
-    except Exception:
-        loc_candidates_sorted = [c for _, c in loc_candidates]
-    # Prioritize known English locale chunks, then desc/loc candidates, then the rest.
-    download_queue = (
-        english_locale_chunks
-        + desc_candidates
-        + loc_candidates_sorted
-        + [ch for ch in chunk_names if ch not in loc_candidates_sorted and ch not in desc_candidates and ch not in english_locale_chunks]
+    _set_objectives_source_info(
+        kind="none",
+        message="No objectives data available",
+        path="",
+        language="",
+        row_count=0,
     )
-    for i, ch in enumerate(download_queue):
-        if ch in _MR_IN_MEM_FILES:
-            continue
-        if _MR_CHUNK_MAX > 0 and downloaded >= _MR_CHUNK_MAX:
-            break
-        url = base_url + ch
-        try:
-            data, headers = _mr_http_get(url, timeout=20)
-            _mr_store_in_memory(ch, data, url)
-            ok += 1
-            downloaded += 1
-            # quick score to allow early exit
-            txt = _mr_decode_bytes_to_text(data)
-            if txt:
-                ds = _mr_score_data_js(txt)
-                cs = _mr_score_desc_js(txt)
-                # Prefer MapRunner domain; URLs here are all /mr/
-                best_data_score = max(best_data_score, ds)
-                best_desc_score = max(best_desc_score, cs)
-                if cs >= 10 and ("s:\"" in txt or "s:'" in txt):
-                    try:
-                        parsed = _mr_parse_localization_from_desc_text(txt)
-                        if parsed:
-                            try:
-                                sample_vals = _mr_sample_values(list(parsed.values()), _MR_ENGLISH_SAMPLE_MAX)
-                            except Exception:
-                                sample_vals = list(parsed.values())[:120]
-                            avg = _mr_localization_avg_score(parsed)
-                            flags = _mr_localization_sample_flags(sample_vals)
-                            looks_english = _mr_localization_looks_english(avg, flags)
-                            if looks_english:
-                                english_chunks += 1
-                                english_entries += len(parsed)
-                                if (avg > best_loc_avg) or (avg == best_loc_avg and len(parsed) > best_loc_count):
-                                    best_loc_name = ch
-                                    best_loc_avg = avg
-                                    best_loc_count = len(parsed)
-                                if _MR_DEBUG:
-                                    _mr_log(f"expand_chunks: english_chunk={ch} entries={len(parsed)} avg={avg:.2f}")
-                    except Exception:
-                        pass
-                if _MR_DEBUG and (ds >= 10 or cs >= 10):
-                    _mr_log(f"expand_chunks: {ch} ds={ds} cs={cs}")
-                have_data = (_MR_CANONICAL_NAMES.get("data") in _MR_IN_MEM_FILES) or (best_data_score >= 20)
-                if best_loc_name and best_loc_count >= _MR_ENGLISH_MIN_ENTRIES and have_data:
-                    break
-        except Exception:
-            fail += 1
-            continue
-
-    # Re-select best roles from the expanded set
-    if _MR_DEBUG:
-        _mr_log(f"expand_chunks: downloaded ok={ok} fail={fail} english_chunks={english_chunks} english_entries={english_entries}")
-    _mr_choose_best_js_roles()
-    # If we identified a strong English localization chunk, prefer it as desc.js.
-    if best_loc_name and best_loc_name in _MR_IN_MEM_FILES:
-        try:
-            meta_url = _MR_IN_MEM_META.get(best_loc_name, {}).get("url")
-            _mr_store_in_memory(_MR_CANONICAL_NAMES["desc"], _MR_IN_MEM_FILES[best_loc_name], meta_url)
-            if _MR_DEBUG:
-                _mr_log(f"expand_chunks: forced desc={best_loc_name} avg={best_loc_avg:.2f} entries={best_loc_count}")
-        except Exception:
-            pass
-
-def _mr_identify_js_role(text: str) -> Optional[str]:
-    if not text:
-        return None
-    data_score = _mr_score_data_js(text)
-    desc_score = _mr_score_desc_js(text)
-    if data_score >= 15 and data_score >= desc_score:
-        return "data"
-    if desc_score >= 10 and desc_score > data_score:
-        return "desc"
-    return None
-
-def _mr_fallback_download_candidates_to_mem(page_url: str, html: str) -> List[str]:
-    found_roles: List[str] = []
-    candidates: List[str] = []
-    for match in re.finditer(r'<script[^>]+src=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
-        src = match.group(1)
-        abs_url = urljoin(page_url, src)
-        if "/mr/" in abs_url or abs_url.endswith(".js") or "cdn" in abs_url:
-            candidates.append(abs_url)
-
-    # Also include modulepreload/prefetch/preload links (Nuxt/Vite often use these for JS chunks)
-    for match in re.finditer(r'<link[^>]+rel=["\'](?:modulepreload|prefetch|preload)["\'][^>]+href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
-        href = match.group(1)
-        abs_url = urljoin(page_url, href)
-        if "/mr/" in abs_url or abs_url.endswith(".js") or "cdn" in abs_url:
-            candidates.append(abs_url)
-
-    candidates = sorted(set(candidates), key=lambda u: ("/mr/" not in u, u))
-
-    for abs_url in candidates:
-        try:
-            data, headers = _mr_http_get(abs_url, timeout=15)
-            if not _mr_looks_like_js_response(headers, abs_url):
-                continue
-            txt = _mr_decode_bytes_to_text(data)
-            role = _mr_identify_js_role(txt or "")
-            filename = os.path.basename(urlparse(abs_url).path) or None
-            if role:
-                canon = _MR_CANONICAL_NAMES[role]
-                if filename:
-                    _mr_store_in_memory(filename, data, abs_url)
-                _mr_store_in_memory(canon, data, abs_url)
-                if canon not in found_roles:
-                    found_roles.append(canon)
-            else:
-                if filename:
-                    _mr_store_in_memory(filename, data, abs_url)
-        except Exception:
-            continue
-    return found_roles
-
-def _mr_try_direct_js_endpoints() -> bool:
-    """
-    Try known static JS endpoints directly (works without Playwright).
-    Returns True if both data.js and desc.js were captured.
-    """
-    endpoints = [
-        ("data", "https://www.maprunner.info/mr/data.js"),
-        ("desc", "https://www.maprunner.info/mr/desc.js"),
-    ]
-    for role, url in endpoints:
-        try:
-            data, headers = _mr_http_get(url, timeout=15)
-            if not _mr_looks_like_js_response(headers, url):
-                continue
-            txt = _mr_decode_bytes_to_text(data) or ""
-            identified = _mr_identify_js_role(txt)
-            if identified == role:
-                _mr_store_in_memory(_MR_CANONICAL_NAMES[role], data, url)
-        except Exception:
-            continue
-    return ("data.js" in _MR_IN_MEM_FILES) and ("desc.js" in _MR_IN_MEM_FILES)
-
-def _mr_download_safe_fallback_js() -> bool:
-    """
-    Download known-good English JS files from the GitHub safe fallback.
-    Returns True if both data.js and desc.js are available after loading.
-    """
-    global _MR_SAFE_FALLBACK_ERROR
-    _MR_SAFE_FALLBACK_ERROR = ""
-    _MR_IN_MEM_FILES.clear()
-    _MR_IN_MEM_META.clear()
-    ok = 0
-    data_ok = False
-    desc_ok = False
-    for url in _MR_SAFE_FALLBACK_URLS:
-        try:
-            data, headers = _mr_http_get(url, timeout=20)
-            filename = os.path.basename(urlparse(url).path) or None
-            if filename:
-                _mr_store_in_memory(filename, data, url)
-            try:
-                txt = _mr_decode_bytes_to_text(data) or ""
-                if _mr_score_data_js(txt) > 0:
-                    data_ok = True
-                if _mr_score_desc_js(txt) > 0:
-                    desc_ok = True
-            except Exception:
-                pass
-            ok += 1
-        except Exception:
-            continue
-    # Identify and promote canonical data/desc roles from downloaded files.
-    _mr_choose_best_js_roles()
-    has_data = ("data.js" in _MR_IN_MEM_FILES) and data_ok
-    has_desc = ("desc.js" in _MR_IN_MEM_FILES) and desc_ok
-    if not has_data or not has_desc:
-        missing = []
-        if not has_data:
-            missing.append("data.js")
-        if not has_desc:
-            missing.append("desc.js")
-        _MR_SAFE_FALLBACK_ERROR = (
-            "Safe fallback failed: missing "
-            + ", ".join(missing)
-            + " in GitHub files."
-        )
-        return False
-    return ok > 0
-
-def _mr_download_js_step() -> None:
-    _MR_IN_MEM_FILES.clear()
-    _MR_IN_MEM_META.clear()
-    found = set()
-
-    # Safe fallback: load known-good GitHub files instead of MapRunner.
-    try:
-        if _get_objectives_safe_fallback_mode():
-            if _mr_download_safe_fallback_js():
-                _mr_persist_canonical_js_cache(allow_desc=True)
-            else:
-                _mr_load_cached_canonical_js_to_mem()
-            return
-    except Exception:
-        pass
-
-    # Fast-path: try known endpoints directly (no Playwright needed)
-    try:
-        if _MR_DEBUG:
-            _mr_log("download_js_step: trying direct endpoints")
-        if _mr_try_direct_js_endpoints():
-            # Ensure the direct localization looks English; otherwise keep searching.
-            try:
-                desc_bs = _mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["desc"])
-            except Exception:
-                desc_bs = None
-            if _mr_desc_bytes_look_english(desc_bs):
-                _mr_persist_canonical_js_cache(allow_desc=True)
-                if _MR_DEBUG:
-                    _mr_log("download_js_step: direct endpoints success")
-                return
-            if _MR_DEBUG:
-                _mr_log("download_js_step: direct endpoints not English; continuing fallback")
-    except Exception:
-        if _MR_DEBUG:
-            _mr_log_exc("download_js_step: direct endpoints failed")
-        pass
-
-    # Use HTML+urllib fallback (no Playwright dependency).
-    try:
-        data, _ = _mr_http_get(_MR_URL, timeout=15)
-        html = _mr_decode_bytes_to_text(data) or ""
-        _mr_fallback_download_candidates_to_mem(_MR_URL, html)
-        _mr_choose_best_js_roles()
-        _mr_expand_chunks_from_bundle()
-        try:
-            desc_ok = _mr_desc_bytes_look_english(_mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["desc"]))
-        except Exception:
-            desc_ok = False
-        _mr_persist_canonical_js_cache(allow_desc=bool(desc_ok))
-        if _MR_DEBUG:
-            _mr_log(f"download_js_step: fallback html ok; mem_files={list(_MR_IN_MEM_FILES.keys())[:6]}")
-        return
-    except Exception:
-        _mr_load_cached_canonical_js_to_mem()
-        if _MR_DEBUG:
-            _mr_log_exc("download_js_step: fallback html failed")
-        return
-
-def _mr_choose_first_available(candidates: List[str]) -> Optional[str]:
-    for name in candidates:
-        if _mr_get_file_bytes_or_mem(name) is not None:
-            return name
-    return candidates[0] if candidates else None
-
-def _mr_collect_localization(desc_js_file: Optional[str]) -> Dict[str, str]:
-    """
-    Build a localization dictionary by parsing one or more JS files that contain
-    localization strings (s:"..."). This merges results across multiple chunks.
-    """
-    global _MR_LAST_LOCALIZATION_FILES, _MR_LAST_LOCALIZATION_BLOCKED
-    merged: Dict[str, str] = {}
-    seen_files: Set[str] = set()
-    candidates: List[Dict[str, Any]] = []
-    _MR_LAST_LOCALIZATION_FILES = []
-    _MR_LAST_LOCALIZATION_BLOCKED = False
-
-    def _merge_value(key: str, val: str) -> None:
-        if not _mr_value_allowed(val):
-            return
-        if key not in merged:
-            merged[key] = val
-            return
-        old = merged.get(key, "")
-        # Prefer the value that looks more English / less mojibake
-        new_score = _mr_text_english_score(val)
-        old_score = _mr_text_english_score(old)
-        if new_score > old_score + 0.2:
-            merged[key] = val
-
-    def _add_candidate(name: Optional[str], txt: Optional[str]) -> None:
-        if not name or not txt:
-            return
-        # quick filter to avoid heavy parsing for unrelated files
-        if ("s:\"") not in txt and ("s:'") not in txt and ("s :") not in txt:
-            return
-        parsed = _mr_parse_localization_from_desc_text(txt)
-        if not parsed:
-            return
-        avg = _mr_localization_avg_score(parsed)
-        try:
-            all_vals = list(parsed.values())
-        except Exception:
-            all_vals = []
-        try:
-            sample_vals = _mr_sample_values(all_vals, _MR_ENGLISH_SAMPLE_MAX)
-        except Exception:
-            sample_vals = []
-        flags = _mr_localization_sample_flags(sample_vals)
-        lang_guess = _mr_guess_language_from_values(sample_vals, avg)
-        candidates.append({
-            "name": name,
-            "loc": parsed,
-            "avg": avg,
-            "count": len(parsed),
-            "lang": lang_guess,
-            "flags": flags,
-        })
-
-    # First try the chosen desc file (if any)
-    if desc_js_file:
-        try:
-            txt = _mr_decode_bytes_to_text(_mr_get_file_bytes_or_mem(desc_js_file))
-            _add_candidate(desc_js_file, txt)
-            if desc_js_file:
-                seen_files.add(desc_js_file)
-        except Exception:
-            pass
-
-    # Then scan other in-memory JS files likely to contain localization.
-    other_files: List[tuple] = []
-    for name, bs in list(_MR_IN_MEM_FILES.items()):
-        if name in seen_files:
-            continue
-        if not name.lower().endswith(".js"):
-            continue
-        if name.lower() == _MR_CANONICAL_NAMES.get("data", "data.js"):
-            continue
-        other_files.append((name, bs))
-
-    try:
-        other_files.sort(
-            key=lambda item: len(item[1]) if isinstance(item[1], (bytes, bytearray)) else 0,
-            reverse=True,
-        )
-    except Exception:
-        pass
-
-    for name, bs in other_files:
-        if _MR_LOCALIZATION_CANDIDATE_MAX > 0 and len(candidates) >= _MR_LOCALIZATION_CANDIDATE_MAX:
-            break
-        try:
-            txt = _mr_decode_bytes_to_text(bs)
-        except Exception:
-            txt = None
-        if not txt:
-            continue
-        if ("EXP_" not in txt) and ("_DESC_DESC" not in txt) and ("_NAME" not in txt and "_DESC" not in txt):
-            # Skip chunks unlikely to contain localization
-            continue
-        _add_candidate(name, txt)
-        seen_files.add(name)
-
-    if not candidates:
-        if _MR_DEBUG:
-            try:
-                _mr_log("collect_localization: no candidates found")
-            except Exception:
-                pass
-        return merged
-
-    # Per-value filters handle language exclusion; keep all candidates here.
-
-    # Avoid tiny localization files (can be high-scoring but useless).
-    best_count = max(c.get("count", 0) for c in candidates)
-    min_count = max(200, int(best_count * 0.6))
-    if best_count >= 2000:
-        min_count = max(min_count, 2000)
-    try:
-        if any(c.get("count", 0) >= _MR_ENGLISH_MIN_ENTRIES for c in candidates):
-            min_count = max(min_count, int(_MR_ENGLISH_MIN_ENTRIES))
-    except Exception:
-        pass
-    pool = [c for c in candidates if c.get("count", 0) >= min_count]
-    if pool:
-        candidates = pool
-
-    # If English-looking localization exists, only use those candidates.
-    english_candidates = [
-        c for c in candidates
-        if _mr_localization_looks_english(float(c.get("avg", -999.0)), c.get("flags") or {})
-    ]
-    if english_candidates:
-        candidates = english_candidates
-    else:
-        _MR_LAST_LOCALIZATION_BLOCKED = True
-        if _MR_DEBUG:
-            try:
-                _mr_log("collect_localization: no English candidates found; blocking refresh")
-            except Exception:
-                pass
-        return merged
-
-    # Prefer English-looking localization files when multiple locales exist.
-    candidates.sort(key=lambda c: (c.get("avg", -999.0), c.get("count", 0)), reverse=True)
-    selected = candidates
-    best = candidates[0]
-    try:
-        if best.get("avg", -999.0) >= _MR_ENGLISH_AVG_MIN:
-            cutoff = max(_MR_ENGLISH_AVG_MIN, float(best.get("avg", 0.0)) - _MR_ENGLISH_AVG_DELTA)
-            selected = [c for c in candidates if float(c.get("avg", -999.0)) >= cutoff]
-            if not selected:
-                selected = [best]
-        else:
-            best_lang = str(best.get("lang") or "").strip()
-            if best_lang:
-                selected = [c for c in candidates if str(c.get("lang") or "").strip() == best_lang]
-                if not selected:
-                    selected = [best]
-            else:
-                selected = [best]
-    except Exception:
-        selected = candidates
-
-    # Merge selected candidates first.
-    _MR_LAST_LOCALIZATION_FILES = []
-    for cand in selected:
-        loc = cand.get("loc") or {}
-        for k, v in loc.items():
-            _merge_value(k, v)
-        if cand.get("name"):
-            _MR_LAST_LOCALIZATION_FILES.append(str(cand.get("name")))
-    # Preserve the best English localization file as canonical desc.js for caching.
-    try:
-        best_name = best.get("name")
-        if best_name and best_name in _MR_IN_MEM_FILES:
-            meta_url = _MR_IN_MEM_META.get(best_name, {}).get("url")
-            _mr_store_in_memory(_MR_CANONICAL_NAMES["desc"], _MR_IN_MEM_FILES[best_name], meta_url)
-    except Exception:
-        pass
-
-    # If still too small, expand with remaining unblocked candidates.
-    if len(merged) < 2000 and len(candidates) > len(selected):
-        for cand in candidates:
-            if cand in selected:
-                continue
-            loc = cand.get("loc") or {}
-            for k, v in loc.items():
-                _merge_value(k, v)
-            if cand.get("name"):
-                _MR_LAST_LOCALIZATION_FILES.append(str(cand.get("name")))
-
-    if _MR_DEBUG:
-        try:
-            _mr_log(
-                f"collect_localization: files={len(_MR_LAST_LOCALIZATION_FILES)} "
-                f"entries={len(merged)} best_avg={best.get('avg')}"
-            )
-        except Exception:
-            pass
-    return merged
-
-def _write_csv_atomic(path: str, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
-    if not rows:
-        return
-    out_dir = os.path.dirname(path) or "."
-    tmp_path = None
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except Exception:
-        pass
-    try:
-        with tempfile.NamedTemporaryFile("w", delete=False, dir=out_dir, encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            for row in rows:
-                writer.writerow(row)
-            tmp_path = f.name
-        os.replace(tmp_path, path)
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
-
-def _to_int(value, default=0) -> int:
-    try:
-        if value is None or value == "":
-            return default
-        return int(float(value))
-    except Exception:
-        return default
-
-def _mr_build_csv(out_path: str) -> bool:
-    """
-    Attempt to download + parse MapRunner data and write a fresh CSV.
-    Returns True on success, False on failure.
-    """
-    try:
-        if _MR_DEBUG:
-            _mr_log("build_csv: start")
-        _mr_download_js_step()
-        region_order = _MR_REGION_ORDER
-        category_priority = _MR_CATEGORY_PRIORITY
-        type_priority = _MR_TYPE_PRIORITY
-        region_lookup = _MR_REGION_LOOKUP
-
-        input_file = _mr_choose_first_available([_MR_CANONICAL_NAMES["data"], "data.js"])
-        desc_js_file = _mr_choose_first_available([_MR_CANONICAL_NAMES["desc"], "desc.js"])
-        if _MR_DEBUG:
-            _mr_log(f"build_csv: input_file={input_file} desc_file={desc_js_file} mem_files={list(_MR_IN_MEM_FILES.keys())[:6]}")
-
-        def clean_text(s):
-            if s is None:
-                return ""
-            if not isinstance(s, str):
-                try:
-                    s = s.decode("utf-8", errors="replace")
-                except Exception:
-                    s = str(s)
-            candidates = [s]
-            # Only attempt unicode_escape if the string contains escapes
-            if "\\" in s:
-                try:
-                    cand = bytes(s, "utf-8").decode("unicode_escape")
-                    candidates.append(cand)
-                except Exception:
-                    pass
-            try:
-                candidates.append(s.encode("latin-1", errors="replace").decode("utf-8", errors="replace"))
-            except Exception:
-                pass
-            try:
-                candidates.append(s.encode("utf-8", errors="replace").decode("latin-1", errors="replace"))
-            except Exception:
-                pass
-            try:
-                if "\\" in s:
-                    cand = bytes(s, "utf-8").decode("unicode_escape").encode("latin-1", errors="replace").decode("utf-8", errors="replace")
-                    candidates.append(cand)
-            except Exception:
-                pass
-            def score(x):
-                if not x:
-                    return 999999
-                return x.count("�") + x.count("Ã") + x.count("Â") + x.count("\ufffd")
-            best = min(candidates, key=score)
-            return _mr_normalize_mojibake_text(best.strip())
-
-        def _collect_desc_text_blobs(current_desc: Optional[str]) -> List[str]:
-            blobs: List[str] = []
-            seen: Set[str] = set()
-            allowed = set(_MR_LAST_LOCALIZATION_FILES) if _MR_LAST_LOCALIZATION_FILES else None
-            if current_desc and (allowed is None or current_desc in allowed):
-                try:
-                    txt = _mr_decode_bytes_to_text(_mr_get_file_bytes_or_mem(current_desc))
-                    if txt:
-                        blobs.append(txt)
-                        seen.add(current_desc)
-                except Exception:
-                    pass
-            for name, bs in list(_MR_IN_MEM_FILES.items()):
-                if allowed is not None and name not in allowed:
-                    continue
-                if name in seen:
-                    continue
-                if not name.lower().endswith(".js"):
-                    continue
-                try:
-                    txt = _mr_decode_bytes_to_text(bs)
-                except Exception:
-                    txt = None
-                if not txt:
-                    continue
-                if ("EXP_" not in txt) and ("_DESC_DESC" not in txt) and ("_NAME" not in txt and "_DESC" not in txt):
-                    continue
-                if ("s:\"") not in txt and ("s:'") not in txt and ("s :") not in txt:
-                    continue
-                blobs.append(txt)
-                seen.add(name)
-                if len(blobs) >= 8:
-                    break
-            return blobs
-
-        localization = _mr_collect_localization(desc_js_file)
-        desc_text_blobs = _collect_desc_text_blobs(desc_js_file)
-
-        # If localization is missing, try to expand chunks and re-select desc file.
-        if (not localization or len(localization) < 200):
-            try:
-                _mr_expand_chunks_from_bundle()
-                _mr_choose_best_js_roles()
-                desc_js_file = _mr_choose_first_available([_MR_CANONICAL_NAMES["desc"], "desc.js"])
-                localization = _mr_collect_localization(desc_js_file)
-                desc_text_blobs = _collect_desc_text_blobs(desc_js_file)
-            except Exception:
-                pass
-        if _MR_LAST_LOCALIZATION_BLOCKED:
-            log("Maprunner localization blocked by language filters; using cached/bundled data.")
-            return False
-        if localization and len(localization) < _MR_MIN_LOCALIZATION_ENTRIES:
-            log("Maprunner localization too small; using cached/bundled data.")
-            return False
-        if _MR_DEBUG:
-            try:
-                _mr_log(f"build_csv: localization size={len(localization) if localization else 0}")
-            except Exception:
-                pass
-
-        _lazy_desc_cache: Dict[str, Optional[str]] = {}
-
-        def lazy_desc_lookup(tok: str) -> Optional[str]:
-            if not tok or not desc_text_blobs:
-                return None
-            if tok in _lazy_desc_cache:
-                return _lazy_desc_cache[tok]
-            # Try both bare and quoted keys across multiple blobs
-            patterns = [f'{tok}:{{', f'"{tok}":{{', f"'{tok}':{{"]
-            for blob in desc_text_blobs:
-                idx = -1
-                for pat in patterns:
-                    idx = blob.find(pat)
-                    if idx != -1:
-                        break
-                if idx == -1:
-                    continue
-                window = blob[idx: idx + 600]
-                m = re.search(r's\\s*:\\s*(\"|\\\')', window)
-                if not m:
-                    continue
-                quote_idx = idx + m.start(1)
-                val = _mr_extract_js_string_literal(blob, quote_idx)
-                if val is None:
-                    continue
-                try:
-                    val = codecs.decode(val.replace(r"\\/", "/"), "unicode_escape")
-                except Exception:
-                    pass
-                val = clean_text(val)
-                _lazy_desc_cache[tok] = val
-                return val
-            _lazy_desc_cache[tok] = None
-            return None
-
-        def translate_token(tok):
-            if not tok:
-                return ""
-            # Build lookup candidates (MapRunner often prefixes EXP_)
-            candidates = [tok]
-            if tok.startswith("EXP_"):
-                candidates.append(tok[4:])
-            else:
-                candidates.append("EXP_" + tok)
-            if tok.startswith("UI_") and not tok.startswith("EXP_UI_"):
-                candidates.append("EXP_" + tok)
-            for candidate in (tok, tok.upper(), tok.lower()):
-                if candidate not in candidates:
-                    candidates.append(candidate)
-            if localization:
-                for candidate in candidates:
-                    if candidate in localization:
-                        return clean_text(localization[candidate])
-                stripped = tok.replace("UI_", "").replace("_NAME", "").replace("_DESC", "")
-                if stripped in localization:
-                    return clean_text(localization[stripped])
-                if "EXP_" + stripped in localization:
-                    return clean_text(localization["EXP_" + stripped])
-            # If still not found, try lazy lookup across blobs
-            for candidate in candidates:
-                fallback = lazy_desc_lookup(candidate)
-                if fallback:
-                    return fallback
-            return clean_text(tok)
-
-        def collect_types(obj):
-            types = set()
-            if isinstance(obj, dict):
-                t = obj.get("type")
-                if isinstance(t, str) and t.strip():
-                    types.add(t.strip())
-                for v in obj.values():
-                    types.update(collect_types(v))
-            elif isinstance(obj, list):
-                for item in obj:
-                    types.update(collect_types(item))
-            return types
-
-        def pretty_cargo_name(raw_name):
-            if not raw_name:
-                return "Unknown"
-            s = raw_name.replace("UI_CARGO_", "").replace("_NAME", "").replace("Cargo", "")
-            s = s.replace("_", " ").strip()
-            return " ".join([p.capitalize() for p in s.split()])
-
-        def collect_cargo(obj):
-            cargos = []
-            if isinstance(obj, dict):
-                if "cargo" in obj and isinstance(obj["cargo"], list):
-                    for c in obj["cargo"]:
-                        if isinstance(c, dict):
-                            count = str(c.get("count", "") or "")
-                            name = c.get("name") or c.get("key") or "Unknown"
-                            name = pretty_cargo_name(name)
-                            cargos.append(f"{count}× {name}" if count and count != "-1" else name)
-                for v in obj.values():
-                    cargos.extend(collect_cargo(v))
-            elif isinstance(obj, list):
-                for v in obj:
-                    cargos.extend(collect_cargo(v))
-            return cargos
-
-        def humanize_key(k):
-            parts = k.split("_")
-            return " ".join([p.capitalize() for p in parts if p])
-
-        def extract_js_parse_string(txt):
-            idx = txt.find("JSON.parse")
-            if idx == -1:
-                return None
-            i = txt.find("(", idx)
-            if i == -1:
-                return None
-            j = i + 1
-            while j < len(txt) and txt[j].isspace():
-                j += 1
-            if j >= len(txt) or txt[j] not in ("'", '"'):
-                return None
-            quote = txt[j]
-            start = j + 1
-            k = start
-            escaped = False
-            while k < len(txt):
-                ch = txt[k]
-                if escaped:
-                    escaped = False
-                    k += 1
-                    continue
-                if ch == "\\":
-                    escaped = True
-                    k += 1
-                    continue
-                if ch == quote:
-                    return txt[start:k]
-                k += 1
-            return None
-
-        def unescape_js_string(s):
-            if s is None:
-                return ""
-            try:
-                normalized = s.replace(r'\/', '/')
-                return codecs.decode(normalized, "unicode_escape")
-            except Exception:
-                return s
-
-        def load_embedded_json(filename):
-            def _extract_js_string_literal(txt, start_idx):
-                if start_idx >= len(txt):
-                    return None
-                quote = txt[start_idx]
-                if quote not in ("'", '"', "`"):
-                    return None
-                k = start_idx + 1
-                escaped = False
-                out = []
-                while k < len(txt):
-                    ch = txt[k]
-                    if escaped:
-                        out.append(ch)
-                        escaped = False
-                        k += 1
-                        continue
-                    if ch == "\\":
-                        escaped = True
-                        k += 1
-                        continue
-                    if quote == "`" and ch == "$" and k + 1 < len(txt) and txt[k + 1] == "{":
-                        # Template literal with interpolation not supported
-                        return None
-                    if ch == quote:
-                        return "".join(out)
-                    out.append(ch)
-                    k += 1
-                return None
-
-            def _extract_largest_string(txt, min_len=100000):
-                best = None
-                best_len = 0
-                i = 0
-                n = len(txt)
-                while i < n:
-                    ch = txt[i]
-                    if ch not in ("'", '"', "`"):
-                        i += 1
-                        continue
-                    quote = ch
-                    i += 1
-                    escaped = False
-                    start = i
-                    has_interp = False
-                    while i < n:
-                        c = txt[i]
-                        if escaped:
-                            escaped = False
-                            i += 1
-                            continue
-                        if c == "\\":
-                            escaped = True
-                            i += 1
-                            continue
-                        if quote == "`" and c == "$" and i + 1 < n and txt[i + 1] == "{":
-                            has_interp = True
-                        if c == quote:
-                            s = txt[start:i]
-                            if not has_interp:
-                                slen = len(s)
-                                if slen > best_len and slen >= min_len:
-                                    best_len = slen
-                                    best = s
-                            i += 1
-                            break
-                        i += 1
-                    else:
-                        break
-                return best
-
-            def _find_json_parse_payload(txt):
-                pos = 0
-                while True:
-                    idx = txt.find("JSON.parse", pos)
-                    if idx == -1:
-                        return None
-                    i = txt.find("(", idx)
-                    if i == -1:
-                        return None
-                    j = i + 1
-                    while j < len(txt) and txt[j].isspace():
-                        j += 1
-                    if j >= len(txt):
-                        return None
-                    # JSON.parse(VAR_NAME) -> resolve variable
-                    m = re.match(r'([A-Za-z_$][\\w$]*)', txt[j:])
-                    if m:
-                        varname = m.group(1)
-                        # look for const/let/var assignment
-                        assign_patterns = [
-                            rf'(?:const|let|var)\\s+{re.escape(varname)}\\s*=\\s*',
-                            rf'{re.escape(varname)}\\s*=\\s*',
-                        ]
-                        for pat in assign_patterns:
-                            am = re.search(pat, txt)
-                            if am:
-                                k = am.end()
-                                while k < len(txt) and txt[k].isspace():
-                                    k += 1
-                                if k < len(txt):
-                                    if txt.startswith("atob", k):
-                                        j2 = txt.find("(", k)
-                                        if j2 != -1:
-                                            j3 = j2 + 1
-                                            while j3 < len(txt) and txt[j3].isspace():
-                                                j3 += 1
-                                            s = _extract_js_string_literal(txt, j3)
-                                            if s is not None:
-                                                try:
-                                                    import base64
-                                                    raw = base64.b64decode(s)
-                                                    decoded = _mr_decode_bytes_to_text(raw) or ""
-                                                    return decoded
-                                                except Exception:
-                                                    pass
-                                    if txt[k] in ("'", '"', "`"):
-                                        s = _extract_js_string_literal(txt, k)
-                                        if s is not None:
-                                            return s
-                        pos = idx + 10
-                        continue
-                    # JSON.parse(atob("..."))
-                    if txt.startswith("atob", j):
-                        j2 = txt.find("(", j)
-                        if j2 == -1:
-                            pos = idx + 10
-                            continue
-                        j3 = j2 + 1
-                        while j3 < len(txt) and txt[j3].isspace():
-                            j3 += 1
-                        s = _extract_js_string_literal(txt, j3)
-                        if s is None:
-                            pos = idx + 10
-                            continue
-                        try:
-                            import base64
-                            raw = base64.b64decode(s)
-                            decoded = _mr_decode_bytes_to_text(raw) or ""
-                            return decoded
-                        except Exception:
-                            pos = idx + 10
-                            continue
-                    # JSON.parse("...") / JSON.parse('...') / JSON.parse(`...`)
-                    if txt[j] in ("'", '"', "`"):
-                        s = _extract_js_string_literal(txt, j)
-                        if s is not None:
-                            return s
-                    pos = idx + 10
-
-            bs = _mr_get_file_bytes_or_mem(filename)
-            if bs is None:
-                return None
-            txt = _mr_decode_bytes_to_text(bs)
-            if _MR_DEBUG:
-                try:
-                    head = bs[:8]
-                    head_hex = "".join([f"{b:02x}" for b in head])
-                    _mr_log(f"load_embedded_json: {filename} bytes={len(bs)} head={head_hex} has_JSON_parse={bool(txt and ('JSON.parse' in txt))}")
-                except Exception:
-                    pass
-            if not txt:
-                return None
-            embedded = _find_json_parse_payload(txt)
-            if embedded is None:
-                embedded = extract_js_parse_string(txt)
-            if embedded is None:
-                # Fallback: try largest string literal in the file
-                try:
-                    candidate = _extract_largest_string(txt)
-                    if candidate:
-                        if _MR_DEBUG:
-                            _mr_log(f"load_embedded_json: largest string len={len(candidate)}")
-                        embedded = candidate
-                except Exception:
-                    pass
-            if embedded is None:
-                return None
-            json_text = unescape_js_string(embedded)
-            try:
-                return json.loads(json_text)
-            except Exception:
-                try:
-                    repaired = clean_text(json_text)
-                    return json.loads(repaired)
-                except Exception:
-                    try:
-                        embedded_bytes = embedded.encode("utf-8", errors="replace")
-                        candidate = embedded_bytes.decode("latin-1", errors="replace")
-                        candidate = unescape_js_string(candidate)
-                        return json.loads(candidate)
-                    except Exception:
-                        return None
-
-        # Try multiple candidates if the primary data file fails
-        data = load_embedded_json(input_file) if input_file else None
-        if not data:
-            if _MR_DEBUG:
-                _mr_log("build_csv: primary load_embedded_json failed; trying candidates")
-            # Rank candidates by data score
-            candidates = []
-            try:
-                for name, bs in _MR_IN_MEM_FILES.items():
-                    if not name.lower().endswith(".js"):
-                        continue
-                    txt = _mr_decode_bytes_to_text(bs) or ""
-                    ds = _mr_score_data_js(txt)
-                    if ds > 0:
-                        candidates.append((ds, name))
-                candidates.sort(reverse=True)
-            except Exception:
-                candidates = []
-            for _, name in candidates:
-                if name == input_file:
-                    continue
-                data = load_embedded_json(name)
-                if data:
-                    if _MR_DEBUG:
-                        _mr_log(f"build_csv: data loaded from candidate {name}")
-                    break
-        if not data:
-            if _MR_DEBUG:
-                _mr_log("build_csv: load_embedded_json failed (no data)")
-            return False
-
-        rows = []
-        wanted_columns = [
-            "key", "displayName", "category", "region", "region_name", "type",
-            "cargo_needed", "experience", "money", "descriptionText", "Source"
-        ]
-
-        def walk(o):
-            if isinstance(o, dict):
-                if "category" in o and "key" in o:
-                    key = o["key"].upper()
-                    region = "_".join(key.split("_")[:2]) if "_" in key else ""
-                    if o.get("category") in _MR_ALLOWED_CATEGORIES and region in region_lookup:
-                        exp = money = None
-                        if isinstance(o.get("rewards"), list):
-                            for r in o["rewards"]:
-                                if isinstance(r, dict):
-                                    exp = r.get("experience", exp)
-                                    money = r.get("money", money)
-                        types = collect_types(o.get("objectives", []))
-                        cargos = collect_cargo(o.get("objectives", []))
-                        if "truckDelivery" in types:
-                            type_str = "truckDelivery"
-                        elif cargos:
-                            type_str = "cargoDelivery"
-                        else:
-                            type_str = "exploration"
-                        cargo_str = "; ".join(cargos) if cargos else None
-
-                        name_field = o.get("name") or ""
-                        if name_field and not name_field.startswith("UI_"):
-                            display = translate_token(name_field) if localization else clean_text(name_field)
-                        else:
-                            if localization and name_field:
-                                display = translate_token(name_field)
-                            elif localization:
-                                display = translate_token(key)
-                            else:
-                                display = clean_text(humanize_key(key))
-
-                        raw_desc = o.get("subtitle") or o.get("description") or o.get("descriptionText") or ""
-                        description_text = translate_token(raw_desc) if raw_desc else ""
-                        description_text = clean_text(description_text)
-
-                        source = (o.get("category") or "").lstrip("_")
-
-                        rows.append({
-                            "key": key,
-                            "displayName": clean_text(display),
-                            "category": o.get("category"),
-                            "region": region,
-                            "region_name": region_lookup.get(region, ""),
-                            "type": type_str,
-                            "cargo_needed": cargo_str,
-                            "experience": exp,
-                            "money": money,
-                            "descriptionText": description_text,
-                            "Source": source,
-                        })
-            for v in (o.values() if isinstance(o, dict) else (o if isinstance(o, list) else [])):
-                walk(v)
-
-        walk(data)
-        if not rows:
-            if _MR_DEBUG:
-                _mr_log("build_csv: no rows produced")
-            return False
-
-        seen = set()
-        unique_rows = []
-        for row in rows:
-            k = row.get("key")
-            if not k or k in seen:
-                continue
-            seen.add(k)
-            unique_rows.append(row)
-
-        region_map = {r: i for i, r in enumerate(region_order)}
-        category_map = {cat: i for i, cat in enumerate(category_priority)}
-        type_map = {t: i for i, t in enumerate(type_priority)}
-
-        num_re = re.compile(r'(\d+)')
-        def numeric_groups_from_key(k, max_groups=4):
-            nums = num_re.findall(k)
-            nums = [int(x) for x in nums]
-            pad = [99999] * max_groups
-            return (nums + pad)[:max_groups]
-
-        def sort_key(r):
-            nums = numeric_groups_from_key(r.get("key", ""))
-            money_num = _to_int(r.get("money"))
-            exp_num = _to_int(r.get("experience"))
-            return (
-                region_map.get(r.get("region"), 9999),
-                nums[0], nums[1], nums[2], nums[3],
-                category_map.get(r.get("category"), 9999),
-                type_map.get(r.get("type"), 9999),
-                -money_num,
-                -exp_num,
-                r.get("displayName") or "",
-            )
-
-        rows_sorted = sorted(unique_rows, key=sort_key)
-        _write_csv_atomic(out_path, rows_sorted, wanted_columns)
-        if _MR_DEBUG:
-            try:
-                if rows_sorted:
-                    r0 = rows_sorted[0]
-                    _mr_log(f"build_csv: sample0 key={r0.get('key')} displayName={r0.get('displayName')} region={r0.get('region')}")
-                # Log a known key if present
-                needle = "US_01_02_LOST_TRAILER_TSK"
-                for r in rows_sorted:
-                    if r.get("key") == needle:
-                        _mr_log(f"build_csv: sample {needle} displayName={r.get('displayName')} desc={str(r.get('descriptionText'))[:80]}")
-                        break
-            except Exception:
-                pass
-        if _MR_DEBUG:
-            _mr_log(f"build_csv: success rows={len(rows_sorted)} out={out_path}")
-        return True
-    except Exception as e:
-        log(f"Maprunner CSV build failed: {e}")
-        _mr_log_exc("build_csv: exception")
-        return False
-
-def _objectives_cache_csv_path() -> str:
-    try:
-        cfg_dir = os.path.dirname(CONFIG_FILE)
-    except Exception:
-        try:
-            cfg_dir = os.path.expanduser("~")
-        except Exception:
-            cfg_dir = ""
-    if not cfg_dir:
-        cfg_dir = os.getcwd()
-    return os.path.join(cfg_dir, ".snowrunner_editor_maprunner_data.csv")
-
-def _objectives_cache_js_path(role: str) -> str:
-    try:
-        cfg_dir = os.path.dirname(CONFIG_FILE)
-    except Exception:
-        try:
-            cfg_dir = os.path.expanduser("~")
-        except Exception:
-            cfg_dir = ""
-    if not cfg_dir:
-        cfg_dir = os.getcwd()
-    role_key = str(role or "").strip().lower()
-    if role_key == "desc":
-        name = ".snowrunner_editor_maprunner_desc.js"
-    else:
-        name = ".snowrunner_editor_maprunner_data.js"
-    return os.path.join(cfg_dir, name)
-
-def _mr_persist_canonical_js_cache(allow_desc: bool = True) -> None:
-    for role, canon in _MR_CANONICAL_NAMES.items():
-        if role == "desc" and not allow_desc:
-            continue
-        bs = _MR_IN_MEM_FILES.get(canon)
-        if not isinstance(bs, (bytes, bytearray)) or not bs:
-            continue
-        out_path = _objectives_cache_js_path(role)
-        tmp_path = out_path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-        except Exception:
-            pass
-        try:
-            with open(tmp_path, "wb") as f:
-                f.write(bytes(bs))
-            os.replace(tmp_path, out_path)
-        except Exception:
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
-
-def _mr_load_cached_canonical_js_to_mem() -> Dict[str, str]:
-    loaded: Dict[str, str] = {}
-    for role, canon in _MR_CANONICAL_NAMES.items():
-        if canon in _MR_IN_MEM_FILES:
-            continue
-        path = _objectives_cache_js_path(role)
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-            if data:
-                _mr_store_in_memory(canon, data, f"cache:{path}")
-                loaded[role] = path
-        except Exception:
-            continue
-    return loaded
-
-def _load_csv_to_simpleframe(csv_path: str, skip_non_english: bool = False) -> Optional[SimpleFrame]:
-    if not csv_path:
-        return None
-    log(f"Starting CSV load: {csv_path}")
-    if not os.path.exists(csv_path):
-        log(f"CSV file not found: {csv_path}")
-        return None
-    try:
-        rows: List[Dict[str, Any]] = []
-        with open(csv_path, "r", encoding="utf-8", newline="") as fh:
-            reader = csv.DictReader(fh)
-            for r in reader:
-                normalized = {str(k).strip().lower(): (v if v != "" else None) for k, v in r.items()}
-                rows.append(normalized)
-        # Optionally skip cached CSVs that are clearly non-English.
-        if skip_non_english:
-            try:
-                if _mr_strings_look_non_english([r.get("displayname") for r in rows if isinstance(r, dict)]):
-                    log("CSV appears non-English; skipping this candidate.")
-                    return None
-            except Exception:
-                pass
-        log(f"CSV read complete: {len(rows)} rows")
-        return SimpleFrame(rows)
-    except Exception as e:
-        log(f"Failed to read CSV: {e}")
-        return None
-
-def _load_parquet_safe(parquet_path: Optional[str] = None, allow_build: bool = True):
-    """
-    CSV loader with fallback chain.
-    Order:
-      1) If allow_build, attempt to build fresh CSV into cache (online).
-      2) Load cached CSV from last successful build.
-      3) Load bundled CSV next to the app (if present).
-      4) If none work, return None (no crash).
-    """
-    if parquet_path is None:
-        try:
-            parquet_path = default_parquet_path()
-        except Exception:
-            parquet_path = resource_path("maprunner_data.parquet")
-
-    cache_csv = _objectives_cache_csv_path()
-    bundled_csv = resource_path("maprunner_data.csv")
-    inferred_csv = os.path.splitext(parquet_path)[0] + ".csv"
-
-    # Attempt online refresh into cache (best-effort)
-    if allow_build:
-        try:
-            built = _mr_build_csv(cache_csv)
-            if built:
-                log(f"Fresh Objectives+ CSV built: {cache_csv}")
-        except Exception:
-            pass
-
-    # Fallback chain (cache -> inferred -> bundled)
-    candidates = []
-    for p in (cache_csv, inferred_csv, bundled_csv):
-        if p and p not in candidates:
-            candidates.append(p)
-
-    bundled_exists = bool(bundled_csv and os.path.exists(bundled_csv))
-    for path in candidates:
-        skip_non_english = bool(bundled_exists and path != bundled_csv)
-        df = _load_csv_to_simpleframe(path, skip_non_english=skip_non_english)
-        if df is not None:
-            return df
-
-    # Last resort: use cached CSV even if it is non-English when no bundled fallback exists.
-    try:
-        if cache_csv and os.path.exists(cache_csv):
-            df = _load_csv_to_simpleframe(cache_csv, skip_non_english=False)
-            if df is not None:
-                log("Using cached CSV despite language filter (no English fallback found).")
-                return df
-    except Exception:
-        pass
-
-    log("Objectives+ CSV load failed: no usable CSV found.")
-    return None
+    return []
 
 # ---------------------------------------------------------------------------
-# END SECTION: Objectives+ CSV Builder (Maprunner)
+# END SECTION: Objectives+ Source Helpers
 # ---------------------------------------------------------------------------
-# --- end CSV-only loader ---
+# --- end objectives data loader ---
 
 
 class VirtualObjectivesFast:
@@ -9241,6 +11312,11 @@ class VirtualObjectivesFast:
         except Exception:
             self.safe_fallback_var = tk.BooleanVar(value=False)
         self.safe_fallback_cb = None
+        self.language_var = tk.StringVar(value=_objectives_language_label(_objectives_get_language_preference()))
+        self.language_cb = None
+        self.source_summary_var = tk.StringVar(value="")
+        self.sourcebar = None
+        self._language_label_to_code: Dict[str, str] = {}
 
         # Status / refresh UI
         self.status_var = tk.StringVar(value="")
@@ -9357,6 +11433,26 @@ class VirtualObjectivesFast:
                 break
         return False
 
+    def _objective_type_map(self, items=None) -> Dict[str, str]:
+        rows = self.items if items is None else items
+        out = {}
+        for item in rows or []:
+            if not isinstance(item, dict):
+                continue
+            oid = str(item.get("id", "") or "").strip()
+            if not oid:
+                continue
+            out[oid] = str(item.get("type", "") or "").strip().upper()
+        return out
+
+    def _read_checked_ids_from_save(self, save_path: str, items=None) -> Set[str]:
+        if not save_path or not os.path.exists(save_path):
+            return set()
+        try:
+            return _read_checked_objective_ids(save_path, self._objective_type_map(items))
+        except Exception:
+            return set()
+
     def _set_cb_var(self, pool_entry, value: bool):
         """Set checkbox variable without triggering trace callbacks."""
         try:
@@ -9383,17 +11479,26 @@ class VirtualObjectivesFast:
             self._full_window_id = None
 
     def _tooltip_text_for_item(self, item: Dict[str, Any]) -> str:
-        category_type = item.get("categoryType") or item.get("category") or ""
+        category_type = str(item.get("categoryType") or item.get("category") or "").strip()
+        category_display = category_type
+        if category_type == "truckDelivery":
+            category_display = "Truck Delivery"
+        elif category_type == "cargoDelivery":
+            category_display = "Cargo Delivery"
+        elif category_type == "exploration":
+            category_display = "Exploration"
+        elif category_type:
+            category_display = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", category_type).strip().title()
         cargo_info = item.get("cargo", "")
         tip = (
-            f"Name: {item.get('displayName','')}\n"
-            f"Type: {item.get('type','').title()}\n"
-            f"Category: {category_type}\n"
-            f"Region: {REGION_NAME_MAP.get(item.get('region'), item.get('region_name') or item.get('region') or '')}\n"
-            f"Money: {item.get('money','')}\nXP: {item.get('xp','')}\n"
+            f"{_editor_translate_display_text('Name')}: {item.get('displayName','')}\n"
+            f"{_editor_translate_display_text('Type')}: {_editor_translate_display_text(item.get('type','').title())}\n"
+            f"{_editor_translate_display_text('Category')}: {_editor_translate_display_text(category_display)}\n"
+            f"{_editor_translate_display_text('Region')}: {REGION_NAME_MAP.get(item.get('region'), item.get('region_name') or item.get('region') or '')}\n"
+            f"{_editor_translate_display_text('Money')}: {item.get('money','')}\n{_editor_translate_display_text('XP')}: {item.get('xp','')}\n"
         )
         if category_type == "cargoDelivery":
-            tip += f"Cargo: {cargo_info}\n"
+            tip += f"{_editor_translate_display_text('Cargo')}: {cargo_info}\n"
         desc = item.get("desc", "")
         if desc:
             tip += f"\n{desc}"
@@ -9606,21 +11711,35 @@ class VirtualObjectivesFast:
         if self._refresh_inflight:
             return
         self._refresh_inflight = True
-        base_text = "Fetching newer data" if self.items else "Fetching data"
+        base_text = "Reloading game data" if self.items else "Loading game data"
         try:
-            if _get_objectives_safe_fallback_mode():
-                base_text = "Fetching safe fallback data"
+            if _objectives_local_probe().get("path"):
+                base_text = "Reloading initial.pak data" if self.items else "Loading initial.pak data"
+            else:
+                base_text = "Fetching fallback data"
         except Exception:
             pass
         self._start_loading_animation(base_text)
-        cache_csv = _objectives_cache_csv_path()
 
         def worker():
             built = False
+            built_local = False
+            built_fallback = False
+            local_lang = ""
             try:
-                built = _mr_build_csv(cache_csv)
+                source_info = _objectives_get_preferred_source(
+                    force_reload=True,
+                    language=_objectives_get_language_preference(),
+                    allow_download=True,
+                )
+                built = bool(source_info.get("rows"))
+                built_local = built and str(source_info.get("kind") or "").strip().lower() == "local"
+                built_fallback = built and str(source_info.get("kind") or "").strip().lower() == "fallback"
+                local_lang = str(source_info.get("language") or "")
             except Exception:
                 built = False
+                built_local = False
+                built_fallback = False
 
             def finish():
                 self._refresh_inflight = False
@@ -9628,19 +11747,28 @@ class VirtualObjectivesFast:
                 if built or not self.items:
                     # reload from cache/bundled without blocking
                     self.load_data_thread(allow_build=False, preserve_changes=True, keep_existing_items=True, show_loading=False)
-                if built:
-                    self._set_status_temp("Updated to latest data", 2000)
+                if built_local:
+                    self._set_status_temp(
+                        f"Reloaded initial.pak ({_objectives_language_label(local_lang or _objectives_get_language_preference())})",
+                        2500,
+                    )
+                elif built_fallback:
+                    try:
+                        missing_local_pak = not bool(_objectives_local_probe().get("path"))
+                    except Exception:
+                        missing_local_pak = False
+                    if missing_local_pak:
+                        self._set_status_temp(_objectives_missing_pak_message(use_fallback=True), 4500)
+                    else:
+                        self._set_status_temp(
+                            f"Reloaded fallback package ({_objectives_language_label(local_lang or _objectives_get_language_preference())})",
+                            2500,
+                        )
                 else:
                     if self.items:
-                        self._set_status_temp("Update failed — using cached data", 3000)
+                        self._set_status_temp("Reload failed — using cached data", 3000)
                     else:
-                        try:
-                            if _get_objectives_safe_fallback_mode() and _MR_SAFE_FALLBACK_ERROR:
-                                self._set_status_temp(_MR_SAFE_FALLBACK_ERROR, 5000)
-                                return
-                        except Exception:
-                            pass
-                        self._set_status_temp("No data available (offline)", 3000)
+                        self._set_status_temp("No objectives data available", 3000)
 
             try:
                 if hasattr(self.parent, "after"):
@@ -9661,11 +11789,100 @@ class VirtualObjectivesFast:
         _update_config_values({"objectives_use_safe_fallback": bool(enabled)})
         try:
             if enabled:
-                self._set_status_temp("Safe fallback enabled — using GitHub data", 4000)
+                self._set_status_temp("Safe fallback enabled — legacy data will be used if local parsing fails", 4000)
             else:
-                self._set_status_temp("Safe fallback disabled — refresh to update", 3000)
+                self._set_status_temp("Safe fallback disabled", 2500)
         except Exception:
             pass
+
+    def _refresh_local_source_controls(self) -> Dict[str, Any]:
+        probe = _objectives_local_probe()
+        available = list(probe.get("available_languages") or [])
+        fallback_manifest = {}
+        fallback_languages = []
+        if not available:
+            try:
+                fallback_info = _objectives_fallback_get_manifest(force_refresh=False, allow_download=False)
+                fallback_manifest = fallback_info.get("manifest") if isinstance(fallback_info, dict) else {}
+            except Exception:
+                fallback_manifest = {}
+            if isinstance(fallback_manifest, dict):
+                fallback_languages = list(fallback_manifest.get("languages") or [])
+                if fallback_languages:
+                    available = fallback_languages
+        current = _objectives_get_language_preference()
+        if current not in available:
+            if _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE in available:
+                current = _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE
+            elif available:
+                current = available[0]
+            else:
+                current = _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE
+
+        try:
+            self.language_var.set(_objectives_language_label(current))
+        except Exception:
+            pass
+
+        pak_path = str(probe.get("path") or "").strip()
+        source_kind = str(probe.get("source") or "").strip()
+        language_summary = f"{_editor_translate_display_text('Language')}: {_objectives_language_label(current)}"
+        if pak_path:
+            source_label = {
+                "config": "Saved path",
+                "env": "Environment",
+                "steam": "Auto-detected",
+                "manifest": "Auto-detected",
+                "scan": "Auto-detected",
+            }.get(source_kind.lower(), source_kind.capitalize() if source_kind else "Detected")
+            summary = f"{source_label}: {pak_path} | {language_summary}"
+        elif fallback_languages:
+            summary = f"{_objectives_missing_pak_message(use_fallback=True)} | {language_summary}"
+        else:
+            summary = f"{_objectives_missing_pak_message(use_fallback=False)} | {language_summary}"
+        try:
+            self.source_summary_var.set(summary)
+        except Exception:
+            pass
+        return probe
+
+    def _choose_initial_pak(self) -> None:
+        try:
+            start_dir = ""
+            existing = _objectives_get_pak_override_path() or _objectives_local_probe().get("path", "")
+            if existing:
+                start_dir = os.path.dirname(existing)
+            path = filedialog.askopenfilename(
+                title="Select initial.pak",
+                initialdir=start_dir or None,
+                initialfile="initial.pak",
+                filetypes=[("initial.pak", "initial.pak"), ("PAK files", "*.pak")],
+            )
+        except Exception:
+            path = ""
+        if not path:
+            return
+        if os.path.basename(path).lower() != "initial.pak":
+            try:
+                messagebox.showerror("Invalid file", "Only files named initial.pak can be selected.")
+            except Exception:
+                pass
+            return
+        saved = _objectives_set_pak_override_path(path)
+        _objectives_invalidate_runtime_caches()
+        self._refresh_local_source_controls()
+        self.load_data_thread(allow_build=True, preserve_changes=True, keep_existing_items=False, show_loading=True)
+        self._set_status_temp(f"Using initial.pak from {saved}", 3500)
+
+    def _clear_initial_pak_override(self) -> None:
+        _objectives_set_pak_override_path("")
+        _objectives_invalidate_runtime_caches()
+        probe = self._refresh_local_source_controls()
+        self.load_data_thread(allow_build=True, preserve_changes=True, keep_existing_items=False, show_loading=True)
+        if probe.get("path"):
+            self._set_status_temp("Using auto-detected initial.pak", 3000)
+        else:
+            self._set_status_temp("Cleared manual initial.pak override", 3000)
 
     # ---------------- UI builder ----------------
     def build_ui(self):
@@ -9696,13 +11913,12 @@ class VirtualObjectivesFast:
         cb3.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
 
         ttk.Button(self.topbar, text="Reload Save", command=self.reload_checked_from_save).pack(side="right", padx=4)
-        self.safe_fallback_cb = ttk.Checkbutton(
-            self.topbar,
-            text="Use safe fallback (English)",
-            variable=self.safe_fallback_var,
-            command=self._on_safe_fallback_toggle,
-        )
-        self.safe_fallback_cb.pack(side="right", padx=(6, 10))
+
+        self.sourcebar = ttk.Frame(self.frame)
+        self.sourcebar.pack(side="top", fill="x", padx=6, pady=(0, 6))
+
+        ttk.Button(self.sourcebar, text="initial.pak", command=self._choose_initial_pak).pack(side="left", padx=(0, 8))
+        ttk.Label(self.sourcebar, textvariable=self.source_summary_var, anchor="w", justify="left").pack(side="left", fill="x", expand=True)
 
         holder = tk.Frame(self.frame, bg=STRIPE_B)
         holder.pack(fill="both", expand=True, padx=6, pady=(0,6))
@@ -9789,6 +12005,8 @@ class VirtualObjectivesFast:
         ttk.Button(bottom, text="Uncheck filtered", command=self.uncheck_filtered).pack(side="right", padx=4)
         ttk.Button(bottom, text="Apply Changes", command=self.apply_changes_thread).pack(side="right")
         ttk.Button(bottom, text="Accept Tasks", command=self.accept_tasks_thread).pack(side="right", padx=(0, 4))
+
+        self._refresh_local_source_controls()
 
     # ---------------- canvas & virtual pool management ----------------
     def _on_canvas_configure(self, event):
@@ -10272,17 +12490,17 @@ class VirtualObjectivesFast:
         keep_existing_items: bool = False,
         show_loading: bool = True,
     ):
-        try:
-            if _get_objectives_safe_fallback_mode():
-                cache_csv = _objectives_cache_csv_path()
-                if not cache_csv or not os.path.exists(cache_csv):
-                    allow_build = True
-        except Exception:
-            pass
         started_loading = False
         try:
             if show_loading and not self._loading_active:
-                base_text = "Loading data" if allow_build else "Loading cached data"
+                try:
+                    has_local_pak = bool(_objectives_local_probe().get("path"))
+                except Exception:
+                    has_local_pak = False
+                if has_local_pak:
+                    base_text = "Loading initial.pak data" if allow_build else "Loading cached initial.pak data"
+                else:
+                    base_text = "Loading fallback package" if allow_build else "Loading fallback data"
                 self._start_loading_animation(base_text)
                 started_loading = True
         except Exception:
@@ -10298,27 +12516,21 @@ class VirtualObjectivesFast:
         def worker():
             log("Worker: starting data processing thread")
             tstart = time.perf_counter()
-            df = _load_parquet_safe(allow_build=allow_build)
-            if df is None or (hasattr(df, "empty") and df.empty):
-                log("No data in parquet or failed to read.")
+            source_rows = _load_objectives_rows(allow_refresh=allow_build)
+            if not source_rows:
+                log("No objectives data available or source load failed.")
                 return
-            df.columns = [str(c).strip().lower() for c in df.columns]
             all_items = []
-            for idx, row in df.iterrows():
+            for idx, raw_row in enumerate(source_rows):
+                row = {
+                    str(k).strip().lower(): v
+                    for k, v in (raw_row.items() if isinstance(raw_row, dict) else [])
+                }
                 def g(k):
-                    try:
-                        v = row.get(k.lower(), "")
-                    except Exception:
-                        v = ""
-                    if _pd is not None:
-                        try:
-                            if _pd.isna(v):
-                                return ""
-                        except Exception:
-                            pass
+                    v = row.get(str(k or "").strip().lower(), "")
                     return "" if v is None else str(v)
                 key = g("key") or g("id") or g("name") or f"ITEM_{idx}"
-                display = _mr_normalize_mojibake_text(g("displayname") or g("name") or key)
+                display = _normalize_text_artifacts(g("displayname") or g("name") or key)
                 if not display.strip() or display.startswith("---"):
                     continue
                 excel_type = g("type")
@@ -10345,7 +12557,7 @@ class VirtualObjectivesFast:
                     "money": g("money"),
                     "xp": g("experience"),
                     "cargo": g("cargo_needed"),
-                    "desc": _mr_normalize_mojibake_text(g("descriptiontext") or ""),
+                    "desc": _normalize_text_artifacts(g("descriptiontext") or ""),
                     "source": raw_source
                 }
                 all_items.append(item)
@@ -10355,10 +12567,7 @@ class VirtualObjectivesFast:
             sp = self.tk_var_get(self.save_var)
             pre = set()
             if sp and os.path.exists(sp):
-                try:
-                    pre = _read_finished_contests(sp) | _read_finished_missions(sp)
-                except Exception:
-                    pre = set()
+                pre = self._read_checked_ids_from_save(sp, all_items)
 
             def finish():
                 self.items = all_items
@@ -10394,16 +12603,51 @@ class VirtualObjectivesFast:
                     if isinstance(child, ttk.Combobox) and child.cget("width") == 20:
                         child.config(values=[""] + [r for r in regs if r])
                 try:
+                    self._refresh_local_source_controls()
+                except Exception:
+                    pass
+                source_info = {}
+                try:
+                    source_info = _get_objectives_source_info()
+                except Exception:
+                    source_info = {}
+                final_status = ""
+                source_kind = str(source_info.get("kind") or "").strip().lower()
+                if source_kind == "local":
+                    lang_label = _objectives_language_label(source_info.get("language") or _objectives_get_language_preference())
+                    final_status = f"Loaded {len(all_items)} objectives from initial.pak ({lang_label})"
+                elif source_kind == "fallback":
+                    try:
+                        missing_local_pak = not bool(_objectives_local_probe().get("path"))
+                    except Exception:
+                        missing_local_pak = False
+                    if missing_local_pak:
+                        final_status = _objectives_missing_pak_message(use_fallback=True)
+                    else:
+                        final_status = f"Loaded {len(all_items)} fallback objectives"
+                elif source_kind == "none" and not all_items:
+                    final_status = "No objectives data available"
+                try:
                     if self._loading_active and self.items:
-                        if self._loading_base.lower().startswith("fetching data"):
-                            self._set_loading_base("Fetching newer data")
+                        base_lower = self._loading_base.lower()
+                        if (
+                            base_lower.startswith("fetching data")
+                            or base_lower.startswith("loading game data")
+                            or base_lower.startswith("loading initial.pak data")
+                        ):
+                            self._set_loading_base("Reloading game data")
                 except Exception:
                     pass
                 log(f"Scheduling finish: items={len(self.items)} original_checked={len(self.original_checked)})")
                 self.apply_filters()
                 if started_loading:
                     try:
-                        self._stop_loading_animation(final_text="")
+                        self._stop_loading_animation(final_text=final_status)
+                    except Exception:
+                        pass
+                elif final_status:
+                    try:
+                        self._set_status(final_status)
                     except Exception:
                         pass
             try:
@@ -10545,7 +12789,7 @@ class VirtualObjectivesFast:
 
                 if task_reaccept_ids:
                     try:
-                        _experiments_load_js_objective_sources(force_reload=True)
+                        _experiments_load_objective_sources(force_reload=True)
                     except Exception:
                         pass
                     _experiments_reaccept_finished_tasks(
@@ -10579,6 +12823,7 @@ class VirtualObjectivesFast:
                                     if not isinstance(cur, dict):
                                         cur = {}
                                     cur["isFinished"] = True
+                                    cur["wasCompletedAtLeastOnce"] = True
                                     obj_states[kid] = cur
                                 new_block = json.dumps(obj_states, indent=4, ensure_ascii=False)
                                 content = content[:bs] + new_block + content[be:]
@@ -10589,9 +12834,9 @@ class VirtualObjectivesFast:
 
                     if contest_changes:
                         try:
-                            global_contest_times_new = {}
-                            added_total = 0
-                            removed_total = 0
+                            finished_added_total = 0
+                            contest_time_added_total = 0
+                            viewed_removed_total = 0
 
                             matches = list(re.finditer(r'"(CompleteSave\d*)"\s*:\s*{', content))
                             for match in reversed(matches):
@@ -10614,49 +12859,94 @@ class VirtualObjectivesFast:
                                     else:
                                         finished_set = set()
 
-                                    contest_times = ssl.get("contestTimes", {})
-                                    if not isinstance(contest_times, dict):
-                                        contest_times = {}
+                                    direct_contest_times_raw = ssl.get("contestTimes", None)
+                                    direct_contest_times_present = isinstance(direct_contest_times_raw, dict)
+                                    direct_contest_times = dict(direct_contest_times_raw) if direct_contest_times_present else {}
+
+                                    persistent_profile = ssl.get("persistentProfileData")
+                                    if isinstance(persistent_profile, dict):
+                                        persistent_profile = dict(persistent_profile)
+                                        persistent_contest_times = persistent_profile.get("contestTimes")
+                                        if not isinstance(persistent_contest_times, dict):
+                                            persistent_contest_times = {}
+                                        else:
+                                            persistent_contest_times = dict(persistent_contest_times)
+                                    else:
+                                        persistent_profile = None
+                                        persistent_contest_times = None
+
+                                    override_profile = ssl.get("overrideStartingProfileData")
+                                    if isinstance(override_profile, dict):
+                                        override_profile = dict(override_profile)
+                                        override_contest_times = override_profile.get("contestTimes")
+                                        if not isinstance(override_contest_times, dict):
+                                            override_contest_times = {}
+                                        else:
+                                            override_contest_times = dict(override_contest_times)
+                                    else:
+                                        override_profile = None
+                                        override_contest_times = None
 
                                     added_here = []
-                                    removed_here = []
+                                    timed_here = []
+                                    changed = False
 
                                     for k in contest_changes.keys():
                                         if k not in finished_set:
                                             finished_set.add(k)
                                             added_here.append(k)
-                                        if k not in contest_times:
-                                            contest_times[k] = 1
-                                            global_contest_times_new[k] = 1
+                                            changed = True
 
-                                    if added_here or removed_here:
+                                        added_time_here = False
+                                        if direct_contest_times_present and k not in direct_contest_times:
+                                            direct_contest_times[k] = 1
+                                            added_time_here = True
+                                        if persistent_contest_times is not None and k not in persistent_contest_times:
+                                            persistent_contest_times[k] = 1
+                                            added_time_here = True
+                                        if override_contest_times is not None and k not in override_contest_times:
+                                            override_contest_times[k] = 1
+                                            added_time_here = True
+                                        if added_time_here:
+                                            timed_here.append(k)
+                                            changed = True
+
+                                    if changed:
                                         if finished_is_dict:
                                             ssl["finishedObjs"] = {kk: True for kk in finished_set}
                                         else:
                                             ssl["finishedObjs"] = list(finished_set)
 
-                                        ssl["contestTimes"] = contest_times
+                                        if direct_contest_times_present:
+                                            ssl["contestTimes"] = direct_contest_times
+                                        if persistent_profile is not None:
+                                            persistent_profile["contestTimes"] = persistent_contest_times
+                                            ssl["persistentProfileData"] = persistent_profile
+                                        if override_profile is not None:
+                                            override_profile["contestTimes"] = override_contest_times
+                                            ssl["overrideStartingProfileData"] = override_profile
 
                                         viewed = ssl.get("viewedUnactivatedObjectives", [])
-                                        if isinstance(viewed, list) and added_here:
-                                            ssl["viewedUnactivatedObjectives"] = [v for v in viewed if v not in added_here]
+                                        patched_here = set(added_here) | set(timed_here)
+                                        if isinstance(viewed, list) and patched_here:
+                                            new_viewed = [v for v in viewed if v not in patched_here]
+                                            viewed_removed_total += max(0, len(viewed) - len(new_viewed))
+                                            ssl["viewedUnactivatedObjectives"] = new_viewed
 
                                         value_data["SslValue"] = ssl
                                         new_value_block_str = json.dumps(value_data, separators=(",", ":"))
                                         content = content[:val_block_start] + new_value_block_str + content[val_block_end:]
 
-                                        added_total += len(added_here)
-                                        removed_total += len(removed_here)
+                                        finished_added_total += len(added_here)
+                                        contest_time_added_total += len(timed_here)
                                 except Exception:
                                     continue
 
-                            if global_contest_times_new and 'update_all_contest_times_blocks' in globals():
-                                try:
-                                    content = update_all_contest_times_blocks(content, global_contest_times_new)
-                                except Exception:
-                                    pass
-
-                            log(f"[BATCH WRITE] Contests updated: +{added_total} / -{removed_total}")
+                            log(
+                                f"[BATCH WRITE] Contests updated: "
+                                f"+{finished_added_total} finished / +{contest_time_added_total} times "
+                                f"/ -{viewed_removed_total} viewed"
+                            )
                         except Exception as e:
                             log(f"[BATCH WRITE] Failed to patch CompleteSave blocks: {e}")
 
@@ -10673,7 +12963,7 @@ class VirtualObjectivesFast:
                 log(f"[BATCH WRITE][ERROR] {ex}")
 
             try:
-                new_checked = _read_finished_contests(sp) | _read_finished_missions(sp) if sp and os.path.exists(sp) else set()
+                new_checked = self._read_checked_ids_from_save(sp) if sp and os.path.exists(sp) else set()
             except Exception:
                 new_checked = set()
             self.original_checked = new_checked
@@ -10758,7 +13048,7 @@ class VirtualObjectivesFast:
         def worker():
             try:
                 try:
-                    _experiments_load_js_objective_sources(force_reload=True)
+                    _experiments_load_objective_sources(force_reload=True)
                 except Exception:
                     pass
                 stats = _experiments_accept_objectives(
@@ -10779,7 +13069,7 @@ class VirtualObjectivesFast:
                 log(f"[ACCEPT TASKS][ERROR] {ex}")
 
             try:
-                new_checked = _read_finished_contests(sp) | _read_finished_missions(sp) if sp and os.path.exists(sp) else set()
+                new_checked = self._read_checked_ids_from_save(sp) if sp and os.path.exists(sp) else set()
             except Exception:
                 new_checked = set()
             self.original_checked = new_checked
@@ -10819,7 +13109,7 @@ class VirtualObjectivesFast:
         if not sp or not os.path.exists(sp):
             return
         try:
-            new_checked = _read_finished_contests(sp) | _read_finished_missions(sp)
+            new_checked = self._read_checked_ids_from_save(sp)
         except Exception:
             new_checked = set()
 
@@ -11719,6 +14009,7 @@ def create_objectives_tab(tab, save_path_var):
     """
     try:
         v = VirtualObjectivesFast(tab, save_path_var)
+        _objectives_register_active_view(v)
 
         try:
             v.build_ui()
@@ -11734,19 +14025,31 @@ def create_objectives_tab(tab, save_path_var):
         except Exception:
             pass
 
+        def _cleanup_active_objectives_view(event=None):
+            if (event is not None) and (getattr(event, "widget", None) not in {tab, getattr(v, "frame", None)}):
+                return
+            active = _objectives_get_active_view()
+            if active is v:
+                _objectives_register_active_view(None)
+
         try:
-            # Quick load from cached/bundled CSV first (no blocking build)
+            tab.bind("<Destroy>", _cleanup_active_objectives_view, add="+")
+        except Exception:
+            pass
+        try:
+            if getattr(v, "frame", None) is not None:
+                v.frame.bind("<Destroy>", _cleanup_active_objectives_view, add="+")
+        except Exception:
+            pass
+
+        try:
+            # Quick load from local initial.pak or fallback package first.
             v.load_data_thread(allow_build=False, preserve_changes=False, keep_existing_items=False, show_loading=True)
-            try:
-                if _get_objectives_safe_fallback_mode():
-                    v._set_status_temp("Safe fallback enabled — using GitHub data", 3500)
-            except Exception:
-                pass
             prefetch_state = _objectives_prefetch_snapshot()
 
             if prefetch_state.get("inflight"):
                 try:
-                    v._set_status_temp("Background refresh already running...", 2500)
+                    v._set_status_temp("Background objectives refresh already running...", 2500)
                 except Exception:
                     pass
 
@@ -11762,7 +14065,7 @@ def create_objectives_tab(tab, save_path_var):
                         if st.get("built"):
                             v.load_data_thread(allow_build=False, preserve_changes=True, keep_existing_items=True, show_loading=False)
                             try:
-                                v._set_status_temp("Updated to latest data", 2000)
+                                v._set_status_temp("Updated objectives data", 2000)
                             except Exception:
                                 pass
                         else:
@@ -11778,7 +14081,7 @@ def create_objectives_tab(tab, save_path_var):
                     pass
             elif prefetch_state.get("completed") and prefetch_state.get("built"):
                 try:
-                    v._set_status_temp("Using latest startup-cached data", 2000)
+                    v._set_status_temp("Using startup-cached objectives data", 2000)
                 except Exception:
                     pass
             else:
@@ -11793,17 +14096,6 @@ def create_objectives_tab(tab, save_path_var):
     except Exception as e:
         # Fallback placeholder (created lazily here to avoid GUI imports at module import time)
         try:
-            top = ttk.Frame(tab)
-            top.pack(fill='x', padx=6, pady=6)
-            parquet_var = tk.StringVar(value="")
-            ttk.Label(top, text="Parquet file:").pack(side='left')
-            ttk.Entry(top, textvariable=parquet_var, width=60).pack(side='left', padx=(6,4))
-            def pick_parquet():
-                p = filedialog.askopenfilename(filetypes=[("Parquet files","*.parquet"),("All","*.*")])
-                if p:
-                    parquet_var.set(p)
-            ttk.Button(top, text="Browse...", command=pick_parquet).pack(side='left', padx=4)
-
             body = ttk.Frame(tab)
             body.pack(fill='both', expand=True, padx=6, pady=6)
             info = ttk.Label(body, text="Objectives+ — failed to initialize (see console).", wraplength=700, justify='left')
@@ -11811,7 +14103,7 @@ def create_objectives_tab(tab, save_path_var):
         except Exception:
             # If we can't even import tkinter for the fallback, do nothing (import-safety preserved).
             log(f"Failed to initialize Objectives+ fallback placeholder: {e}")
-__all__ = ["VirtualObjectivesFast", "create_objectives_tab", "default_parquet_path", "DEBUG"]
+__all__ = ["VirtualObjectivesFast", "create_objectives_tab", "DEBUG"]
 
 # UI helper: "Check All" for groups of IntVar checkboxes
 def _add_check_all_checkbox(tab, all_vars, before_widget=None, label="Check All"):
@@ -12961,8 +15253,7 @@ def create_achievements_tab(tab, save_path_var, plugin_loaders):
             if orig_parsed is None:
                 out_block = {"SslType": "CommonSaveObject", "SslValue": {"achievementStates": new_ach}}
                 new_block_str = json.dumps(out_block, separators=(",", ":"))
-                with open(p, "w", encoding="utf-8") as out_f:
-                    out_f.write(new_block_str)
+                _write_text_file_atomic(p, new_block_str, encoding="utf-8")
                 show_info("Saved", "Achievements saved to file (rewrote file).")
                 return
 
@@ -12975,11 +15266,9 @@ def create_achievements_tab(tab, save_path_var, plugin_loaders):
             new_block_str = json.dumps(parsed_to_write, separators=(",", ":"))
             if bs is not None and be is not None:
                 new_content = content[:bs] + new_block_str + content[be:]
-                with open(p, "w", encoding="utf-8") as out_f:
-                    out_f.write(new_content)
+                _write_text_file_atomic(p, new_content, encoding="utf-8")
             else:
-                with open(p, "w", encoding="utf-8") as out_f:
-                    out_f.write(new_block_str)
+                _write_text_file_atomic(p, new_block_str, encoding="utf-8")
 
             try:
                 cfg = load_config() or {}
@@ -13091,7 +15380,6 @@ def create_pros_tab(tab, save_path_var, plugin_loaders):
             root = tab.winfo_toplevel()
             root.clipboard_clear()
             root.clipboard_append(PROS_URL)
-            root.update()
             show_info("Copied", "PROS link copied to clipboard.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to copy link:\n{e}")
@@ -13194,8 +15482,7 @@ def create_pros_tab(tab, save_path_var, plugin_loaders):
             else:
                 new_content = new_block_str
 
-            with open(path, "w", encoding="utf-8") as out_f:
-                out_f.write(new_content)
+            _write_text_file_atomic(path, new_content, encoding="utf-8")
 
             _save_common_ssl_path_to_config(path)
 
@@ -13407,8 +15694,7 @@ def create_trials_tab(tab, save_path_var, plugin_loaders):
             with open(path, "r", encoding="utf-8") as f:
                 text = f.read()
             new_text = _write_finished_trials_into_text(text, finished)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(new_text)
+            _write_text_file_atomic(path, new_text, encoding="utf-8")
             _save_common_ssl_path_to_config(path)
             show_info("Saved", "Trials saved successfully.")
         except Exception as e:
@@ -13471,6 +15757,39 @@ def create_upgrades_tab(tab, save_path_var):
               style="Warning.TLabel").pack(pady=(0, 2))
     ttk.Label(tab, text="If a new season is added, you may need to mark or collect one new upgrade.",
               style="Warning.TLabel").pack()
+
+
+GAME_STAT_LABEL_OVERRIDES = {
+    "MULTIPLAYER_SESSIONS_PLAYED": "Multiplayer Sessions Played",
+    "TRUCK_SOLD": "Trucks Sold",
+    "MONEY_SPENT": "Money Spent",
+    "MULTIPLAYER_MISSIONS_FINISHED": "Multiplayer Missions Finished",
+    "ADDON_SOLD": "Addons Sold",
+    "TRAILER_BOUGHT": "Trailers Bought",
+    "ADDON_BOUGHT": "Addons Bought",
+    "TRAILER_SOLD": "Trailers Sold",
+    "MULTIPLAYER_MONEY_EARNED": "Multiplayer Money Earned",
+    "SESSION_NUMBER": "Session Number",
+    "MONEY_EARNED": "Money Earned",
+    "TRUCK_BOUGHT": "Trucks Bought",
+}
+
+GAME_STAT_FIELD_ORDER = [
+    "MULTIPLAYER_SESSIONS_PLAYED",
+    "TRUCK_SOLD",
+    "MONEY_SPENT",
+    "MULTIPLAYER_MISSIONS_FINISHED",
+    "ADDON_SOLD",
+    "TRAILER_BOUGHT",
+    "ADDON_BOUGHT",
+    "TRAILER_SOLD",
+    "MULTIPLAYER_MONEY_EARNED",
+    "SESSION_NUMBER",
+    "MONEY_EARNED",
+    "TRUCK_BOUGHT",
+]
+
+
 # TAB: Game Stats (launch_gui -> tab_stats)
 def create_game_stats_tab(tab, save_path_var, plugin_loaders):
 
@@ -13482,6 +15801,9 @@ def create_game_stats_tab(tab, save_path_var, plugin_loaders):
 
     def nice_name(raw_key: str) -> str:
         """Turn MONEY_SPENT → Money Spent and fix plural forms"""
+        override = GAME_STAT_LABEL_OVERRIDES.get(str(raw_key or "").strip().upper())
+        if override:
+            return override
         name = raw_key.replace("_", " ").title()
         replacements = {
             "Truck Sold": "Trucks Sold",
@@ -13492,6 +15814,44 @@ def create_game_stats_tab(tab, save_path_var, plugin_loaders):
             "Addon Bought": "Addons Bought",
         }
         return replacements.get(name, name)
+
+    def _ordered_distance_entries(parsed: Dict[str, Any]) -> List[Tuple[str, Any]]:
+        data = parsed if isinstance(parsed, dict) else {}
+        entries: List[Tuple[str, Any]] = []
+        seen = set()
+        for region_code in REGION_ORDER:
+            canonical = str(region_code or "").upper()
+            if not canonical:
+                continue
+            seen.add(canonical)
+            entries.append((canonical, data.get(canonical, data.get(region_code, 0))))
+        extras = []
+        for raw_key, raw_value in data.items():
+            canonical = str(raw_key or "").upper()
+            if canonical in seen:
+                continue
+            extras.append((str(raw_key or ""), raw_value))
+        extras.sort(key=lambda item: str(item[0]).upper())
+        return entries + extras
+
+    def _ordered_stat_entries(parsed: Dict[str, Any]) -> List[Tuple[str, Any]]:
+        data = parsed if isinstance(parsed, dict) else {}
+        entries: List[Tuple[str, Any]] = []
+        seen = set()
+        for stat_key in GAME_STAT_FIELD_ORDER:
+            canonical = str(stat_key or "").upper()
+            if not canonical:
+                continue
+            seen.add(canonical)
+            entries.append((canonical, data.get(canonical, data.get(stat_key, 0))))
+        extras = []
+        for raw_key, raw_value in data.items():
+            canonical = str(raw_key or "").upper()
+            if canonical in seen:
+                continue
+            extras.append((str(raw_key or ""), raw_value))
+        extras.sort(key=lambda item: nice_name(item[0]).lower())
+        return entries + extras
 
     # Find best distance block
     def _find_best_distance_block(content):
@@ -13553,13 +15913,7 @@ def create_game_stats_tab(tab, save_path_var, plugin_loaders):
         ttk.Label(center_frame, text="Game Statistics", font=("TkDefaultFont", 12, "bold")).grid(row=0, column=3, columnspan=2, pady=(0, 15), sticky="w")
 
         # distance rows
-        def dist_sort_key(k):
-            up = str(k).upper()
-            if up in REGION_ORDER:
-                return (0, REGION_ORDER.index(up))
-            return (1, str(k).upper())
-
-        dist_items = sorted(distance_parsed.items(), key=lambda kv: dist_sort_key(kv[0]))
+        dist_items = _ordered_distance_entries(distance_parsed)
         for i, (region, value) in enumerate(dist_items, start=1):
             region_up = str(region).upper()
             label_text = REGION_LONG_NAME_MAP.get(region_up, region)
@@ -13569,16 +15923,21 @@ def create_game_stats_tab(tab, save_path_var, plugin_loaders):
             ttk.Entry(center_frame, textvariable=var, width=12).grid(row=i, column=1, sticky="w", pady=2)
 
         # stats rows
-        for j, (key, value) in enumerate(game_stat.items(), start=1):
+        stat_items = _ordered_stat_entries(game_stat)
+        for j, (key, value) in enumerate(stat_items, start=1):
             ttk.Label(center_frame, text=nice_name(key) + ":", anchor="w", justify="left").grid(row=j, column=3, sticky="w", padx=(0, 6), pady=3)
             var = tk.StringVar(value=str(value))
             stats_vars[key] = var
             ttk.Entry(center_frame, textvariable=var, width=20).grid(row=j, column=4, sticky="w", pady=3)
 
         # Save button
-        final_row = 1 + max(len(dist_items), len(game_stat))
+        final_row = 1 + max(len(dist_items), len(stat_items))
         btn = ttk.Button(center_frame, text="Save All", command=save_all)
         btn.grid(row=final_row, column=0, columnspan=5, pady=(15, 0))
+        try:
+            _editor_apply_language_to_widget_tree(center_frame)
+        except Exception:
+            pass
 
     def save_all():
         path = save_path_var.get()
@@ -13637,8 +15996,7 @@ def create_game_stats_tab(tab, save_path_var, plugin_loaders):
             content = content[:dstart] + new_block + content[dend:]
 
         # write back
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
+        _write_text_file_atomic(path, content, encoding="utf-8")
 
         show_info("Success", "Stats and distances updated.")
         refresh_ui(path)
@@ -14184,6 +16542,8 @@ _VEHICLE_METADATA_CACHE_INFO = None
 _VEHICLE_METADATA_CACHE_LOCK = threading.Lock()
 _VEHICLE_STATIC_ID_SOURCE_CACHE = None
 _VEHICLE_STATIC_ID_SOURCE_LOCK = threading.Lock()
+_VEHICLE_METADATA_REFRESH_LISTENERS = []
+_VEHICLE_METADATA_REFRESH_LOCK = threading.Lock()
 
 
 def _vehicle_static_ids_file_path() -> str:
@@ -14383,6 +16743,69 @@ def _vehicle_metadata_cache_path(kind: str) -> str:
     return os.path.join(cfg_dir, name)
 
 
+def _vehicle_invalidate_metadata_caches(clear_disk: bool = False) -> None:
+    global _VEHICLE_REAL_NAME_MAP_CACHE
+    global _VEHICLE_MAP_DISPLAY_INDEX_CACHE
+    global _VEHICLE_METADATA_CACHE_INFO
+
+    try:
+        with _VEHICLE_METADATA_CACHE_LOCK:
+            _VEHICLE_REAL_NAME_MAP_CACHE = None
+            _VEHICLE_MAP_DISPLAY_INDEX_CACHE = None
+            _VEHICLE_METADATA_CACHE_INFO = None
+    except Exception:
+        _VEHICLE_REAL_NAME_MAP_CACHE = None
+        _VEHICLE_MAP_DISPLAY_INDEX_CACHE = None
+        _VEHICLE_METADATA_CACHE_INFO = None
+
+    if not clear_disk:
+        return
+
+    cache_path = _vehicle_metadata_cache_path("maps")
+    if not cache_path:
+        return
+    try:
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+    except Exception:
+        pass
+
+
+def _vehicle_register_metadata_refresh_listener(callback) -> None:
+    if not callable(callback):
+        return
+    try:
+        with _VEHICLE_METADATA_REFRESH_LOCK:
+            if callback not in _VEHICLE_METADATA_REFRESH_LISTENERS:
+                _VEHICLE_METADATA_REFRESH_LISTENERS.append(callback)
+    except Exception:
+        pass
+
+
+def _vehicle_unregister_metadata_refresh_listener(callback) -> None:
+    try:
+        with _VEHICLE_METADATA_REFRESH_LOCK:
+            _VEHICLE_METADATA_REFRESH_LISTENERS[:] = [
+                cb for cb in _VEHICLE_METADATA_REFRESH_LISTENERS if cb is not callback
+            ]
+    except Exception:
+        pass
+
+
+def _vehicle_notify_metadata_refresh_listeners() -> None:
+    try:
+        with _VEHICLE_METADATA_REFRESH_LOCK:
+            listeners = list(_VEHICLE_METADATA_REFRESH_LISTENERS)
+    except Exception:
+        listeners = list(_VEHICLE_METADATA_REFRESH_LISTENERS)
+
+    for callback in listeners:
+        try:
+            callback()
+        except Exception:
+            pass
+
+
 def _vehicle_read_json_cache(path: str) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
         return {}
@@ -14416,209 +16839,13 @@ def _vehicle_write_json_cache(path: str, payload: Dict[str, Any]) -> None:
             pass
 
 
-def _vehicle_collect_maprunner_js_texts(allow_online: bool = False) -> List[str]:
-    """
-    Collect JS text blobs using the same MapRunner pipeline as Objectives+:
-      - in-memory canonical roles
-      - cached canonical JS files
-      - optional online refresh with random chunk role detection
-    """
-    try:
-        _mr_choose_best_js_roles()
-    except Exception:
-        pass
-
-    try:
-        _mr_load_cached_canonical_js_to_mem()
-    except Exception:
-        pass
-
-    if allow_online:
-        try:
-            _mr_download_js_step()
-        except Exception:
-            pass
-
-    try:
-        _mr_choose_best_js_roles()
-    except Exception:
-        pass
-
-    texts: List[str] = []
-    seen_texts = set()
-
-    def _add_text(raw: Any) -> None:
-        try:
-            txt = _mr_decode_bytes_to_text(raw) if raw is not None else None
-        except Exception:
-            txt = None
-        if not txt or not isinstance(txt, str):
-            return
-        if txt in seen_texts:
-            return
-        seen_texts.add(txt)
-        texts.append(txt)
-
-    try:
-        _add_text(_mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["data"]))
-    except Exception:
-        pass
-    try:
-        _add_text(_mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["desc"]))
-    except Exception:
-        pass
-
-    try:
-        for name, bs in list(_MR_IN_MEM_FILES.items()):
-            if not str(name or "").lower().endswith(".js"):
-                continue
-            _add_text(bs)
-    except Exception:
-        pass
-
-    return texts
-
-
-def _vehicle_extract_metadata_from_js_texts(
-    texts: List[str], localization_seed: Optional[Dict[str, str]] = None
-) -> (Dict[str, str], Dict[str, Dict[str, str]]):
-    localization = {}
-    if isinstance(localization_seed, dict) and localization_seed:
-        for k, v in localization_seed.items():
-            key = str(k or "").strip()
-            val = str(v or "").strip()
-            if key and val:
-                localization[key] = val
-    id_to_token = {}
-    level_tokens = {}
-    level_slugs = {}
-
-    pat_name_key = re.compile(
-        r'"name"\s*:\s*"(UI_(?:VEHICLE|TRAILER)_[A-Z0-9_]+)"\s*,\s*"key"\s*:\s*"([a-z0-9_./-]+)"',
-        flags=re.IGNORECASE,
-    )
-    pat_key_name = re.compile(
-        r'"key"\s*:\s*"([a-z0-9_./-]+)"\s*,\s*"name"\s*:\s*"(UI_(?:VEHICLE|TRAILER)_[A-Z0-9_]+)"',
-        flags=re.IGNORECASE,
-    )
-    pat_level_levelname = re.compile(
-        r'"level"\s*:\s*"level_([a-z0-9_]+)"\s*,\s*"levelName"\s*:\s*"([^"]+)"',
-        flags=re.IGNORECASE,
-    )
-    pat_levelname_level = re.compile(
-        r'"levelName"\s*:\s*"([^"]+)"\s*,\s*"level"\s*:\s*"level_([a-z0-9_]+)"',
-        flags=re.IGNORECASE,
-    )
-    pat_level_map_slug = re.compile(
-        r'"level"\s*:\s*"level_([a-z0-9_]+)"[\s\S]{0,220}?"map"\s*:\s*"([^"]+)"',
-        flags=re.IGNORECASE,
-    )
-
-    for text in texts or []:
-        if not text:
-            continue
-
-        # If localization seed is missing/incomplete, keep filling from scanned JS.
-        try:
-            parsed_loc = _mr_parse_localization_from_desc_text(text) or {}
-        except Exception:
-            parsed_loc = {}
-        if parsed_loc:
-            for k, v in parsed_loc.items():
-                if k not in localization:
-                    localization[k] = v
-
-        try:
-            for m in pat_name_key.finditer(text):
-                token = str(m.group(1) or "").strip()
-                type_id = str(m.group(2) or "").strip()
-                if not token or not type_id:
-                    continue
-                if not _sts_is_vehicle_or_trailer_type(type_id, ""):
-                    continue
-                id_to_token.setdefault(type_id, token)
-            for m in pat_key_name.finditer(text):
-                type_id = str(m.group(1) or "").strip()
-                token = str(m.group(2) or "").strip()
-                if not token or not type_id:
-                    continue
-                if not _sts_is_vehicle_or_trailer_type(type_id, ""):
-                    continue
-                id_to_token.setdefault(type_id, token)
-        except Exception:
-            pass
-
-        try:
-            for m in pat_level_levelname.finditer(text):
-                level = _map_normalize_id(m.group(1))
-                token = str(m.group(2) or "").strip()
-                if level and token:
-                    level_tokens.setdefault(level, set()).add(token)
-            for m in pat_levelname_level.finditer(text):
-                token = str(m.group(1) or "").strip()
-                level = _map_normalize_id(m.group(2))
-                if level and token:
-                    level_tokens.setdefault(level, set()).add(token)
-            for m in pat_level_map_slug.finditer(text):
-                level = _map_normalize_id(m.group(1))
-                slug = str(m.group(2) or "").strip()
-                if level and slug and level not in level_slugs:
-                    level_slugs[level] = slug
-        except Exception:
-            pass
-
-    name_map = {}
-    for type_id, token in id_to_token.items():
-        name = _experiments_translate_token(token, localization) if isinstance(localization, dict) and localization else token
-        name = _experiments_clean_text(name) if name else ""
-        if (not name) or _experiments_is_likely_token(name):
-            name = _vehicle_humanize_id(type_id)
-        name_map[type_id] = name
-
+def _vehicle_build_map_index_from_localization(localization: Dict[str, str]) -> Dict[str, Dict[str, str]]:
     map_index = {}
-    all_levels = set(level_tokens.keys()) | set(level_slugs.keys())
-    for map_id in sorted(all_levels):
-        region_code = _map_region_code_from_map_id(map_id)
-        region_name = _map_region_name_from_code(region_code)
-        map_name = ""
-
-        tokens = sorted(
-            list(level_tokens.get(map_id, set())),
-            key=lambda t: (
-                0 if str(t).upper().endswith("_NAME") else 1,
-                0 if not str(t).upper().startswith("LEVEL_") else 1,
-                len(str(t)),
-            ),
-        )
-        for token in tokens:
-            try:
-                translated = _experiments_translate_token(token, localization)
-            except Exception:
-                translated = token
-            cleaned = _experiments_clean_text(translated) if translated else ""
-            if cleaned and not _experiments_is_likely_token(cleaned):
-                map_name = cleaned
-                break
-
-        if not map_name:
-            slug = level_slugs.get(map_id, "")
-            map_name = _map_humanize_slug(slug)
-
-        if not map_name:
-            map_name = map_id
-
-        map_index[map_id] = {
-            "map_id": map_id,
-            "region_code": region_code,
-            "region_name": region_name,
-            "map_name": map_name,
-        }
-
     token_map_pat = re.compile(
         r"^(?:LEVEL_)?((?:US|RU)_\d{2}_\d{2}(?:_(?:NEW|CROP))?|TRIAL_\d{2}_\d{2})_NAME$",
         flags=re.IGNORECASE,
     )
-    for token, value in list(localization.items()):
+    for token, value in list((localization or {}).items()):
         m = token_map_pat.match(str(token or "").strip())
         if not m:
             continue
@@ -14626,24 +16853,39 @@ def _vehicle_extract_metadata_from_js_texts(
         cleaned = _experiments_clean_text(value)
         if not cleaned or _experiments_is_likely_token(cleaned):
             continue
+        region_code = _map_region_code_from_map_id(map_id)
+        map_index[map_id] = {
+            "map_id": map_id,
+            "region_code": region_code,
+            "region_name": _map_region_name_from_code(region_code),
+            "map_name": cleaned,
+        }
+    return map_index
 
-        entry = map_index.get(map_id)
-        if not isinstance(entry, dict):
-            region_code = _map_region_code_from_map_id(map_id)
-            entry = {
-                "map_id": map_id,
-                "region_code": region_code,
-                "region_name": _map_region_name_from_code(region_code),
-                "map_name": cleaned,
-            }
-            map_index[map_id] = entry
-            continue
 
-        current_name = str(entry.get("map_name", "") or "").strip()
-        if not current_name or current_name == map_id or _experiments_is_likely_token(current_name):
-            entry["map_name"] = cleaned
+def _vehicle_load_map_index_from_objectives_source(
+    force_reload: bool = False,
+    allow_download: bool = False,
+) -> Tuple[Dict[str, Dict[str, str]], str]:
+    try:
+        source_info = _objectives_get_preferred_source(
+            force_reload=bool(force_reload),
+            language=_objectives_get_language_preference(),
+            allow_download=bool(allow_download),
+        )
+    except Exception:
+        return {}, ""
 
-    return name_map, map_index
+    if not isinstance(source_info, dict):
+        return {}, ""
+
+    localization = source_info.get("localization")
+    if not isinstance(localization, dict) or not localization:
+        return {}, ""
+
+    map_index = _vehicle_build_map_index_from_localization(localization)
+    source_kind = str(source_info.get("kind") or source_info.get("source") or "").strip().lower()
+    return map_index, source_kind
 
 
 def _vehicle_normalize_name_map(payload: Any) -> Dict[str, str]:
@@ -14791,7 +17033,6 @@ def _vehicle_merge_map_index(
 def _vehicle_load_metadata(force_reload: bool = False, allow_online: bool = False):
     global _VEHICLE_REAL_NAME_MAP_CACHE, _VEHICLE_MAP_DISPLAY_INDEX_CACHE, _VEHICLE_METADATA_CACHE_INFO
 
-    # Quick in-memory hit (lock held only for this tiny section).
     with _VEHICLE_METADATA_CACHE_LOCK:
         if (
             (not force_reload)
@@ -14801,14 +17042,14 @@ def _vehicle_load_metadata(force_reload: bool = False, allow_online: bool = Fals
             info = _VEHICLE_METADATA_CACHE_INFO if isinstance(_VEHICLE_METADATA_CACHE_INFO, dict) else {}
             return _VEHICLE_REAL_NAME_MAP_CACHE, _VEHICLE_MAP_DISPLAY_INDEX_CACHE, info
 
-    # Read local backup without holding the lock.
-    name_map = _vehicle_normalize_name_map(_vehicle_read_json_cache(_vehicle_metadata_cache_path("names")))
-    map_index = _vehicle_normalize_map_index(_vehicle_read_json_cache(_vehicle_metadata_cache_path("maps")))
+    names_cache_path = _vehicle_metadata_cache_path("names")
+    maps_cache_path = _vehicle_metadata_cache_path("maps")
+    name_map = _vehicle_normalize_name_map(_vehicle_read_json_cache(names_cache_path))
+    map_index = _vehicle_normalize_map_index(_vehicle_read_json_cache(maps_cache_path))
     source_tags = []
     if name_map or map_index:
         source_tags.append("backup")
 
-    # Always merge local static ids/names from experiments/truck_trailer_ids.txt.
     try:
         static_map = _vehicle_normalize_name_map(_vehicle_static_name_map(force_reload=force_reload))
     except Exception:
@@ -14816,52 +17057,28 @@ def _vehicle_load_metadata(force_reload: bool = False, allow_online: bool = Fals
     if static_map:
         name_map = _vehicle_merge_name_maps(name_map, static_map)
         source_tags.append("local_ids")
-
-    # Fast path for normal UI: use local backup immediately.
-    if (not force_reload) and (not allow_online) and (name_map or map_index):
-        with _VEHICLE_METADATA_CACHE_LOCK:
-            current_names = _VEHICLE_REAL_NAME_MAP_CACHE if isinstance(_VEHICLE_REAL_NAME_MAP_CACHE, dict) else {}
-            current_maps = _VEHICLE_MAP_DISPLAY_INDEX_CACHE if isinstance(_VEHICLE_MAP_DISPLAY_INDEX_CACHE, dict) else {}
-            if current_names:
-                name_map = _vehicle_merge_name_maps(name_map, current_names)
-            if current_maps:
-                map_index = _vehicle_merge_map_index(map_index, current_maps)
-
-            _VEHICLE_REAL_NAME_MAP_CACHE = name_map
-            _VEHICLE_MAP_DISPLAY_INDEX_CACHE = map_index
-            _VEHICLE_METADATA_CACHE_INFO = {
-                "source": ",".join(source_tags) if source_tags else "none",
-                "name_count": len(name_map),
-                "map_count": len(map_index),
-            }
-            return _VEHICLE_REAL_NAME_MAP_CACHE, _VEHICLE_MAP_DISPLAY_INDEX_CACHE, _VEHICLE_METADATA_CACHE_INFO
-
-    # Potentially slow JS discovery/download/parsing; keep lock released.
-    texts = _vehicle_collect_maprunner_js_texts(allow_online=allow_online)
-    if texts:
-        loc_seed = {}
         try:
-            desc_choice = _mr_choose_first_available([_MR_CANONICAL_NAMES["desc"], "desc.js"])
+            _vehicle_write_json_cache(names_cache_path, name_map)
         except Exception:
-            desc_choice = None
+            pass
+
+    needs_source = bool(force_reload or allow_online or not map_index)
+    if needs_source:
         try:
-            loc_seed = _mr_collect_localization(desc_choice) if desc_choice else {}
+            source_map_index, source_kind = _vehicle_load_map_index_from_objectives_source(
+                force_reload=force_reload,
+                allow_download=allow_online,
+            )
         except Exception:
-            loc_seed = {}
+            source_map_index, source_kind = {}, ""
+        if source_map_index:
+            map_index = _vehicle_merge_map_index(map_index, source_map_index)
+            source_tags.append(f"objectives_{source_kind or 'source'}")
+            try:
+                _vehicle_write_json_cache(maps_cache_path, map_index)
+            except Exception:
+                pass
 
-        parsed_names, parsed_maps = _vehicle_extract_metadata_from_js_texts(texts, localization_seed=loc_seed)
-        parsed_names = _vehicle_normalize_name_map(parsed_names)
-        parsed_maps = _vehicle_normalize_map_index(parsed_maps)
-        if parsed_names:
-            name_map = _vehicle_merge_name_maps(name_map, parsed_names)
-        if parsed_maps:
-            map_index = _vehicle_merge_map_index(map_index, parsed_maps)
-        if parsed_names or parsed_maps:
-            source_tags.append("online" if allow_online else "objectives_cache")
-            _vehicle_write_json_cache(_vehicle_metadata_cache_path("names"), name_map)
-            _vehicle_write_json_cache(_vehicle_metadata_cache_path("maps"), map_index)
-
-    # Final cache swap under lock.
     with _VEHICLE_METADATA_CACHE_LOCK:
         current_names = _VEHICLE_REAL_NAME_MAP_CACHE if isinstance(_VEHICLE_REAL_NAME_MAP_CACHE, dict) else {}
         current_maps = _VEHICLE_MAP_DISPLAY_INDEX_CACHE if isinstance(_VEHICLE_MAP_DISPLAY_INDEX_CACHE, dict) else {}
@@ -16336,6 +18553,7 @@ def create_vehicles_tab(tab, save_path_var):
         if sts_state.get("is_loading"):
             return
 
+        request_generation = _get_objectives_source_generation()
         metadata_state["refresh_running"] = True
 
         def _worker():
@@ -16348,6 +18566,10 @@ def create_vehicles_tab(tab, save_path_var):
 
             def _apply():
                 metadata_state["refresh_running"] = False
+                if request_generation != _get_objectives_source_generation():
+                    metadata_state["refresh_done"] = False
+                    _refresh_vehicle_metadata_in_background(force=True)
+                    return
                 if not ok:
                     return
                 metadata_state["refresh_done"] = True
@@ -16359,6 +18581,31 @@ def create_vehicles_tab(tab, save_path_var):
                 pass
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _handle_objectives_source_changed():
+        metadata_state["refresh_done"] = False
+        try:
+            if not bool(tab.winfo_exists()):
+                _vehicle_unregister_metadata_refresh_listener(_handle_objectives_source_changed)
+                return
+        except Exception:
+            _vehicle_unregister_metadata_refresh_listener(_handle_objectives_source_changed)
+            return
+        try:
+            tab.after(0, lambda: _refresh_vehicle_metadata_in_background(force=True))
+        except Exception:
+            pass
+
+    def _cleanup_vehicle_metadata_listener(event=None):
+        if (event is not None) and (getattr(event, "widget", None) is not tab):
+            return
+        _vehicle_unregister_metadata_refresh_listener(_handle_objectives_source_changed)
+
+    _vehicle_register_metadata_refresh_listener(_handle_objectives_source_changed)
+    try:
+        tab.bind("<Destroy>", _cleanup_vehicle_metadata_listener, add="+")
+    except Exception:
+        pass
 
     def _clear_sts_view(message: str):
         sts_state["load_token"] = int(sts_state.get("load_token", 0)) + 1
@@ -17329,63 +19576,40 @@ def _experiments_humanize_objective_key(objective_id):
 
 def _experiments_load_objective_index():
     """
-    Load objective index rows from maprunner_data.csv.
+    Load objective index rows from the active Objectives+ source
+    (local initial.pak or fallback package).
     Returns a list of normalized rows.
     """
-    csv_path = resource_path("maprunner_data.csv")
-    if not os.path.exists(csv_path):
-        return []
-
-    localization = {}
-
-    rows = []
     try:
-        with open(csv_path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                key = str(row.get("key", "")).strip()
-                if not key:
-                    continue
+        source_info = _objectives_get_preferred_source(
+            force_reload=False,
+            language=_objectives_get_language_preference(),
+            allow_download=True,
+        )
+        local_rows = source_info.get("rows") if isinstance(source_info, dict) else []
+    except Exception:
+        local_rows = []
 
-                raw_display = str(row.get("displayName", "")).strip()
-                display = _experiments_translate_token(raw_display, localization)
-                if not display or _experiments_is_likely_token(display):
-                    display = _experiments_humanize_objective_key(key)
-
-                region_code = str(row.get("region", "")).strip()
-                raw_region_name = str(row.get("region_name", "")).strip() or REGION_NAME_MAP.get(region_code, "")
-                region_name = _experiments_translate_token(raw_region_name, localization)
-                if not region_name or _experiments_is_likely_token(region_name):
-                    region_name = REGION_NAME_MAP.get(region_code, raw_region_name or region_code)
-
-                raw_desc = str(row.get("descriptionText", "")).strip()
-                description = _experiments_translate_token(raw_desc, localization)
-                description = _experiments_clean_text(description)
-                if _experiments_is_likely_token(description):
-                    description = ""
-
-                rows.append(
-                    {
-                        "key": key,
-                        "displayName": display or key,
-                        "category": str(row.get("category", "")).strip(),
-                        "region": region_code,
-                        "region_name": region_name,
-                        "type": str(row.get("type", "")).strip(),
-                        "cargo_needed": str(row.get("cargo_needed", "")).strip(),
-                        "descriptionText": description,
-                    }
-                )
-    except Exception as e:
-        print(f"[Experiments] Failed to read maprunner_data.csv: {e}")
-        return []
-
-    dedup = {}
-    for row in rows:
-        k = row["key"]
-        if k not in dedup:
-            dedup[k] = row
-    return list(dedup.values())
+    if isinstance(local_rows, list) and local_rows:
+        dedup = {}
+        for row in local_rows:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key", "")).strip()
+            if not key:
+                continue
+            dedup[key] = {
+                "key": key,
+                "displayName": str(row.get("displayname", "") or key).strip(),
+                "category": str(row.get("category", "")).strip(),
+                "region": str(row.get("region", "")).strip(),
+                "region_name": str(row.get("region_name", "")).strip() or REGION_NAME_MAP.get(str(row.get("region", "")).strip(), ""),
+                "type": str(row.get("type", "")).strip(),
+                "cargo_needed": str(row.get("cargo_needed", "")).strip(),
+                "descriptionText": str(row.get("descriptiontext", "")).strip(),
+            }
+        return list(dedup.values())
+    return []
 
 
 _EXPERIMENTS_OBJECTIVE_ROW_BY_KEY = None
@@ -17462,8 +19686,7 @@ def _experiments_write_save_doc(path, doc, had_null=False):
     out = json.dumps(doc, separators=(",", ":"), ensure_ascii=False)
     if had_null:
         out += "\0"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(out)
+    _write_text_file_atomic(path, out, encoding="utf-8")
 
 
 def _experiments_iter_ssl_values(doc, save_keys):
@@ -17478,55 +19701,31 @@ def _experiments_iter_ssl_values(doc, save_keys):
         yield save_key, save_obj, ssl_value
 
 
-_EXPERIMENTS_JS_OBJECTIVE_INDEX = None
-_EXPERIMENTS_JS_LOCALIZATION = None
-_EXPERIMENTS_JS_LOAD_INFO = None
+_EXPERIMENTS_OBJECTIVE_INDEX_CACHE = None
+_EXPERIMENTS_OBJECTIVE_LOCALIZATION_CACHE = None
+_EXPERIMENTS_OBJECTIVE_LOAD_INFO = None
 _EXPERIMENTS_META_OBJECTIVE_KIND = None
 
 
-def _experiments_extract_json_parse_payload(text):
-    """
-    Extract JSON.parse('<payload>') payload from a JS bundle.
-    """
-    if not text:
-        return None
-    idx = text.find("JSON.parse")
-    if idx < 0:
-        return None
-    i = text.find("(", idx)
-    if i < 0:
-        return None
-    j = i + 1
-    while j < len(text) and text[j].isspace():
-        j += 1
-    if j >= len(text) or text[j] not in ("'", '"'):
-        return None
-    raw = _mr_extract_js_string_literal(text, j)
-    if raw is None:
-        return None
-    try:
-        return codecs.decode(raw.replace(r"\/", "/"), "unicode_escape")
-    except Exception:
-        return raw
-
-
-def _experiments_load_js_objective_sources(force_reload=False):
+def _experiments_load_objective_sources(force_reload=False):
     """
     Load objective definitions/localization for objective-state seeding.
-    Priority:
-      1) MapRunner in-memory canonical JS (`data.js` / `desc.js`) if available.
-      2) Cached canonical JS saved by Objectives+ from earlier online runs.
-      3) Fresh MapRunner fetch + role detection (handles random chunk names).
     """
-    global _EXPERIMENTS_JS_OBJECTIVE_INDEX, _EXPERIMENTS_JS_LOCALIZATION, _EXPERIMENTS_JS_LOAD_INFO
+    global _EXPERIMENTS_OBJECTIVE_INDEX_CACHE
+    global _EXPERIMENTS_OBJECTIVE_LOCALIZATION_CACHE
+    global _EXPERIMENTS_OBJECTIVE_LOAD_INFO
 
     if (
         not force_reload
-        and isinstance(_EXPERIMENTS_JS_OBJECTIVE_INDEX, dict)
-        and isinstance(_EXPERIMENTS_JS_LOCALIZATION, dict)
-        and isinstance(_EXPERIMENTS_JS_LOAD_INFO, dict)
+        and isinstance(_EXPERIMENTS_OBJECTIVE_INDEX_CACHE, dict)
+        and isinstance(_EXPERIMENTS_OBJECTIVE_LOCALIZATION_CACHE, dict)
+        and isinstance(_EXPERIMENTS_OBJECTIVE_LOAD_INFO, dict)
     ):
-        return _EXPERIMENTS_JS_OBJECTIVE_INDEX, _EXPERIMENTS_JS_LOCALIZATION, _EXPERIMENTS_JS_LOAD_INFO
+        return (
+            _EXPERIMENTS_OBJECTIVE_INDEX_CACHE,
+            _EXPERIMENTS_OBJECTIVE_LOCALIZATION_CACHE,
+            _EXPERIMENTS_OBJECTIVE_LOAD_INFO,
+        )
 
     objective_index = {}
     localization = {}
@@ -17537,100 +19736,36 @@ def _experiments_load_js_objective_sources(force_reload=False):
         "localization_entries": 0,
     }
 
-    def _merge_objective_entries(arr):
-        if not isinstance(arr, list):
-            return
-        for entry in arr:
-            if not isinstance(entry, dict):
-                continue
-            key = str(entry.get("key", "")).strip()
-            if key and key not in objective_index:
-                objective_index[key] = entry
-
-    def _parse_data_text(text):
-        payload = _experiments_extract_json_parse_payload(text)
-        if not payload:
-            return 0
-        try:
-            arr = json.loads(payload)
-        except Exception:
-            return 0
-        before = len(objective_index)
-        _merge_objective_entries(arr)
-        return max(0, len(objective_index) - before)
-
-    def _parse_desc_text(text):
-        parsed = _mr_parse_localization_from_desc_text(text) or {}
-        if not parsed:
-            return 0
-        if not localization:
-            localization.update(parsed)
-        else:
-            for k, v in parsed.items():
-                if k not in localization:
-                    localization[k] = v
-        return len(parsed)
-
-    def _try_parse_canonical_mr_sources():
-        parsed_any = False
-        try:
-            _mr_choose_best_js_roles()
-        except Exception:
-            pass
-
-        try:
-            data_bs = _mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["data"])
-            data_text = _mr_decode_bytes_to_text(data_bs) if data_bs is not None else None
-            if data_text:
-                added = _parse_data_text(data_text)
-                if added > 0 and not info["data_path"]:
-                    info["data_path"] = "in-memory:data.js"
-                    parsed_any = True
-        except Exception:
-            pass
-
-        try:
-            desc_bs = _mr_get_file_bytes_or_mem(_MR_CANONICAL_NAMES["desc"])
-            desc_text = _mr_decode_bytes_to_text(desc_bs) if desc_bs is not None else None
-            if desc_text:
-                parsed = _parse_desc_text(desc_text)
-                if parsed > 0 and not info["desc_path"]:
-                    info["desc_path"] = "in-memory:desc.js"
-                    parsed_any = True
-        except Exception:
-            pass
-        return parsed_any
-
-    # 1) First try already-loaded MapRunner canonical sources.
-    _try_parse_canonical_mr_sources()
-
-    # 2) Try cached canonical JS (saved by previous Objectives+ fetch).
-    if not objective_index or not localization:
-        try:
-            loaded_cached = _mr_load_cached_canonical_js_to_mem()
-            if loaded_cached:
-                if "data" in loaded_cached and not info["data_path"]:
-                    info["data_path"] = f"cache:{os.path.basename(loaded_cached['data'])}"
-                if "desc" in loaded_cached and not info["desc_path"]:
-                    info["desc_path"] = f"cache:{os.path.basename(loaded_cached['desc'])}"
-            _try_parse_canonical_mr_sources()
-        except Exception:
-            pass
-
-    # 3) If still missing, fetch/resolve MapRunner JS roles (random chunk names supported).
-    if not objective_index or not localization:
-        try:
-            _mr_download_js_step()
-            _try_parse_canonical_mr_sources()
-        except Exception:
-            pass
+    try:
+        local_info = _objectives_get_preferred_source(
+            force_reload=bool(force_reload),
+            language=_objectives_get_language_preference(),
+            allow_download=True,
+        )
+        local_defs = local_info.get("definitions") if isinstance(local_info, dict) else {}
+        local_loc = local_info.get("localization") if isinstance(local_info, dict) else {}
+        if isinstance(local_defs, dict) and local_defs:
+            objective_index = local_defs
+            localization = local_loc if isinstance(local_loc, dict) else {}
+            source_kind = str(local_info.get("kind") or "source").strip().lower()
+            data_label = "initial.pak" if source_kind == "local" else "fallback"
+            info["data_path"] = f"{source_kind}:{os.path.basename(str(local_info.get('path') or data_label))}"
+            info["desc_path"] = f"strings:{str(local_info.get('language') or _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE)}"
+            info["data_entries"] = len(objective_index)
+            info["localization_entries"] = len(localization)
+            _EXPERIMENTS_OBJECTIVE_INDEX_CACHE = objective_index
+            _EXPERIMENTS_OBJECTIVE_LOCALIZATION_CACHE = localization
+            _EXPERIMENTS_OBJECTIVE_LOAD_INFO = info
+            return objective_index, localization, info
+    except Exception:
+        pass
 
     info["data_entries"] = len(objective_index)
     info["localization_entries"] = len(localization)
 
-    _EXPERIMENTS_JS_OBJECTIVE_INDEX = objective_index
-    _EXPERIMENTS_JS_LOCALIZATION = localization
-    _EXPERIMENTS_JS_LOAD_INFO = info
+    _EXPERIMENTS_OBJECTIVE_INDEX_CACHE = objective_index
+    _EXPERIMENTS_OBJECTIVE_LOCALIZATION_CACHE = localization
+    _EXPERIMENTS_OBJECTIVE_LOAD_INFO = info
     return objective_index, localization, info
 
 
@@ -17836,7 +19971,7 @@ def _experiments_guess_cargo_type(label):
 
 def _experiments_parse_cargo_needed(cargo_needed_text):
     """
-    Parse maprunner cargo string like:
+    Parse cargo summary text like:
       "2× Concrete Slab; 1× Metal Planks"
     into list of (count, cargo_type).
     """
@@ -17862,108 +19997,75 @@ def _experiments_parse_cargo_needed(cargo_needed_text):
     return items
 
 
-def _experiments_collect_marker_data(markers, objective_id):
-    zones = []
-    level_name = ""
-    for marker in markers or []:
-        if not isinstance(marker, dict):
-            continue
-        zone = str(marker.get("key", "")).strip()
-        if zone:
-            zones.append(zone)
-        if not level_name:
-            lv = str(marker.get("level", "")).strip()
-            if not lv:
-                lv = str(marker.get("map", "")).strip()
-            if lv:
-                level_name = lv
-
-    zones = _experiments_dedupe_ids(zones)
-    if not level_name:
-        level_name = _experiments_guess_map_from_objective_id(objective_id)
-    if not zones:
-        fallback_zone = _experiments_guess_zone_from_objective_id(objective_id)
-        if fallback_zone:
-            zones = [fallback_zone]
-    return level_name, zones
-
-
-def _experiments_build_stage_from_js(stage_def, root_markers, objective_id):
+def _experiments_build_stage_from_local(stage_def, objective_id):
     stage = stage_def if isinstance(stage_def, dict) else {}
-    markers = stage.get("markers")
-    if not isinstance(markers, list):
-        markers = root_markers if isinstance(root_markers, list) else []
-
-    map_name, zones = _experiments_collect_marker_data(markers, objective_id)
+    cargo_defs = stage.get("cargo") if isinstance(stage.get("cargo"), list) else []
+    truck_defs = stage.get("truck_delivery") if isinstance(stage.get("truck_delivery"), list) else []
+    visit_defs = stage.get("visit_zones") if isinstance(stage.get("visit_zones"), list) else []
 
     cargo_actions = []
-    cargo_items = stage.get("cargo")
-    if isinstance(cargo_items, list):
-        for cargo in cargo_items:
-            if not isinstance(cargo, dict):
-                continue
-            cargo_type = str(cargo.get("key", "")).strip()
-            if not cargo_type:
-                cargo_type = _experiments_guess_cargo_type(cargo.get("name", ""))
-            if not cargo_type:
-                continue
-            raw_count = cargo.get("count", 1)
-            try:
-                aim_value = int(float(raw_count))
-            except Exception:
-                aim_value = 1
-            if aim_value <= 0:
-                aim_value = 1
-
-            cargo_actions.append(
-                {
-                    "cargoState": {"aimValue": aim_value, "type": cargo_type, "curValue": 0},
-                    "map": map_name or "",
-                    "zones": list(zones),
-                    "zoneColorOverride": {"r": 0.0, "g": 185.0, "b": 25.0, "a": 125.0},
-                    "isZoneVisited": False,
-                    "platformColorOverride": None,
-                    "modelBuildingTag": "",
-                    "isNeedVisitOnTruck": False,
-                    "truckUid": "",
-                    "platformId": "",
-                    "isVisibleWithPlatform": False,
-                    "unloadingMode": 0,
-                }
-            )
+    for cargo in cargo_defs:
+        if not isinstance(cargo, dict):
+            continue
+        cargo_type = str(cargo.get("type", "")).strip()
+        if not cargo_type:
+            continue
+        aim_value = max(1, _objectives_local_int(cargo.get("count"), 1) or 1)
+        zone = str(cargo.get("zone", "")).strip()
+        map_name = str(cargo.get("map", "")).strip() or _experiments_guess_map_from_objective_id(objective_id)
+        cargo_actions.append(
+            {
+                "cargoState": {"aimValue": aim_value, "type": cargo_type, "curValue": 0},
+                "map": map_name or "",
+                "zones": [zone] if zone else [],
+                "zoneColorOverride": {"r": 0.0, "g": 185.0, "b": 25.0, "a": 125.0},
+                "isZoneVisited": False,
+                "platformColorOverride": None,
+                "modelBuildingTag": "",
+                "isNeedVisitOnTruck": False,
+                "truckUid": "",
+                "platformId": "",
+                "isVisibleWithPlatform": False,
+                "unloadingMode": 0,
+            }
+        )
 
     truck_delivery_states = []
-    stage_type = str(stage.get("type", "") or "").strip()
-    nested = stage.get("objectives")
-    if isinstance(nested, list) and (stage_type == "truckDelivery" or any(isinstance(x, dict) and x.get("key") for x in nested)):
-        for item in nested:
-            if not isinstance(item, dict):
-                continue
-            truck_id = str(item.get("key", "")).strip()
-            if not truck_id:
-                continue
-            truck_delivery_states.append(
-                {
-                    "isDelivered": False,
-                    "truckId": truck_id,
-                    "deliveryZones": list(zones),
-                    "mapDelivery": map_name or "",
-                }
-            )
-    elif stage_type == "truckDelivery":
+    for item in truck_defs:
+        if not isinstance(item, dict):
+            continue
+        zone = str(item.get("zone", "")).strip()
+        map_name = str(item.get("map", "")).strip() or _experiments_guess_map_from_objective_id(objective_id)
         truck_delivery_states.append(
             {
                 "isDelivered": False,
-                "truckId": "",
-                "deliveryZones": list(zones),
+                "truckId": str(item.get("truckId", "")).strip(),
+                "deliveryZones": [zone] if zone else [],
                 "mapDelivery": map_name or "",
             }
         )
 
     visit_all = None
-    if not cargo_actions and not truck_delivery_states and map_name and zones:
+    visit_map = ""
+    visit_zones = []
+    for item in visit_defs:
+        if not isinstance(item, dict):
+            continue
+        zone = str(item.get("zone", "")).strip()
+        if not zone:
+            continue
+        map_name = str(item.get("map", "")).strip()
+        if not visit_map and map_name:
+            visit_map = map_name
+        if (not map_name) or (not visit_map) or map_name == visit_map:
+            visit_zones.append(zone)
+
+    if not visit_map:
+        visit_map = _experiments_guess_map_from_objective_id(objective_id)
+    visit_zones = _experiments_dedupe_ids(visit_zones)
+    if visit_map and visit_zones:
         visit_all = {
-            "map": map_name,
+            "map": visit_map,
             "zoneStates": [
                 {
                     "zone": zone,
@@ -17971,7 +20073,7 @@ def _experiments_build_stage_from_js(stage_def, root_markers, objective_id):
                     "isVisited": False,
                     "isVisitWithCertainTruck": False,
                 }
-                for zone in zones
+                for zone in visit_zones
             ],
         }
 
@@ -17988,29 +20090,21 @@ def _experiments_build_stage_from_js(stage_def, root_markers, objective_id):
     }
 
 
-def _experiments_build_stage_states_from_js_objective(objective_id):
-    objective_index, _, _ = _experiments_load_js_objective_sources()
+def _experiments_build_stage_states_from_local_objective_entry(objective_id, entry):
+    stage_states = []
+    for stage_def in entry.get("stages") or []:
+        if not isinstance(stage_def, dict):
+            continue
+        stage_states.append(_experiments_build_stage_from_local(stage_def, objective_id))
+    return stage_states
+
+
+def _experiments_build_stage_states_from_objective_definition(objective_id):
+    objective_index, _, _ = _experiments_load_objective_sources()
     entry = objective_index.get(str(objective_id))
     if not isinstance(entry, dict):
         return []
-
-    root_markers = entry.get("markers")
-    if not isinstance(root_markers, list):
-        root_markers = []
-
-    stage_defs = entry.get("objectives")
-    stage_states = []
-    if isinstance(stage_defs, list):
-        for stage_def in stage_defs:
-            if not isinstance(stage_def, dict):
-                continue
-            stage_state = _experiments_build_stage_from_js(stage_def, root_markers, objective_id)
-            stage_states.append(stage_state)
-
-    if not stage_states and root_markers:
-        stage_states.append(_experiments_build_stage_from_js({"markers": root_markers}, root_markers, objective_id))
-
-    return stage_states
+    return _experiments_build_stage_states_from_local_objective_entry(objective_id, entry)
 
 
 def _experiments_build_placeholder_stage_state(objective_id):
@@ -18086,7 +20180,7 @@ def _experiments_seed_objective_state_with_source(objective_id, stage_mode="none
     """
     stage_mode:
       - 'none': no stagesState key (let game generate from objective defs)
-      - 'placeholder': inject a non-completing stage (prefer JS-based mission stages)
+      - 'placeholder': inject a non-completing stage (prefer objective-definition stages)
     """
     state = {
         "failReasons": {},
@@ -18100,10 +20194,10 @@ def _experiments_seed_objective_state_with_source(objective_id, stage_mode="none
     source = "none"
     mode = str(stage_mode or "none").strip().lower()
     if mode == "placeholder":
-        js_stages = _experiments_build_stage_states_from_js_objective(objective_id)
-        if js_stages:
-            state["stagesState"] = js_stages
-            source = "js"
+        definition_stages = _experiments_build_stage_states_from_objective_definition(objective_id)
+        if definition_stages:
+            state["stagesState"] = definition_stages
+            source = "definitions"
         else:
             state["stagesState"] = [_experiments_build_placeholder_stage_state(objective_id)]
             source = "fallback"
@@ -18757,14 +20851,15 @@ FACTOR_RULE_DEFINITIONS = [
     ("Vehicle storage slots", "vehicleStorageSlots", {"default": 0, "only 3": 3, "only 5": 5, "only 10": 10, "only scouts": -1}),
     ("External addon availability", "externalAddonAvailability", {
         "default": 0,
-        "all addons unlocked": 1,
-        "random 5": 2,
-        "random 10": 3,
-        "each garage random 10": 4
+        "all addons unlocked": 1
     }),
     ("Internal addon availability", "internalAddonAvailability", {
         "default": 0,
-        "all internal addons unlocked": 1
+        "all internal addons unlocked": 1,
+        "10-50 per garage": 2,
+        "30-100 per garage": 2,
+        "50-150 per garage": 2,
+        "0-100 per garage": 2
     }),
     ("Tire availability", "tyreAvailability", {
         "default": 1,
@@ -18772,25 +20867,24 @@ FACTOR_RULE_DEFINITIONS = [
         "highway and allroad": 2,
         "highway, allroad, offroad": 3,
         "no mud tires": 4,
-        "no chained tires": 5,
-        "random per garage": 6
+        "no chained tires": 5
     }),
     ("Vehicle addon pricing", "addonPricingFactor", {"default": 1, "free": 0, "2x": 2, "4x": 4, "6x": 6}),
     ("Addon selling price", "addonSellingFactor", {"normal": 1.0, "10%": 0.1, "30%": 0.3, "50%": 0.5, "no refunds": 0}),
-    ("Trailer store availability", "trailerStoreAviability", {"default": 0, "one per region": 1}),
-    ("Trailer availability", "trailerAvailability", {"default": 0, "all trailers available": 1, "not available": 2}),
+    ("Trailer store availability", "trailerStoreAviability", {"default": 0, "one random store per region": 1}),
+    ("Trailer availability", "trailerAvailability", {"default": 0, "all trailers available": 1}),
     ("Trailer pricing", "trailerPricingFactor", {"normal price": 1, "free": 0, "2x": 2, "4x": 4, "6x": 6}),
     ("Trailer selling price", "trailerSellingFactor", {"normal price": 1, "50%": 0.5, "30%": 0.3, "10%": 0.1, "cant be sold": -1}),
     ("Fuel price", "fuelPriceFactor", {
-        "normal price": 1,
+        "default": 0,
         "free": 0,
         "2x": 2,
         "4x": 4,
         "6x": 6
     }),
     ("Garage repair price", "garageRepairePriceFactor", {
-        "normal price": 1,
-        "free": 0,
+        "default": 0,
+        "paid": 1,
         "2x": 2,
         "4x": 4,
         "6x": 6
@@ -18798,39 +20892,39 @@ FACTOR_RULE_DEFINITIONS = [
     ("Garage refuelling", "isGarageRefuelAvailable", {"available": True, "unavailable": False}),
     ("Repair points cost", "repairPointsCostFactor", {
         "default": 1,
-        "free": 0,
+        "paid": 1,
         "2x": 2,
         "4x": 4,
         "6x": 6
     }),
-    ("Repair points required", "repairPointsRequiredFactor", {"default": 1, "2x less": 0.5, "2x": 2, "4x": 4, "6x": 6}),
+    ("Repair points required", "repairPointsRequiredFactor", {"default": 1, "2x more effective": 0.5, "2x": 2, "4x": 4, "6x": 6}),
     ("Vehicle repair regional rules", "regionRepaireMoneyFactor", {
         "default": 1,
-        "free": 0,
-        "2x": 2,
-        "4x": 4,
-        "6x": 6
+        "2x outside home region": 2,
+        "3x outside home region": 3,
+        "4x outside home region": 4
     }),
     ("Vehicle damage", "vehicleDamageFactor", {"default": 1, "no damage": 0, "2x": 2, "3x": 3, "5x": 5}),
     ("Recovery price", "recoveryPriceFactor", {
-        "default": 1,
-        "free": 0,
+        "default": 0,
+        "paid": 1,
         "2x": 2,
         "4x": 4,
-        "6x": 6
+        "6x": 6,
+        "unavailable": -1
     }),
-    ("Automatic cargo loading", "loadingPriceFactor", {"free": 0, "paid": 1, "2x": 2, "4x": 4, "6x": 6}),
+    ("Automatic cargo loading", "loadingPriceFactor", {"default": 0, "paid": 1, "2x": 2, "4x": 4, "6x": 6}),
     ("Truck switching price (minimap)", "teleportationPrice", {"free": 0, "500": 500, "1000": 1000, "2000": 2000, "5000": 5000}),
     ("Region traveling price", "regionTravellingPriceFactor", {
-        "default": 1,
-        "free": 0,
+        "default": 0,
+        "paid": 1,
         "2x": 2,
         "4x": 4,
         "6x": 6
     }),
     ("Task and contest payouts", "tasksAndContestsPayoutsFactor", {"normal": 1, "50%": 0.5, "150%": 1.5, "200%": 2, "300%": 3}),
     ("Contracts payouts", "contractsPayoutsFactor", {"normal": 1, "50%": 0.5, "150%": 1.5, "200%": 2, "300%": 3}),
-    ("Max contest attempts", "maxContestAttempts", {"default": -1, "1 attempt": 1, "3 attempts": 3, "5 attempts": 5, "gold time only": -1}),
+    ("Max contest attempts", "maxContestAttempts", {"default": 0, "1 attempt": 1, "3 attempts": 3, "5 attempts": 5, "gold time only": -1}),
     ("Map marker style", "isMapMarkerAsInHardMode", {"default": False, "hard mode": True}),
 ]
 
@@ -18850,18 +20944,19 @@ _RULE_NGP_DICT_META = {
     }),
     "truckPricingFactor": ("TRUCK_PRICING", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
     "truckSellingFactor": ("TRUCK_SELLING", {"normal price": 0, "50%": 1, "30%": 2, "10%": 3, "cant be sold": 4}),
-    "isDLCVehiclesAvailable": ("DLC_VEHICLES", {"available": 0, "unavailable": 1}),
+    "needToAddDlcTrucks": ("DLC_VEHICLES", {"available": 0, "unavailable": 1}),
     "vehicleStorageSlots": ("VEHICLE_STORAGE", {"default": 0, "only 3": 1, "only 5": 2, "only 10": 3, "only scouts": 4}),
     "externalAddonAvailability": ("ADDON_AVAILABILITY", {
         "default": 0,
-        "all addons unlocked": 1,
-        "random 5": 2,
-        "random 10": 3,
-        "each garage random 10": 4
+        "all addons unlocked": 1
     }),
     "internalAddonAvailability": ("INTENAL_ADDON_AVAILABILITY", {
         "default": 0,
-        "all internal addons unlocked": 1
+        "all internal addons unlocked": 1,
+        "10-50 per garage": 2,
+        "30-100 per garage": 3,
+        "50-150 per garage": 4,
+        "0-100 per garage": 5
     }),
     "tyreAvailability": ("TYRE_AVAILABILITY", {
         "default": 0,
@@ -18869,30 +20964,28 @@ _RULE_NGP_DICT_META = {
         "highway and allroad": 2,
         "highway, allroad, offroad": 3,
         "no mud tires": 4,
-        "no chained tires": 5,
-        "random per garage": 6
+        "no chained tires": 5
     }),
-    "trailerStoreAviability": ("TRAILER_STORE_AVAILBILITY", {"default": 1, "not available": 0}),
-    "trailerAvailability": ("TRAILER_AVAILABILITY", {"default": 0, "all trailers available": 1, "not available": 2}),
+    "trailerStoreAviability": ("TRAILER_STORE_AVAILBILITY", {"default": 0, "one random store per region": 1}),
+    "trailerAvailability": ("TRAILER_AVAILABILITY", {"default": 0, "all trailers available": 1}),
     "trailerPricingFactor": ("TRAILER_PRICING", {"normal price": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
     "trailerSellingFactor": ("TRAILER_SELLING", {"normal price": 0, "50%": 1, "30%": 2, "10%": 3, "cant be sold": 4}),
-    "fuelPriceFactor": ("FUEL_PRICE", {"normal price": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
-    "garageRepairePriceFactor": ("GARAGE_REPAIRE", {"normal price": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "fuelPriceFactor": ("FUEL_PRICE", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "garageRepairePriceFactor": ("GARAGE_REPAIRE", {"default": 0, "paid": 1, "2x": 2, "4x": 3, "6x": 4}),
     "isGarageRefuelAvailable": ("GARAGE_REFUEL", {"available": 0, "unavailable": 1}),
-    "repairPointsCostFactor": ("REPAIR_POINTS_COST", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
-    "repairPointsRequiredFactor": ("REPAIR_POINTS_AMOUNT", {"default": 0, "2x less": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "repairPointsCostFactor": ("REPAIR_POINTS_COST", {"default": 0, "paid": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "repairPointsRequiredFactor": ("REPAIR_POINTS_AMOUNT", {"default": 0, "2x more effective": 1, "2x": 2, "4x": 3, "6x": 4}),
     "regionRepaireMoneyFactor": ("REGIONAL_REPAIR", {
         "default": 0,
-        "free": 1,
-        "2x": 2,
-        "4x": 3,
-        "6x": 4
+        "2x outside home region": 1,
+        "3x outside home region": 2,
+        "4x outside home region": 3
     }),
     "vehicleDamageFactor": ("VEHICLE_DAMAGE", {"default": 0, "no damage": 1, "2x": 2, "3x": 3, "5x": 4}),
-    "recoveryPriceFactor": ("RECOVERY", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
-    "loadingPriceFactor": ("LOADING", {"free": 0, "paid": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "recoveryPriceFactor": ("RECOVERY", {"default": 0, "paid": 1, "2x": 2, "4x": 3, "6x": 4, "unavailable": 5}),
+    "loadingPriceFactor": ("LOADING", {"default": 0, "paid": 1, "2x": 2, "4x": 3, "6x": 4}),
     "teleportationPrice": ("TELEPORTATION", {"free": 0, "500": 1, "1000": 2, "2000": 3, "5000": 4}),
-    "regionTravellingPriceFactor": ("REGION_TRAVELLING", {"default": 0, "free": 1, "2x": 2, "4x": 3, "6x": 4}),
+    "regionTravellingPriceFactor": ("REGION_TRAVELLING", {"default": 0, "paid": 1, "2x": 2, "4x": 3, "6x": 4}),
     "tasksAndContestsPayoutsFactor": ("TASKS_CONTESTS", {"normal": 0, "50%": 1, "150%": 2, "200%": 3, "300%": 4}),
     "contractsPayoutsFactor": ("CONTRACTS", {"normal": 0, "50%": 1, "150%": 2, "200%": 3, "300%": 4}),
     "maxContestAttempts": ("CONTEST_ATTEMPTS", {"default": 0, "1 attempt": 1, "3 attempts": 2, "5 attempts": 3, "gold time only": 4}),
@@ -18901,7 +20994,10 @@ _RULE_NGP_DICT_META = {
 }
 
 _INTERNAL_ADDON_AMOUNT_BY_LABEL = {
-    # Randomized internal-addon presets are intentionally not exposed in the editor.
+    "10-50 per garage": 30,
+    "30-100 per garage": 65,
+    "50-150 per garage": 100,
+    "0-100 per garage": 50,
 }
 
 # defensive globals
@@ -18955,6 +21051,18 @@ def _choose_safe_default(options):
         return v
     return 0
 
+def _rule_option_matches_value(option_value, raw_value):
+    if option_value == _RULE_RANDOM_VALUE:
+        return False
+    if isinstance(option_value, bool) or isinstance(raw_value, bool):
+        return option_value is raw_value
+    try:
+        if isinstance(option_value, (int, float)) and isinstance(raw_value, (int, float)):
+            return abs(float(option_value) - float(raw_value)) < 1e-6
+    except Exception:
+        pass
+    return str(option_value) == str(raw_value)
+
 def _make_key_saver(key, options, var):
     def saver(path):
         try:
@@ -18963,8 +21071,7 @@ def _make_key_saver(key, options, var):
             value = options.get(var.get(), _choose_safe_default(options))
             json_value = json.dumps(value)
             content = _set_key_in_text(content, key, json_value)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+            _write_text_file_atomic(path, content, encoding="utf-8")
         except Exception as e:
             print(f"[rules saver] {key} failed: {e}")
     return saver
@@ -18979,17 +21086,25 @@ def _make_backup(path):
     except Exception:
         pass
 
-# defaults you requested
+# defaults
 _DEFAULT_RECOVERY_PRICE = [0,0,2500,5000,8000,5000,2000]
 _DEFAULT_FULL_REPAIR_PRICE = [0,0,1500,2500,5000,2500,1500]
-_DEFAULT_SETTINGS_DICT = {
-    "ADDON_AVAILABILITY":1,"CONTEST_ATTEMPTS":0,"STARTING_MONEY":0,"REPAIR_POINTS_AMOUNT":0,"TRUCK_SELLING":0,"MAP_MARKER":0,
-    "TRAILER_AVAILABILITY":1,"RECOVERY":0,"TIME_SETTINGS":0,"STARTING_RANK":0,"GARAGE_REPAIRE":0,"TYRE_AVAILABILITY":1,
-    "REPAIR_POINTS_COST":0,"TRUCK_AVAILABILITY":3,"REGION_TRAVELLING":0,"VEHICLE_STORAGE":0,"LOADING":0,"FUEL_PRICE":1,
-    "STARTING_RULES":0,"INTENAL_ADDON_AVAILABILITY":1,"TASKS_CONTESTS":0,"GARAGE_REFUEL":0,"TRAILER_STORE_AVAILBILITY":0,
-    "DLC_VEHICLES":1,"TELEPORTATION":0,"CONTRACTS":0,"TRAILER_PRICING":0,"TRUCK_PRICING":0,"TRAILER_SELLING":0,"VEHICLE_DAMAGE":0,
-    "ADDON_PRICING":0,"REGIONAL_REPAIR":0
+_EXTRA_DEFAULT_SETTINGS_DICT = {
+    "STARTING_MONEY": 0,
+    "STARTING_RANK": 0,
+    "STARTING_RULES": 0,
+    "TIME_SETTINGS": 0,
 }
+
+def _build_default_settings_dict():
+    default_dict = dict(_EXTRA_DEFAULT_SETTINGS_DICT)
+    for ngp_key, label_to_state in _RULE_NGP_DICT_META.values():
+        for _, state in label_to_state.items():
+            default_dict[ngp_key] = int(state)
+            break
+    return default_dict
+
+_DEFAULT_SETTINGS_DICT = _build_default_settings_dict()
 _DEFAULT_DEPLOY_PRICE = {"Region":3500,"Map":1000}
 _DEFAULT_AUTOLOAD_PRICE = 150
 
@@ -19028,6 +21143,59 @@ def create_rules_tab(tab_rules, save_path_var):
     def _on_random_rules_toggle():
         if random_rules_var.get():
             _set_all_rules_to_random()
+
+    def _get_rule_default_label(rule):
+        options = rule.get("options") or {}
+        for label, value in options.items():
+            if value != _RULE_RANDOM_VALUE:
+                return label
+        return next(iter(options.keys()), "")
+
+    def _reset_rules_ui_to_defaults():
+        for rule in FACTOR_RULE_VARS:
+            try:
+                rule["var"].set(_get_rule_default_label(rule))
+            except Exception:
+                pass
+
+    def _get_rule_by_key(key):
+        for rule in FACTOR_RULE_VARS:
+            if rule.get("key") == key:
+                return rule
+        return None
+
+    def _set_rule_label(rule, label):
+        if not rule:
+            return
+        try:
+            if label in (rule.get("options") or {}):
+                rule["var"].set(label)
+        except Exception:
+            pass
+
+    def _set_game_difficulty_label(label):
+        _set_rule_label(_get_rule_by_key("gameDifficultyMode"), label)
+
+    def _on_rule_dropdown_selected(selected_rule):
+        key = str((selected_rule or {}).get("key") or "")
+        if key == "gameDifficultyMode":
+            selected_label = str((selected_rule or {}).get("var").get() or "")
+            if selected_label == "Normal":
+                try:
+                    random_rules_var.set(False)
+                except Exception:
+                    pass
+                _reset_rules_ui_to_defaults()
+                _set_game_difficulty_label("Normal")
+            elif selected_label == "Hard":
+                try:
+                    random_rules_var.set(False)
+                except Exception:
+                    pass
+            return
+
+        # Any manual rule edit should move the save mode to New Game+ immediately.
+        _set_game_difficulty_label("New Game+")
 
     # UI container + scrollable canvas
     container = ttk.Frame(tab_rules)
@@ -19146,6 +21314,7 @@ def create_rules_tab(tab_rules, save_path_var):
         ttk.Label(card, text=label_text + ":", font=("TkDefaultFont", 9)).pack(anchor="w")
         cb = ttk.Combobox(card, textvariable=var, values=list(opts.keys()), state="readonly")
         cb.pack(fill="x", pady=(6,2))
+        cb.bind("<<ComboboxSelected>>", lambda _e, current_rule=rule: _on_rule_dropdown_selected(current_rule))
         dropdown_widgets[key] = cb
         rule_savers.append(_make_key_saver(key, opts, var))
 
@@ -19305,6 +21474,31 @@ def create_rules_tab(tab_rules, save_path_var):
             for rule in FACTOR_RULE_VARS:
                 resolved_rule_choices[rule["key"]] = _resolve_rule_selection(rule)
 
+            difficulty_rule = _get_rule_by_key("gameDifficultyMode")
+            difficulty_label = resolved_rule_choices.get(
+                "gameDifficultyMode",
+                (
+                    difficulty_rule["var"].get() if difficulty_rule else "Normal",
+                    0,
+                ),
+            )[0]
+
+            if difficulty_label == "Normal":
+                for rule in FACTOR_RULE_VARS:
+                    if rule["key"] == "gameDifficultyMode":
+                        continue
+                    default_label = _get_rule_default_label(rule)
+                    default_value = rule["options"].get(default_label, _choose_safe_default(rule["options"]))
+                    resolved_rule_choices[rule["key"]] = (default_label, default_value)
+                    try:
+                        rule["var"].set(default_label)
+                    except Exception:
+                        pass
+                try:
+                    random_rules_var.set(False)
+                except Exception:
+                    pass
+
             # 2) Run direct key savers (non-virtual rules).
             for saver in rule_savers:
                 try:
@@ -19366,10 +21560,10 @@ def create_rules_tab(tab_rules, save_path_var):
                     text = _set_key_in_text(text, "regionRepairePointsFactor", json.dumps(selected_value))
                     continue
 
-                if key == "isDLCVehiclesAvailable":
-                    # Keep this companion flag coherent with current availability choice.
+                if key == "needToAddDlcTrucks":
+                    # Keep the legacy companion flag coherent with the selected DLC-truck rule.
                     try:
-                        text = _set_key_in_text(text, "needToAddDlcTrucks", json.dumps(bool(selected_value)))
+                        text = _set_key_in_text(text, "isDLCVehiclesAvailable", json.dumps(bool(selected_value)))
                     except Exception:
                         pass
 
@@ -19380,7 +21574,10 @@ def create_rules_tab(tab_rules, save_path_var):
 
             # 7) settingsDictionaryForNGPScreen: ensure exists, then sync from selected rule labels.
             text = _ensure_settings_dictionary(text, _DEFAULT_SETTINGS_DICT)
-            settings_dict = _load_settings_dictionary(text, _DEFAULT_SETTINGS_DICT)
+            if difficulty_label == "Normal":
+                settings_dict = dict(_DEFAULT_SETTINGS_DICT)
+            else:
+                settings_dict = _load_settings_dictionary(text, _DEFAULT_SETTINGS_DICT)
             for rule in FACTOR_RULE_VARS:
                 key = rule["key"]
                 label, _ = resolved_rule_choices.get(key, (rule["var"].get(), None))
@@ -19418,8 +21615,7 @@ def create_rules_tab(tab_rules, save_path_var):
                 return
 
             _make_backup(path)
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
+            _write_text_file_atomic(path, text, encoding="utf-8")
             try:
                 os.remove(tmp)
             except Exception:
@@ -19434,15 +21630,33 @@ def create_rules_tab(tab_rules, save_path_var):
 
     # ---------- sync UI values from save to comboboxes ----------
     def sync_all_rules_from_save(path):
+        _reset_rules_ui_to_defaults()
         if not path or not os.path.exists(path):
             return
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
+            settings_dict = _load_settings_dictionary(content, _DEFAULT_SETTINGS_DICT)
             for rule in FACTOR_RULE_VARS:
                 internal_key = rule["key"]
                 options = rule["options"]
                 var = rule["var"]
+
+                meta = _RULE_NGP_DICT_META.get(internal_key)
+                if meta:
+                    ngp_key, label_to_state = meta
+                    try:
+                        state_value = settings_dict.get(ngp_key)
+                        if state_value is not None:
+                            state_value = int(state_value)
+                            for label, state_id in label_to_state.items():
+                                if int(state_id) == state_value and label in options:
+                                    var.set(label)
+                                    break
+                            if var.get() != _get_rule_default_label(rule):
+                                continue
+                    except Exception:
+                        pass
 
                 # Special state inference for real keys.
                 if internal_key == "truckAvailability":
@@ -19457,6 +21671,23 @@ def create_rules_tab(tab_rules, save_path_var):
                             var.set("store unlocks at rank 10")
                         continue
 
+                if internal_key == "internalAddonAvailability":
+                    addon_avail = _read_scalar_key(content, "internalAddonAvailability")
+                    if addon_avail == 2:
+                        addon_amount = _read_scalar_key(content, "internalAddonAmount")
+                        if addon_amount is not None:
+                            addon_amount = float(addon_amount)
+                            if 10 <= addon_amount <= 50 and "10-50 per garage" in options:
+                                var.set("10-50 per garage")
+                            elif 30 <= addon_amount <= 100 and "30-100 per garage" in options:
+                                var.set("30-100 per garage")
+                            elif 50 <= addon_amount <= 150 and "50-150 per garage" in options:
+                                var.set("50-150 per garage")
+                            elif 0 <= addon_amount <= 100 and "0-100 per garage" in options:
+                                var.set("0-100 per garage")
+                            if var.get() != _get_rule_default_label(rule):
+                                continue
+
                 if internal_key == "maxContestAttempts":
                     is_gold = _read_scalar_key(content, "isGoldFailReason")
                     if is_gold is True and "gold time only" in options:
@@ -19468,16 +21699,27 @@ def create_rules_tab(tab_rules, save_path_var):
                     points_factor = _read_scalar_key(content, "regionRepairePointsFactor")
                     if money_factor is not None and points_factor is not None:
                         for lab, val in options.items():
-                            if str(money_factor) == str(val) and str(points_factor) == str(val):
+                            if _rule_option_matches_value(val, money_factor) and _rule_option_matches_value(val, points_factor):
                                 var.set(lab)
                                 break
                         continue
+
+                if internal_key == "needToAddDlcTrucks":
+                    rawv = _read_scalar_key(content, "needToAddDlcTrucks")
+                    if rawv is None:
+                        rawv = _read_scalar_key(content, "isDLCVehiclesAvailable")
+                    if rawv is not None:
+                        for lab, val in options.items():
+                            if _rule_option_matches_value(val, rawv):
+                                var.set(lab)
+                                break
+                    continue
 
                 rawv = _read_scalar_key(content, internal_key)
                 if rawv is None:
                     continue
                 for lab, val in options.items():
-                    if str(val) == str(rawv):
+                    if _rule_option_matches_value(val, rawv):
                         var.set(lab)
                         break
         except Exception as e:
@@ -19551,8 +21793,16 @@ def _platform_release_suffix(system_name=None):
     return ""
 
 
+def _release_tag_platform_suffix(tag_raw):
+    tag = str(tag_raw or "").lstrip("v").strip().lower()
+    match = re.fullmatch(r"(\d+)([a-z])?", tag)
+    if not match:
+        return ""
+    return str(match.group(2) or "")
+
+
 def _select_latest_release_for_platform(releases, suffix):
-    """Pick latest release matching suffix (a/b/c). Fallback to all releases when needed."""
+    """Pick latest release matching suffix (a/b/c). Fallback only to legacy unsuffixed tags."""
     candidates = []
     for rel in releases:
         if not isinstance(rel, dict):
@@ -19567,12 +21817,15 @@ def _select_latest_release_for_platform(releases, suffix):
         candidates.append((num, published, tag_raw, rel))
 
     if not candidates and suffix:
-        # Fallback for legacy tags that may not carry platform suffix.
+        # Fallback only for legacy tags that carry no explicit platform suffix.
+        # Do not treat another platform's tagged build as valid for this OS.
         for rel in releases:
             if not isinstance(rel, dict):
                 continue
             tag_raw = str(rel.get("tag_name", "") or "").lstrip("v").strip()
             if not tag_raw:
+                continue
+            if _release_tag_platform_suffix(tag_raw):
                 continue
             num = normalize_version(tag_raw)
             published = str(rel.get("published_at", "") or rel.get("created_at", "") or "")
@@ -19908,7 +22161,7 @@ def _run_windows_updater_script(update_payload):
         "try{ Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue } catch{}\n"
     )
     # Windows PowerShell treats UTF-16 BOM scripts as canonical; this avoids
-    # Unicode path mangling on non-ASCII usernames (e.g., Vlastnik with accents).
+    # Unicode path mangling on non-ASCII usernames.
     with open(script_path, "w", encoding="utf-16", newline="\r\n") as f:
         f.write(ps_script)
 
@@ -20195,8 +22448,12 @@ def normalize_version(tag: str) -> int:
     """
     m = re.match(r"(\d+)", str(tag))
     return int(m.group(1)) if m else 0
-def check_for_updates_background(root, debug=False):
+def check_for_updates_background(root, debug=False, startup_managed=False):
     """Check GitHub for newer release in a background thread."""
+    background_attempt_ts = None
+    if startup_managed:
+        background_attempt_ts = _mark_background_update_check_started()
+
     def log(msg):
         if debug:
             print(f"[UpdateCheck] {msg}")
@@ -20288,6 +22545,16 @@ def check_for_updates_background(root, debug=False):
         except Exception as e:
             log(f"Update check failed: {e}")
         finally:
+            if result.get("status") not in ("update", "dev", "none"):
+                result["status"] = "failed"
+            if startup_managed:
+                try:
+                    _record_background_update_check_result(
+                        result.get("status"),
+                        now_ts=background_attempt_ts,
+                    )
+                except Exception:
+                    pass
             result_box["result"] = result
             done.set()
 
@@ -20342,29 +22609,12 @@ def check_for_updates_background(root, debug=False):
 
         # During startup, root is temporarily withdrawn. If we build the popup too early,
         # some systems may never present it. Defer popup creation until the main window is visible.
-        try:
-            root_state = str(root.state()).strip().lower()
-        except Exception:
-            root_state = "normal"
-        try:
-            root_visible = bool(root.winfo_viewable())
-        except Exception:
-            root_visible = (root_state != "withdrawn")
-        if root_state == "withdrawn" or not root_visible:
-            retry_count = int(result_box.get("_update_popup_retry_count", 0) or 0)
-            if retry_count < 120:
-                result_box["_update_popup_retry_count"] = retry_count + 1
-                try:
-                    root.after(120, _apply_result_on_main_thread)
-                except Exception:
-                    pass
-                return
+        if not _root_can_present_popup(root):
+            retry_count = int(result_box.get("_update_popup_retry_count", 0) or 0) + 1
+            result_box["_update_popup_retry_count"] = retry_count
+            retry_delay = 250 if retry_count <= 20 else 1500
             try:
-                set_app_status(
-                    "Update available, but popup could not be shown automatically. "
-                    "Use Settings > Check for Update.",
-                    timeout_ms=10000,
-                )
+                root.after(retry_delay, _apply_result_on_main_thread)
             except Exception:
                 pass
             return
@@ -20405,7 +22655,6 @@ def check_for_updates_background(root, debug=False):
             def copy_link():
                 root.clipboard_clear()
                 root.clipboard_append(GITHUB_RELEASES_PAGE)
-                root.update()
                 show_info("Copied", "Releases page link copied to clipboard.")
 
             btn_frame = ttk.Frame(top)
@@ -20598,6 +22847,7 @@ def check_for_updates_background(root, debug=False):
 
     # Run network work in background.
     threading.Thread(target=worker, daemon=True).start()
+    return True
 
 # -----------------------------------------------------------------------------
 # END SECTION: Update Checks
@@ -20761,6 +23011,52 @@ def _apply_focus_outline_fix(root):
         pass
 
 
+def _clear_readonly_combobox_visual_state(widget, focus_target=None) -> None:
+    if not isinstance(widget, ttk.Combobox):
+        return
+    try:
+        combo_state = str(widget.cget("state") or "").strip().lower()
+    except Exception:
+        combo_state = ""
+    if combo_state != "readonly":
+        return
+
+    def _do_clear():
+        try:
+            widget.selection_clear()
+        except Exception:
+            pass
+        try:
+            widget.icursor(widget.index("end"))
+        except Exception:
+            pass
+        try:
+            widget.xview_moveto(0)
+        except Exception:
+            pass
+        try:
+            target = focus_target
+            if target is not None:
+                target.focus_set()
+        except Exception:
+            pass
+        try:
+            current_focus = widget.focus_get()
+        except Exception:
+            current_focus = None
+        if current_focus is widget:
+            try:
+                widget.winfo_toplevel().focus_set()
+            except Exception:
+                pass
+
+    try:
+        widget.after_idle(_do_clear)
+        widget.after(1, _do_clear)
+    except Exception:
+        _do_clear()
+
+
 # Main GUI entry (builds all tabs + wires callbacks)
 def launch_gui(start_minimized=False):
     # Capture terminal output into the shared status log file.
@@ -20775,7 +23071,6 @@ def launch_gui(start_minimized=False):
         try:
             MYAPPID = "com.mrboxik.snowrunnereditor"
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(MYAPPID)
-            print("[DEBUG] AppUserModelID set:", MYAPPID)
         except Exception as e:
             print("[AppID Warning]", e)
     
@@ -20785,15 +23080,29 @@ def launch_gui(start_minimized=False):
     global FACTOR_RULE_VARS, rule_savers, plugin_loaders
     global tyre_var, delete_path_on_close_var, dont_remember_path_var, autosave_var, dark_mode_var, theme_preset_var
     global objectives_safe_fallback_var
+    global _EDITOR_ROOT
     
     # Create root window first
     root = tk.Tk()
+    _EDITOR_ROOT = root
+    _editor_translation_install_hooks()
+    try:
+        root.tk.call("tk", "appname", "SnowRunner Editor")
+    except Exception:
+        pass
     root.title("SnowRunner Editor")
+    try:
+        _objectives_set_language_preference(_editor_get_language_preference())
+    except Exception:
+        pass
+    _editor_register_window(root)
+    _editor_apply_language(root=root, language=_editor_get_language_preference(), allow_download=True, force_reload=False)
     # Hide during initial layout to avoid size jump on startup
     try:
         root.withdraw()
     except Exception:
         pass
+    _close_state = {"requested": False, "cleanup_done": False}
     # Run cleanup again after GUI startup so updater leftovers are removed
     # while the app is open (not only on next restart).
     try:
@@ -20802,7 +23111,7 @@ def launch_gui(start_minimized=False):
         pass
 
     def _runtime_update_artifact_cleanup_tick(remaining=240):
-        if remaining <= 0:
+        if _close_state.get("requested") or remaining <= 0:
             return
         try:
             _cleanup_windows_update_artifacts()
@@ -20852,7 +23161,6 @@ def launch_gui(start_minimized=False):
     dark_mode_var = tk.BooleanVar(root, value=False)
     theme_preset_var = tk.StringVar(root, value="Light")
     max_autobackups_var = tk.StringVar(root, value="50")
-    objectives_safe_fallback_var = tk.BooleanVar(root, value=_get_objectives_safe_fallback_mode())
     # Initialize additional variables
     difficulty_var = tk.StringVar(root)
     truck_avail_var = tk.StringVar(root)
@@ -20862,15 +23170,8 @@ def launch_gui(start_minimized=False):
     time_day_var = tk.StringVar(root)
     time_night_var = tk.StringVar(root)
     garage_refuel_var = tk.BooleanVar(root)
-    app_status_var = tk.StringVar(root, value=_DEFAULT_STATUS_TEXT)
+    app_status_var = tk.StringVar(root, value=_editor_translate_display_text(_DEFAULT_STATUS_TEXT))
     configure_app_status(root, app_status_var)
-    try:
-        # Start Objectives+ online refresh immediately so latest data is ready
-        # by the time the tab is opened.
-        start_objectives_prefetch_background(force=False)
-    except Exception:
-        pass
-
     # Ensure global registries exist before building UI
     try:
         FACTOR_RULE_VARS
@@ -20904,11 +23205,7 @@ def launch_gui(start_minimized=False):
     enable_legacy_tabs_var = tk.BooleanVar(root, value=bool(config.get("enable_legacy_tabs", False)))
     dark_mode_var.set(bool(config.get("dark_mode", False)))
     try:
-        val = config.get("objectives_use_safe_fallback", None)
-        if val is None:
-            val = config.get("objectives_use_backup", False)
-        _set_objectives_safe_fallback_mode(bool(val))
-        objectives_safe_fallback_var.set(_get_objectives_safe_fallback_mode())
+        _delete_config_keys(["objectives_use_safe_fallback", "objectives_use_backup"])
     except Exception:
         pass
     improve_share_raw = config.get("improve_share_enabled", False)
@@ -20940,21 +23237,11 @@ def launch_gui(start_minimized=False):
     except Exception as e:
         print("[Autosave] failed to bind state traces:", e)
 
-    # If startup is enabled, keep the Startup shortcut aligned to the currently running build.
-    try:
-        _sync_windows_startup_registration_if_needed()
-    except Exception as e:
-        print("[Startup] registration sync failed:", e)
-
-    check_for_updates_background(root, debug=True)
-
     tyre_var = tk.StringVar(value="default")
     custom_day_var = tk.DoubleVar(value=1.0)
     custom_night_var = tk.DoubleVar(value=1.0)
 
     # Icon setup removed
-
-    try_autoload_last_save(save_path_var)
 
     # --- schedule delayed version check so the editor can finish loading first ---
     # Delay (ms) — change to taste (5000 = 5 seconds)
@@ -20964,8 +23251,17 @@ def launch_gui(start_minimized=False):
         last = load_last_path()
         if not last or not os.path.exists(last):
             return
+        if not _root_can_present_popup(root):
+            try:
+                root.after(1500, _delayed_version_check)
+            except Exception:
+                pass
+            return
+        if not _should_run_delayed_version_check(last):
+            return
 
         try:
+            _mark_delayed_version_check_started(last)
             # Show the non-blocking dialog only once; the dialog's buttons handle persistence/UI updates.
             prompt_save_version_mismatch_and_choose(last, modal=False)
         except Exception as e:
@@ -21006,12 +23302,11 @@ def launch_gui(start_minimized=False):
             if "rank_var" in globals() and rank is not None:
                 rank_var.set(str(rank))
 
-            # --- robustly read & set experience (will print debug to terminal) ---
+            # --- robustly read & set experience ---
             try:
                 xp_val = _read_int_key_from_text(content, "experience")
-                print(f"[DEBUG] experience read from save: {xp_val}")
             except Exception as e:
-                print(f"[DEBUG] error reading experience from save: {e}")
+                print(f"[XP] failed to read experience from save: {e}")
                 xp_val = None
 
             # only set xp_var if the variable actually exists (it is created earlier).
@@ -21019,7 +23314,7 @@ def launch_gui(start_minimized=False):
                 try:
                     xp_var.set(str(xp_val) if xp_val is not None else "")
                 except Exception as e:
-                    print(f"[DEBUG] failed to set xp_var: {e}")
+                    print(f"[XP] failed to set experience field: {e}")
 
 
             # set the main builtin rule vars
@@ -21081,14 +23376,22 @@ def launch_gui(start_minimized=False):
             sync_all_rules(path)
         except Exception as e:
             print(f"sync_all_rules failed: {e}")
-        # Ensure Tk flushes variable -> widget updates
+        # Flush pending layout/variable work without entering a nested Tk event loop.
+        def _flush_idletasks():
+            try:
+                root.update_idletasks()
+            except Exception:
+                try:
+                    tk._default_root.update_idletasks()
+                except Exception:
+                    pass
+
+        _flush_idletasks()
         try:
-            root.update_idletasks()
-            root.update()
+            root.after_idle(_flush_idletasks)
         except Exception:
             try:
-                tk._default_root.update_idletasks()
-                tk._default_root.update()
+                tk._default_root.after_idle(_flush_idletasks)
             except Exception:
                 pass
         try:
@@ -21395,6 +23698,8 @@ def launch_gui(start_minimized=False):
             break
 
         # If we reached here, file_path is accepted (either original or replaced)
+        if not _wgs_is_session_path(file_path):
+            _wgs_reset_session(remove_mirror=True, sync=True)
         save_path_var.set(file_path)
 
         # Persist the selection
@@ -21521,6 +23826,7 @@ def launch_gui(start_minimized=False):
             set_app_status(f"Loading {tab_name} tab...", timeout_ms=0)
         try:
             builder()
+            _editor_apply_language_to_widget_tree(tab_widget)
             if not silent:
                 set_app_status(f"{tab_name} tab loaded.", timeout_ms=2500)
         except Exception as e:
@@ -21531,6 +23837,7 @@ def launch_gui(start_minimized=False):
                 wraplength=600,
                 justify="center",
             ).pack(fill="both", expand=True, padx=10, pady=10)
+            _editor_apply_language_to_widget_tree(tab_widget)
             set_app_status(f"{tab_name} tab failed to load: {e}", timeout_ms=10000)
 
     # TAB: Save File (inline UI built below)
@@ -21707,19 +24014,12 @@ def launch_gui(start_minimized=False):
             pass
         try:
             if not os.path.exists(path):
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write("")
+                _write_text_file_atomic(path, "", encoding="utf-8")
         except Exception as e:
             return set_app_status(f"Could not create status log file: {e}", timeout_ms=9000)
 
         try:
-            system = platform.system()
-            if system == "Windows" and hasattr(os, "startfile"):
-                os.startfile(path)
-            elif system == "Darwin":
-                subprocess.Popen(["open", path])
-            else:
-                subprocess.Popen(["xdg-open", path])
+            _open_path_with_default_app(path)
             set_app_status(f"Opened status logs: {path}", timeout_ms=7000)
         except Exception as e:
             set_app_status(f"Could not open status logs: {e}", timeout_ms=9000)
@@ -21731,7 +24031,22 @@ def launch_gui(start_minimized=False):
     status_row = ttk.Frame(status_bar, style="StatusBar.TFrame")
     status_row.pack(fill="x", padx=8, pady=(4, 6))
 
-    ttk.Label(status_row, text="STATUS", style="StatusBarBadge.TLabel").pack(side="left", padx=(0, 8))
+    tk.Button(
+        status_row,
+        text="STATUS",
+        command=_open_status_logs_file,
+        bg="#1f8f3a",
+        fg="white",
+        activebackground="#16692b",
+        activeforeground="white",
+        relief="raised",
+        bd=1,
+        padx=8,
+        pady=2,
+        font=("TkDefaultFont", 9, "bold"),
+        cursor="hand2",
+        highlightthickness=0,
+    ).pack(side="left", padx=(0, 8))
     ttk.Label(status_row, textvariable=app_status_var, style="StatusBarText.TLabel", anchor="w").pack(
         side="left",
         fill="x",
@@ -21819,6 +24134,9 @@ def launch_gui(start_minimized=False):
     # -------------------------------------------------------------------------
     minesweeper_app = None
     theme_preset_combo = None
+    editor_language_combo = None
+    editor_language_var = tk.StringVar(root, value=_objectives_language_label(_editor_get_language_preference()))
+    editor_language_label_to_code: Dict[str, str] = {}
 
     def apply_selected_theme_preset(preset_name, persist=True):
         enabled = _set_active_theme_preset(preset_name, persist=False)
@@ -21851,6 +24169,59 @@ def launch_gui(start_minimized=False):
 
     def on_theme_preset_changed(_event=None):
         apply_selected_theme_preset(theme_preset_var.get(), persist=True)
+
+    def refresh_editor_language_values(allow_download: bool = False):
+        nonlocal editor_language_label_to_code
+        available = _editor_available_languages(allow_download=allow_download)
+        current = _editor_get_language_preference()
+        if current not in available:
+            available = [current] + [code for code in available if code != current]
+        labels = [_objectives_language_label(code) for code in available]
+        editor_language_label_to_code = {label: code for label, code in zip(labels, available)}
+        try:
+            editor_language_var.set(_objectives_language_label(current))
+        except Exception:
+            pass
+        if editor_language_combo is not None:
+            try:
+                editor_language_combo.configure(values=labels, state=("readonly" if labels else "disabled"))
+            except Exception:
+                pass
+
+    def apply_selected_editor_language(language_code: Any, force_reload: bool = False):
+        lang = _editor_set_language_preference(language_code)
+        previous_objectives_lang = _objectives_normalize_language_code(_objectives_get_language_preference())
+        _objectives_set_language_preference(lang)
+        _editor_apply_language(root=root, language=lang, allow_download=True, force_reload=force_reload)
+        refresh_editor_language_values(allow_download=False)
+        _objectives_invalidate_runtime_caches()
+        _objectives_refresh_active_view_for_shared_language()
+        try:
+            root.after_idle(_fit_window_to_tabs_and_rules)
+        except Exception:
+            pass
+        translation_status = _editor_translation_status_message()
+        if previous_objectives_lang != lang:
+            set_app_status(
+                f"Editor, Objectives+, and Vehicles language set to {_objectives_language_label(lang)}. {translation_status}",
+                timeout_ms=4500,
+            )
+        else:
+            set_app_status(
+                f"Editor language set to {_objectives_language_label(lang)}. {translation_status}",
+                timeout_ms=4500,
+            )
+
+    def on_editor_language_changed(_event=None):
+        label = str(editor_language_var.get() or "").strip()
+        lang = editor_language_label_to_code.get(label)
+        if not lang:
+            lang = _editor_normalize_language_code(label)
+        apply_selected_editor_language(lang, force_reload=True)
+        try:
+            _clear_readonly_combobox_visual_state(editor_language_combo, focus_target=tab_settings)
+        except Exception:
+            pass
 
     def open_theme_customizer():
         popup = _create_themed_toplevel(root)
@@ -22444,6 +24815,13 @@ def launch_gui(start_minimized=False):
     theme_preset_combo.pack(side="left", fill="x", expand=True, padx=(8, 0))
     theme_preset_combo.bind("<<ComboboxSelected>>", on_theme_preset_changed)
     refresh_theme_preset_values(selected=_ACTIVE_THEME_NAME)
+    language_row = ttk.Frame(appearance_box)
+    language_row.pack(fill="x", pady=(8, 0))
+    ttk.Label(language_row, text="Editor Language:").pack(side="left")
+    editor_language_combo = ttk.Combobox(language_row, textvariable=editor_language_var, state="readonly", width=20)
+    editor_language_combo.pack(side="left", fill="x", expand=True, padx=(8, 0))
+    editor_language_combo.bind("<<ComboboxSelected>>", on_editor_language_changed)
+    refresh_editor_language_values(allow_download=True)
     ttk.Button(appearance_box, text="Theme Customizer", command=open_theme_customizer).pack(anchor="w", pady=(8, 0))
 
     editor_box = ttk.LabelFrame(settings_top, text="Editor", padding=(10, 8))
@@ -22508,6 +24886,7 @@ def launch_gui(start_minimized=False):
         config["delete_path_on_close"] = delete_path_on_close_var.get()
         config["dark_mode"] = bool(dark_mode_var.get())
         config["theme_preset"] = str(theme_preset_var.get() or _ACTIVE_THEME_NAME or "Light")
+        config["editor_language"] = _editor_get_language_preference()
         config["theme_presets"] = _serialize_theme_presets()
         config["make_backup"] = make_backup_var.get()
         config["full_backup"] = full_backup_var.get()
@@ -22520,10 +24899,8 @@ def launch_gui(start_minimized=False):
             _parse_nonnegative_int(config.get("max_autobackups", 50), 50),
         )
         config["autosave"] = bool(autosave_var.get() if autosave_var is not None else False)
-        try:
-            config["objectives_use_safe_fallback"] = bool(objectives_safe_fallback_var.get())
-        except Exception:
-            pass
+        config.pop("objectives_use_safe_fallback", None)
+        config.pop("objectives_use_backup", None)
         startup_normal, startup_minimized = _get_settings_startup_mode()
         config["start_with_windows"] = bool(startup_normal)
         config["start_with_windows_minimized"] = bool(startup_minimized)
@@ -22565,12 +24942,14 @@ def launch_gui(start_minimized=False):
             system = platform.system()
 
             def _run_powershell(ps_command: str):
+                quiet_kwargs = _windows_hidden_subprocess_kwargs()
                 for exe in ("powershell", "pwsh"):
                     try:
                         result = subprocess.run(
                             [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_command],
                             capture_output=True,
                             text=True,
+                            **quiet_kwargs,
                         )
                         if result.returncode == 0:
                             return
@@ -22656,12 +25035,71 @@ def launch_gui(start_minimized=False):
         except Exception as e:
             messagebox.showerror("Error", f"Failed to create shortcut:\n{e}")
 
+    def delete_editor_config_folder():
+        try:
+            target = os.path.abspath(str(get_editor_data_dir() or "").strip())
+        except Exception as e:
+            messagebox.showerror("Delete Config", f"Could not resolve the config folder:\n{e}")
+            return
+
+        if not target:
+            messagebox.showerror("Delete Config", "Could not resolve the config folder.")
+            return
+        if os.path.exists(target) and not os.path.isdir(target):
+            messagebox.showerror("Delete Config", f"Config path is not a folder:\n{target}")
+            return
+
+        try:
+            target_name = os.path.basename(target.rstrip("\\/"))
+        except Exception:
+            target_name = ""
+        try:
+            home_dir = os.path.abspath(os.path.expanduser("~"))
+        except Exception:
+            home_dir = ""
+        try:
+            cwd_dir = os.path.abspath(os.getcwd())
+        except Exception:
+            cwd_dir = ""
+
+        safe_target = (
+            bool(target_name)
+            and target_name == EDITOR_DATA_DIR_NAME
+            and target not in ("\\", "/")
+            and target != home_dir
+            and target != cwd_dir
+        )
+        if not safe_target:
+            messagebox.showerror("Delete Config", f"Refusing to delete unexpected folder:\n{target}")
+            return
+
+        confirmed = messagebox.askyesno(
+            "Delete Config",
+            "Delete the editor config folder and everything inside it?\n\n"
+            f"{target}\n\n"
+            "This removes saved settings, logs, caches, backups stored there, and other editor data.",
+        )
+        if not confirmed:
+            return
+
+        try:
+            if os.path.isdir(target):
+                shutil.rmtree(target)
+            set_app_status(f"Deleted editor config folder: {target}", timeout_ms=9000)
+            show_info(
+                "Delete Config",
+                f"Deleted:\n{target}\n\nThe folder will be recreated automatically if the editor saves data again.",
+            )
+        except Exception as e:
+            messagebox.showerror("Delete Config", f"Failed to delete the config folder:\n{e}")
+
     def manual_update_check():
         check_for_updates_background(root, debug=True)
 
     ttk.Button(actions_grid, text="Save Settings", command=save_settings).grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 6))
     ttk.Button(actions_grid, text="Check for Update", command=manual_update_check).grid(row=0, column=1, sticky="ew", pady=(0, 6))
-    ttk.Button(actions_grid, text="Make Desktop Shortcut", command=create_desktop_shortcut).grid(row=1, column=0, columnspan=2, sticky="ew")
+    ttk.Button(actions_grid, text="Make Desktop Shortcut", command=create_desktop_shortcut).grid(row=1, column=0, sticky="ew", padx=(0, 6))
+    ttk.Button(actions_grid, text="Delete Config", command=delete_editor_config_folder).grid(row=1, column=1, sticky="ew")
 
     # Separator and embedded Minesweeper
     if MINESWEEPER_AVAILABLE:
@@ -22695,6 +25133,11 @@ def launch_gui(start_minimized=False):
         p = save_path_var.get().strip()
         if not p:
             return messagebox.showerror("Error", "No path in entry to save.")
+        if _wgs_is_session_path(p):
+            return show_info(
+                "WGS",
+                "Saved Path slots are disabled for WGS sessions because they use a temporary mirrored folder.",
+            )
         cfg = load_config() or {}
         cfg[f"saved_path{slot_idx}"] = p
         save_config(cfg)
@@ -22736,6 +25179,8 @@ def launch_gui(start_minimized=False):
             break
 
         # Accept and persist into UI + existing save behavior
+        if not _wgs_is_session_path(file_path):
+            _wgs_reset_session(remove_mirror=True, sync=True)
         save_path_var.set(file_path)
         try:
             save_path(file_path)
@@ -22777,7 +25222,52 @@ def launch_gui(start_minimized=False):
                 return lambda: (_apply_path_selection(p), w.destroy())
             ttk.Button(btn_frame, text=f"[{idx}]", command=_make_handler()).pack(side="left", padx=6)
 
-    def _find_steam_saves():
+    def _prompt_select_path(candidates, title, message, label_builder=None):
+        if not candidates:
+            return ""
+        if len(candidates) == 1:
+            return candidates[0]
+
+        result = {"path": ""}
+        win = _create_themed_toplevel()
+        win.title(title)
+        ttk.Label(win, text=message, justify="left").pack(padx=12, pady=(8, 6))
+        frame = ttk.Frame(win)
+        frame.pack(padx=12, pady=8, fill="both", expand=True)
+        for candidate in candidates:
+            label = label_builder(candidate) if callable(label_builder) else str(candidate)
+
+            def _handler(value=candidate, w=win):
+                def _run():
+                    result["path"] = value
+                    try:
+                        w.destroy()
+                    except Exception:
+                        pass
+                return _run
+
+            ttk.Button(frame, text=label, command=_handler()).pack(fill="x", pady=2)
+        try:
+            win.transient(root)
+        except Exception:
+            pass
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        try:
+            win.wait_window()
+        except Exception:
+            pass
+        return result["path"]
+
+    def _steam_folder_label(path):
+        try:
+            return os.path.basename(os.path.dirname(os.path.dirname(path))) + " / " + os.path.basename(path)
+        except Exception:
+            return str(path)
+
+    def _collect_steam_save_folders():
         """Best-effort scan for Steam userdata -> */1465360/remote that contain CompleteSave files."""
         candidates = []
         env_candidates = []
@@ -22858,28 +25348,29 @@ def launch_gui(start_minimized=False):
             except Exception:
                 pass
 
-        candidates = list(dict.fromkeys(candidates))
+        return list(dict.fromkeys(candidates))
+
+    def _find_steam_saves():
+        candidates = _collect_steam_save_folders()
         if not candidates:
             return show_info("Steam not found", "Could not locate Steam save folder automatically.")
 
-        if len(candidates) == 1:
-            _choose_complete_save_in_folder(candidates[0])
-        else:
-            win = _create_themed_toplevel()
-            win.title("Multiple Steam save folders found")
-            ttk.Label(win, text="Multiple Steam save folders found — pick the folder to inspect:").pack(padx=12, pady=(8,6))
-            frame = ttk.Frame(win)
-            frame.pack(padx=12, pady=8)
-            for p in candidates:
-                def _h(pp=p, w=win):
-                    return lambda: (_choose_complete_save_in_folder(pp), w.destroy())
-                ttk.Button(frame, text=os.path.basename(os.path.dirname(os.path.dirname(p))) + " / " + os.path.basename(p), command=_h()).pack(fill="x", pady=2)
+        selected = _prompt_select_path(
+            candidates,
+            _editor_translate_display_text("Multiple Steam save folders found"),
+            _editor_translate_display_text("Multiple Steam save folders found — pick the folder to inspect:"),
+            _steam_folder_label,
+        )
+        if selected:
+            _choose_complete_save_in_folder(selected)
 
-    def _find_epic_saves():
+    def _collect_epic_save_folders():
         """Check %USERPROFILE%\\Documents\\My Games\\SnowRunner\\base\\storage\\<id> for CompleteSave files."""
+        if platform.system() != "Windows":
+            return []
         base = os.path.join(os.path.expanduser("~"), "Documents", "My Games", "SnowRunner", "base", "storage")
         if not os.path.isdir(base):
-            return show_info("Epic not found", f"Could not locate Epic storage folder:\n{base}")
+            return []
         found_folders = []
         try:
             for sub in os.listdir(base):
@@ -22892,22 +25383,517 @@ def launch_gui(start_minimized=False):
                         break
         except Exception:
             pass
+        return found_folders
+
+    def _epic_folder_label(path):
+        try:
+            return os.path.basename(path)
+        except Exception:
+            return str(path)
+
+    def _find_epic_saves():
+        if platform.system() != "Windows":
+            return show_info(
+                "Epic auto-detect unavailable",
+                "Epic save auto-detect currently supports the Windows save layout only. "
+                "Use Browse to select the save file manually on this platform.",
+                timeout_ms=8000,
+            )
+        base = os.path.join(os.path.expanduser("~"), "Documents", "My Games", "SnowRunner", "base", "storage")
+        found_folders = _collect_epic_save_folders()
 
         if not found_folders:
-            return show_info("Epic", "No SnowRunner save folders with CompleteSave files found in storage.")
+            return show_info("Epic", f"No SnowRunner save folders with CompleteSave files found in:\n{base}")
 
-        if len(found_folders) == 1:
-            _choose_complete_save_in_folder(found_folders[0])
+        selected = _prompt_select_path(
+            found_folders,
+            _editor_translate_display_text("Multiple Epic storage folders"),
+            _editor_translate_display_text("Multiple Epic storage folders found — pick one to inspect:"),
+            _epic_folder_label,
+        )
+        if selected:
+            _choose_complete_save_in_folder(selected)
+
+    def _activate_wgs_source(source_info):
+        try:
+            _wgs_reset_session(remove_mirror=True, sync=True)
+            session = _wgs_build_session(source_info.get("path"), source_kind=source_info.get("kind", "auto"))
+        except Exception as e:
+            return messagebox.showerror("WGS", f"Failed to open WGS save folder:\n\n{e}")
+
+        mirror_dir = str(session.get("mirror_dir") or "")
+        has_main_save = False
+        for base_name in ("CompleteSave", "CompleteSave1", "CompleteSave2", "CompleteSave3"):
+            for ext in (".cfg", ".dat"):
+                if os.path.isfile(os.path.join(mirror_dir, base_name + ext)):
+                    has_main_save = True
+                    break
+            if has_main_save:
+                break
+
+        if not has_main_save:
+            _wgs_reset_session(remove_mirror=True, sync=False)
+            return show_info(
+                "WGS",
+                "The selected WGS folder was decoded, but no CompleteSave files were found in it.",
+            )
+
+        try:
+            set_app_status(
+                "WGS folder loaded. Changes will sync back to the original Game Pass files automatically.",
+                timeout_ms=9000,
+            )
+        except Exception:
+            pass
+
+        _choose_complete_save_in_folder(mirror_dir)
+
+    def _prompt_select_wgs_source(candidates, title=None, message=None):
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+
+        title = str(title or _editor_translate_display_text("Select WGS source"))
+        message = str(message or _editor_translate_display_text("Multiple WGS save sources were found.\nChoose which one to decode:"))
+
+        win = _create_themed_toplevel()
+        win.title(title)
+        result = {"value": None}
+        ttk.Label(
+            win,
+            text=message,
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(10, 6))
+        frame = ttk.Frame(win)
+        frame.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        for item in candidates:
+            button_text = f"{item.get('label', 'WGS source')}\n{item.get('path', '')}"
+            def _handler(info=item, w=win):
+                def _run():
+                    result["value"] = info
+                    try:
+                        w.destroy()
+                    except Exception:
+                        pass
+                return _run
+            ttk.Button(frame, text=button_text, command=_handler()).pack(fill="x", pady=3)
+        try:
+            win.transient(root)
+        except Exception:
+            pass
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        try:
+            win.wait_window()
+        except Exception:
+            pass
+        return result["value"]
+
+    def _choose_wgs_source(candidates):
+        selected = _prompt_select_wgs_source(candidates)
+        if selected is None:
+            return messagebox.showerror(
+                "WGS",
+                "No WGS save data was found in the selected folder.\n\n"
+                "Select a folder that contains containers.index or container.* files.",
+            )
+        _activate_wgs_source(selected)
+
+    def _browse_wgs_folder():
+        startdir = _wgs_default_browse_dir()
+        selected = filedialog.askdirectory(
+            initialdir=startdir if startdir and os.path.isdir(startdir) else load_initial_path(),
+            title="Select SnowRunner WGS folder",
+        )
+        if not selected:
+            return
+        candidates = _wgs_discover_sources(selected)
+        _choose_wgs_source(candidates)
+
+    def _find_wgs_saves():
+        candidates = _wgs_auto_detect_sources()
+        if candidates:
+            _choose_wgs_source(candidates)
+            return
+
+        try:
+            set_app_status(
+                "No installed WGS save folder was auto-detected. Select the WGS folder manually.",
+                timeout_ms=8000,
+            )
+        except Exception:
+            pass
+        _browse_wgs_folder()
+
+    def _get_loaded_save_context():
+        file_path = os.path.abspath(str(save_path_var.get() or "").strip())
+        if not file_path:
+            raise ValueError("No save file is currently loaded.")
+        if not os.path.isfile(file_path):
+            raise ValueError(f"The loaded save file no longer exists:\n{file_path}")
+        folder_path = os.path.dirname(file_path)
+        if not folder_path or not os.path.isdir(folder_path):
+            raise ValueError(f"The loaded save folder is invalid:\n{folder_path}")
+        return {
+            "file_path": file_path,
+            "folder_path": folder_path,
+            "platform": detect_save_platform(file_path),
+        }
+
+    def _collect_detected_targets_for_platform(target_platform):
+        if target_platform == "steam":
+            return _collect_steam_save_folders()
+        if target_platform == "epic":
+            return _collect_epic_save_folders()
+        if target_platform == "wgs":
+            return _wgs_auto_detect_sources()
+        return []
+
+    def _choose_conversion_destination_mode(target_platform):
+        detected_targets = _collect_detected_targets_for_platform(target_platform)
+        result = {"mode": None}
+        title = f"Convert To {_platform_display_name(target_platform)}"
+        win = _create_themed_toplevel()
+        win.title(title)
+        body = ttk.Frame(win, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(
+            body,
+            text=f"Choose where to place the converted {_platform_display_name(target_platform)} files.",
+            justify="left",
+        ).pack(fill="x", pady=(0, 8))
+        ttk.Label(
+            body,
+            text="The currently loaded source save will not be modified.",
+            justify="left",
+        ).pack(fill="x", pady=(0, 10))
+
+        def _choose(mode):
+            result["mode"] = mode
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        button_col = ttk.Frame(body)
+        button_col.pack(fill="x")
+
+        detected_label = f"Use detected {_platform_display_name(target_platform)} path"
+        if target_platform == "wgs":
+            detected_desc = "Overwrite an existing WGS save using its current container mapping."
         else:
-            win = _create_themed_toplevel()
-            win.title("Multiple Epic storage folders")
-            ttk.Label(win, text="Multiple Epic storage folders found — pick one to inspect:").pack(padx=12, pady=(8,6))
-            frame = ttk.Frame(win)
-            frame.pack(padx=12, pady=8)
-            for p in found_folders:
-                def _h(pp=p, w=win):
-                    return lambda: (_choose_complete_save_in_folder(pp), w.destroy())
-                ttk.Button(frame, text=os.path.basename(p), command=_h()).pack(fill="x", pady=2)
+            detected_desc = "Write directly into the detected live save folder for that platform."
+        ttk.Button(
+            button_col,
+            text=detected_label,
+            command=lambda: _choose("detected"),
+            state=("normal" if detected_targets else "disabled"),
+        ).pack(fill="x", pady=(0, 4))
+        ttk.Label(body, text=detected_desc, justify="left", wraplength=520).pack(fill="x", pady=(0, 10))
+
+        if target_platform in {"steam", "epic"}:
+            ttk.Button(button_col, text="ZIP to Downloads", command=lambda: _choose("zip")).pack(fill="x", pady=(0, 4))
+            ttk.Label(
+                body,
+                text="Create a separate ZIP package in your Downloads folder instead of touching a live save.",
+                justify="left",
+                wraplength=520,
+            ).pack(fill="x", pady=(0, 10))
+
+            ttk.Button(button_col, text="Choose export folder", command=lambda: _choose("folder")).pack(fill="x", pady=(0, 4))
+            ttk.Label(
+                body,
+                text="Create a new converted folder inside a location you choose, keeping existing saves untouched.",
+                justify="left",
+                wraplength=520,
+            ).pack(fill="x", pady=(0, 10))
+        else:
+            ttk.Button(button_col, text="Choose WGS folder", command=lambda: _choose("folder")).pack(fill="x", pady=(0, 4))
+            ttk.Label(
+                body,
+                text="Pick an existing WGS save folder manually. WGS conversion needs an existing save layout to write back into.",
+                justify="left",
+                wraplength=520,
+            ).pack(fill="x", pady=(0, 10))
+
+        ttk.Button(body, text="Cancel", command=lambda: _choose(None)).pack(anchor="e", pady=(4, 0))
+
+        try:
+            win.transient(root)
+        except Exception:
+            pass
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        try:
+            win.wait_window()
+        except Exception:
+            pass
+        return result["mode"]
+
+    def _select_detected_target_for_conversion(target_platform):
+        if target_platform == "steam":
+            candidates = _collect_steam_save_folders()
+            return _prompt_select_path(
+                candidates,
+                _editor_translate_display_text("Convert To Steam"),
+                _editor_translate_display_text("Choose the detected Steam remote folder to overwrite with the converted save:"),
+                _steam_folder_label,
+            )
+        if target_platform == "epic":
+            candidates = _collect_epic_save_folders()
+            return _prompt_select_path(
+                candidates,
+                _editor_translate_display_text("Convert To Epic"),
+                _editor_translate_display_text("Choose the detected Epic storage folder to overwrite with the converted save:"),
+                _epic_folder_label,
+            )
+        if target_platform == "wgs":
+            return _prompt_select_wgs_source(
+                _wgs_auto_detect_sources(),
+                title=_editor_translate_display_text("Convert To WGS"),
+                message=_editor_translate_display_text("Choose the detected WGS save source to overwrite with the converted save:"),
+            )
+        return None
+
+    def _pick_conversion_export_parent(target_platform):
+        if target_platform == "steam":
+            title = "Choose folder for Steam export"
+            initialdir = get_downloads_path()
+        elif target_platform == "epic":
+            title = "Choose folder for Epic export"
+            initialdir = get_downloads_path()
+        else:
+            title = "Choose target WGS folder"
+            initialdir = _wgs_default_browse_dir()
+        return filedialog.askdirectory(
+            initialdir=initialdir if initialdir and os.path.isdir(initialdir) else load_initial_path(),
+            title=title,
+        )
+
+    def _pick_manual_wgs_target():
+        picked = _pick_conversion_export_parent("wgs")
+        if not picked:
+            return None
+        manual_candidates = _wgs_discover_sources(picked)
+        if not manual_candidates:
+            messagebox.showerror(
+                "Convert To WGS",
+                "No WGS save data was found in the selected folder.\n\n"
+                "Select a folder that contains containers.index or container.* files.",
+            )
+            return None
+        return _prompt_select_wgs_source(
+            manual_candidates,
+            title="Convert To WGS",
+            message="Choose the WGS save source to overwrite with the converted save:",
+        )
+
+    def _show_conversion_result(target_platform, target_label, result, extra_message_text=""):
+        copied = int(result.get("copied", 0) or 0)
+        overwritten = int(result.get("overwritten", 0) or 0)
+        display_target = str(result.get("display_target") or result.get("target_dir") or "")
+        summary_message = _editor_translate_display_text(
+            "Converted the current save folder to {target_label}.\n\n"
+            "Files copied: {copied}\n"
+            "Existing files overwritten: {overwritten}\n"
+            "Target: {display_target}"
+        ).format(
+            target_label=target_label,
+            copied=copied,
+            overwritten=overwritten,
+            display_target=display_target,
+        )
+        message_parts = [summary_message]
+        if target_platform == "wgs":
+            missing = result.get("missing") or []
+            if missing:
+                preview = "\n".join(str(name) for name in missing[:8])
+                if len(missing) > 8:
+                    preview = f"{preview}\n..." if preview else "..."
+                missing_message = _editor_translate_display_text(
+                    "Files skipped because no matching WGS slot existed: {missing_count}\n{missing_preview}"
+                ).format(
+                    missing_count=len(missing),
+                    missing_preview=preview,
+                )
+                message_parts.append(missing_message)
+        if extra_message_text:
+            message_parts.append(str(extra_message_text))
+        show_info(f"Convert To {target_label}", "\n\n".join(message_parts))
+
+    def _platform_display_name(platform_name):
+        table = {
+            "steam": "Steam",
+            "epic": "Epic",
+            "wgs": "WGS",
+            "unknown": "current",
+        }
+        return table.get(str(platform_name or "").lower(), str(platform_name or "current"))
+
+    def _convert_current_save(target_platform):
+        try:
+            context = _get_loaded_save_context()
+        except Exception as e:
+            return messagebox.showerror("Convert Save", str(e))
+
+        source_platform = context.get("platform", "unknown")
+        source_label = _platform_display_name(source_platform)
+        target_label = _platform_display_name(target_platform)
+        if target_platform == source_platform:
+            return show_info("Convert Save", f"The loaded save already appears to be a {target_label} save.")
+
+        source_dir = context["folder_path"]
+        destination_mode = _choose_conversion_destination_mode(target_platform)
+        if not destination_mode:
+            return
+
+        try:
+            if target_platform in {"steam", "epic"}:
+                if destination_mode == "detected":
+                    target_dir = _select_detected_target_for_conversion(target_platform)
+                    if not target_dir:
+                        return
+                    if os.path.abspath(target_dir) == os.path.abspath(source_dir):
+                        return messagebox.showerror(
+                            "Convert Save",
+                            "Source and target folders must be different for conversion.",
+                        )
+                    confirmed = messagebox.askyesno(
+                        f"Convert To {target_label}",
+                        f"Convert the currently loaded {source_label} save folder to the detected {target_label} path?\n\n"
+                        f"Source:\n{source_dir}\n\n"
+                        f"Target:\n{target_dir}\n\n"
+                        "Existing files with matching names in the target folder will be overwritten.",
+                    )
+                    if not confirmed:
+                        return
+
+                    result = _copy_save_folder_to_platform(source_dir, target_dir, target_platform)
+                    extra_message_text = ""
+                    if target_platform == "steam":
+                        try:
+                            remcache_path = _write_steam_remotecache(target_dir)
+                            extra_message_text = _editor_translate_display_text(
+                                "Generated Steam remotecache:\n{remcache_path}"
+                            ).format(remcache_path=remcache_path)
+                        except Exception as e:
+                            extra_message_text = _editor_translate_display_text(
+                                "Steam files were copied, but remotecache.vdf could not be generated:\n{error}"
+                            ).format(error=e)
+                    try:
+                        set_app_status(f"Converted save folder to detected {target_label} path.", timeout_ms=8000)
+                    except Exception:
+                        pass
+                    return _show_conversion_result(target_platform, target_label, result, extra_message_text=extra_message_text)
+
+                if destination_mode == "folder":
+                    parent_dir = _pick_conversion_export_parent(target_platform)
+                    if not parent_dir:
+                        return
+                    result = _build_platform_export(source_dir, parent_dir, target_platform)
+                    extra_message_text = _editor_translate_display_text(
+                        "Created a new converted folder:\n{export_root}"
+                    ).format(export_root=result.get("export_root", ""))
+                    if target_platform == "steam" and result.get("remotecache_path"):
+                        extra_message_text += "\n\n" + _editor_translate_display_text(
+                            "Generated Steam remotecache:\n{remcache_path}"
+                        ).format(remcache_path=result.get("remotecache_path"))
+                    try:
+                        set_app_status(f"Exported converted {target_label} folder.", timeout_ms=8000)
+                    except Exception:
+                        pass
+                    return _show_conversion_result(target_platform, target_label, result, extra_message_text=extra_message_text)
+
+                if destination_mode == "zip":
+                    downloads_dir = get_downloads_path()
+                    result = _build_platform_zip_export(source_dir, downloads_dir, target_platform)
+                    extra_message_text = _editor_translate_display_text(
+                        "Created ZIP package:\n{zip_path}"
+                    ).format(zip_path=result.get("zip_path", ""))
+                    try:
+                        set_app_status(f"Created {target_label} ZIP in Downloads.", timeout_ms=8000)
+                    except Exception:
+                        pass
+                    return _show_conversion_result(target_platform, target_label, result, extra_message_text=extra_message_text)
+
+                return
+
+            if target_platform == "wgs":
+                if destination_mode == "detected":
+                    target_info = _select_detected_target_for_conversion("wgs")
+                elif destination_mode == "folder":
+                    target_info = _pick_manual_wgs_target()
+                else:
+                    target_info = None
+                if not target_info:
+                    return
+                target_path = str(target_info.get("path") or "")
+                confirmed = messagebox.askyesno(
+                    "Convert To WGS",
+                    f"Convert the currently loaded {source_label} save folder to WGS?\n\n"
+                    f"Source:\n{source_dir}\n\n"
+                    f"Target WGS source:\n{target_path}\n\n"
+                    "Matching files in the target WGS save will be overwritten.",
+                )
+                if not confirmed:
+                    return
+
+                result = _copy_save_folder_to_wgs(source_dir, target_path, source_kind=target_info.get("kind", "auto"))
+                try:
+                    set_app_status("Converted save folder to WGS.", timeout_ms=8000)
+                except Exception:
+                    pass
+                return _show_conversion_result("wgs", "WGS", result)
+
+            return messagebox.showerror("Convert Save", f"Unsupported conversion target: {target_platform}")
+        except Exception as e:
+            return messagebox.showerror(f"Convert To {target_label}", str(e))
+
+    def _conversion_targets_for_current_save():
+        try:
+            platform_name = _get_loaded_save_context().get("platform", "unknown")
+        except Exception:
+            platform_name = "unknown"
+
+        if platform_name == "steam":
+            return [("Epic", "epic"), ("WGS", "wgs")]
+        if platform_name == "epic":
+            return [("Steam", "steam"), ("WGS", "wgs")]
+        if platform_name == "wgs":
+            return [("Steam", "steam"), ("Epic", "epic")]
+        return [("Steam", "steam"), ("Epic", "epic"), ("WGS", "wgs")]
+
+    def _show_convert_menu():
+        try:
+            _get_loaded_save_context()
+        except Exception as e:
+            return messagebox.showerror("Convert Save", str(e))
+
+        menu = tk.Menu(tab_file, tearoff=False)
+        for label, key in _conversion_targets_for_current_save():
+            menu.add_command(
+                label=_editor_translate_display_text(f"Convert To {label}"),
+                command=lambda target=key: _convert_current_save(target),
+            )
+
+        if menu.index("end") is None:
+            menu.add_command(
+                label=_editor_translate_display_text("No conversion options available"),
+                state="disabled",
+            )
+
+        try:
+            menu.tk_popup(convert_button.winfo_rootx(), convert_button.winfo_rooty() + convert_button.winfo_height())
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
 
     def _load_saved_path(slot_idx: int):
         p = _get_saved_path(slot_idx)
@@ -22931,11 +25917,12 @@ def launch_gui(start_minimized=False):
     entry = ttk.Entry(mid_col, textvariable=save_path_var)
     entry.pack(fill="x", expand=True)
 
-    # Right column: Steam / Epic (stacked)
+    # Right column: Steam / Epic / WGS (stacked)
     right_col = ttk.Frame(row1)
     right_col.pack(side="left", anchor="n")
     ttk.Button(right_col, text="Steam", width=12, command=_find_steam_saves).pack(pady=2)
     ttk.Button(right_col, text="Epic", width=12, command=_find_epic_saves).pack(pady=2)
+    ttk.Button(right_col, text="wgs", width=12, command=_find_wgs_saves).pack(pady=2)
 
     # Replace the previous Row 2 block with this centered layout
     row2 = ttk.Frame(path_container)
@@ -23017,6 +26004,8 @@ def launch_gui(start_minimized=False):
     ttk.Button(center_frame, text="Load Path 1", width=12, command=lambda: _load_saved_path(1)).pack(side="left", padx=(0,6))
     ttk.Button(center_frame, text="Load Path 2", width=12, command=lambda: _load_saved_path(2)).pack(side="left", padx=(0,12))
     ttk.Button(center_frame, text="Browse...", command=browse_file).pack(side="left")
+    convert_button = ttk.Button(center_frame, text="Convert To...", command=_show_convert_menu)
+    convert_button.pack(side="left", padx=(12, 0))
     improve_share_inline = ttk.Frame(center_frame)
     improve_share_inline.pack(side="left", padx=(12, 0))
     ttk.Checkbutton(
@@ -23058,6 +26047,8 @@ def launch_gui(start_minimized=False):
             "Slot 4 → CompleteSave3.cfg\n\n"
             "Steam saves are typically found at:\n"
             "[Steam install]/userdata/[steam_id]/1465360/remote\n\n"
+            "WGS / Xbox App saves are typically found at:\n"
+            "%LOCALAPPDATA%\\Packages\\FocusHomeInteractiveSA.SnowRunnerWindows10_4hny5m903y3g0\\SystemAppData\\wgs\\<user_id>_<title_id>\n\n"
             "Epic and other platforms:\n"
             "%USERPROFILE%\\Documents\\My Games\\SnowRunner\\base\\storage\\<unique_key_folder>"
         ),
@@ -23159,8 +26150,7 @@ def launch_gui(start_minimized=False):
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
             content = _set_key_in_text(content, key, json.dumps(value))
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+            _write_text_file_atomic(path, content, encoding="utf-8")
             return True
         except Exception as e:
             print(f"[write_json_key] {e}")
@@ -23170,11 +26160,9 @@ def launch_gui(start_minimized=False):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 c = f.read()
-            val = _read_int_key_from_text(c, "experience")
-            print("DEBUG XP READ:", val)
-            return val
+            return _read_int_key_from_text(c, "experience")
         except Exception as e:
-            print("DEBUG XP ERROR:", e)
+            print("[XP] failed to read experience:", e)
             return None
 
 
@@ -23303,9 +26291,7 @@ def launch_gui(start_minimized=False):
                                  lambda m: m.group(1) + j_rank,
                                  content, flags=re.IGNORECASE)
 
-            # write once
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+            _write_text_file_atomic(path, content, encoding="utf-8")
 
             # Update GUI immediately (best-effort)
             try:
@@ -23370,9 +26356,7 @@ def launch_gui(start_minimized=False):
                              lambda m: m.group(1) + j_xp,
                              content, flags=re.IGNORECASE)
 
-            # write once
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(content)
+            _write_text_file_atomic(path, content, encoding="utf-8")
 
             # update UI (best-effort)
             try:
@@ -23423,11 +26407,13 @@ def launch_gui(start_minimized=False):
         xp_val = RANK_XP_REQUIREMENTS.get(rank_val, 0)
 
         try:
-            okm = _write_json_key_to_file(path, "money", money_val)
-            okr = _write_json_key_to_file(path, "rank", rank_val)
-            okx = _write_json_key_to_file(path, "experience", xp_val)
-            if not (okm and okr and okx):
-                raise RuntimeError("One or more writes failed")
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            content = _set_key_in_text(content, "money", json.dumps(money_val))
+            content = _set_key_in_text(content, "rank", json.dumps(rank_val))
+            content = _set_key_in_text(content, "experience", json.dumps(xp_val))
+            _write_text_file_atomic(path, content, encoding="utf-8")
             # update UI immediately
             try:
                 if "money_var" in globals() and money_var is not None:
@@ -23660,19 +26646,6 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
     # END TAB UI: Time
     # -------------------------------------------------------------------------
 
-    if os.path.exists(save_path_var.get()):
-        sync_rule_dropdowns(save_path_var.get())
-
-    
-    # --- Final Sync After GUI is Built ---
-    if os.path.exists(save_path_var.get()):
-        for loader in plugin_loaders:
-            try:
-                loader(save_path_var.get())
-            except Exception as e:
-                print(f"Plugin failed to update GUI on startup: {e}")
-
-
     # External rules/extensions no longer mounted into the Rules tab (tab intentionally left empty).
 
     
@@ -23682,36 +26655,95 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
         except Exception as e:
             print("[Warning] Could not delete save path:", e)
 
-    # --- Auto-sync on startup if a valid save file is remembered ---
-    if save_path_var.get() and os.path.exists(save_path_var.get()):
-        try:
-            sync_all_rules(save_path_var.get())
-            print("[DEBUG] Auto-sync applied on startup.")
-        except Exception as e:
-            print("[Warning] Auto-sync failed:", e)
-
-    _close_guard = {"done": False}
-
-    def _shutdown_editor():
-        if _close_guard["done"]:
+    def _finalize_shutdown_cleanup():
+        if _close_state.get("cleanup_done"):
             return
-        _close_guard["done"] = True
+        _close_state["cleanup_done"] = True
+        try:
+            _wgs_reset_session(remove_mirror=True, sync=True)
+        except Exception:
+            pass
         try:
             save_settings_silent()
         except Exception:
             pass
         try:
-            _apply_settings_startup_mode()
+            stop_autosave_monitor(wait=False)
         except Exception:
             pass
         try:
-            stop_autosave_monitor()
+            if bool(root.winfo_exists()):
+                root.destroy()
+        except Exception:
+            pass
+
+    def _shutdown_editor():
+        if _close_state.get("requested"):
+            return
+        _close_state["requested"] = True
+        try:
+            root.protocol("WM_DELETE_WINDOW", lambda: None)
         except Exception:
             pass
         try:
-            root.destroy()
+            root.withdraw()
         except Exception:
             pass
+        try:
+            root.quit()
+        except Exception:
+            _finalize_shutdown_cleanup()
+
+    def _run_deferred_startup_syncs():
+        if _close_state.get("requested"):
+            return
+        try:
+            try_autoload_last_save(save_path_var)
+        except Exception as e:
+            print("[Startup] remembered save autoload failed:", e)
+
+        if _close_state.get("requested"):
+            return
+        current_path = str(save_path_var.get() or "")
+        if not current_path or not os.path.exists(current_path):
+            return
+
+        def _finish_startup_sync(path=current_path):
+            if _close_state.get("requested"):
+                return
+            try:
+                sync_all_rules(path)
+            except Exception as e:
+                print("[Warning] Auto-sync failed:", e)
+
+        try:
+            root.after(40, _finish_startup_sync)
+        except Exception:
+            _finish_startup_sync()
+
+    def _run_post_show_background_maintenance():
+        if _close_state.get("requested"):
+            return
+        try:
+            start_objectives_prefetch_background(force=False, startup_managed=True)
+        except Exception as e:
+            print("[Startup] objectives prefetch failed:", e)
+
+        def _startup_registration_worker():
+            try:
+                _sync_windows_startup_registration_if_needed()
+            except Exception as e:
+                print("[Startup] registration sync failed:", e)
+
+        try:
+            threading.Thread(target=_startup_registration_worker, daemon=True).start()
+        except Exception:
+            pass
+
+        try:
+            check_for_updates_background(root, debug=False, startup_managed=True)
+        except Exception as e:
+            print("[Startup] update check failed to start:", e)
 
     try:
         root.protocol("WM_DELETE_WINDOW", _shutdown_editor)
@@ -23719,22 +26751,15 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
         pass
 
     _apply_editor_theme(root, dark_mode=dark_mode_var.get())
+    _editor_apply_language_to_all_windows(root=root)
 
-    objectives_width_cache = {"value": 0}
+    EDITOR_DEFAULT_WINDOW_WIDTH = 1110
 
     # --- Auto-size window to show all tabs and full Rules tab content ---
     def _fit_window_to_tabs_and_rules():
+        if _close_state.get("requested"):
+            return
         try:
-            try:
-                if str(tab_rules) in lazy_tab_builders:
-                    _ensure_lazy_tab_built(tab_rules, silent=True)
-            except Exception:
-                pass
-            try:
-                if str(tab_objectives) in lazy_tab_builders:
-                    _ensure_lazy_tab_built(tab_objectives, silent=True)
-            except Exception:
-                pass
             root.update_idletasks()
             try:
                 tab_count = tab_control.index("end")
@@ -23742,13 +26767,8 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
                 tab_count = 0
 
             nb_req_h = tab_control.winfo_reqheight()
-            objectives_req_w = tab_objectives.winfo_reqwidth() if 'tab_objectives' in locals() else 0
             rules_req_w = tab_rules.winfo_reqwidth() if 'tab_rules' in locals() else 0
             rules_req_h = tab_rules.winfo_reqheight() if 'tab_rules' in locals() else 0
-
-            if objectives_req_w > 0:
-                objectives_width_cache["value"] = max(objectives_width_cache["value"], int(objectives_req_w))
-            objectives_req_w = int(objectives_width_cache["value"] or objectives_req_w or 0)
 
             rules_container = globals().get("_RULES_TAB_CONTAINER")
             if rules_container is not None:
@@ -23788,7 +26808,7 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
                 text_width = sum(font.measure(t) for t in tab_texts)
                 header_width = text_width + (12 * tab_count) + 20
 
-            target_w = int(max(header_width, objectives_req_w, 900) + 16)
+            target_w = int(EDITOR_DEFAULT_WINDOW_WIDTH)
             status_h = 0
             try:
                 status_h = status_bar.winfo_reqheight() if "status_bar" in locals() else 0
@@ -23831,29 +26851,263 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
         root.after(60, _fit_window_to_tabs_and_rules)
     except Exception:
         pass
+
+    def _build_initial_selected_tab():
+        if _close_state.get("requested"):
+            return
+        try:
+            current_tab_widget = tab_control.nametowidget(tab_control.select())
+            _ensure_lazy_tab_built(current_tab_widget)
+        except Exception:
+            pass
+        try:
+            root.after_idle(_fit_window_to_tabs_and_rules)
+        except Exception:
+            pass
+
     try:
-        root.after(
-            120,
-            lambda: _ensure_lazy_tab_built(tab_control.nametowidget(tab_control.select())),
-        )
+        root.after(120, _build_initial_selected_tab)
+    except Exception:
+        pass
+    try:
+        root.after(250, _run_deferred_startup_syncs)
+    except Exception:
+        pass
+    try:
+        root.after(1200, _run_post_show_background_maintenance)
     except Exception:
         pass
 
     root.mainloop()
+    _finalize_shutdown_cleanup()
 
 # -----------------------------------------------------------------------------
 # END SECTION: Dependency Checks + App Launch
 # -----------------------------------------------------------------------------
 
 FogToolFrame = FogToolApp
+
+
+def run_self_test():
+    """Lightweight non-GUI probe for packaging and core release helpers."""
+    failures = []
+
+    def _check(condition, message):
+        if not condition:
+            failures.append(str(message))
+
+    data_dir = str(get_editor_data_dir() or "").strip()
+    _check(bool(data_dir), "editor data dir did not resolve")
+    _check(os.path.isdir(data_dir), "editor data dir does not exist")
+
+    desktop_dir = str(get_desktop_path() or "").strip()
+    _check(bool(desktop_dir), "desktop path did not resolve")
+    _check(os.path.isdir(desktop_dir), "desktop path does not exist")
+
+    expected_suffixes = {
+        "Windows": "a",
+        "Linux": "b",
+        "Darwin": "c",
+    }
+    for system_name, expected in expected_suffixes.items():
+        actual = _platform_release_suffix(system_name)
+        _check(actual == expected, f"release suffix mismatch for {system_name}: expected {expected}, got {actual}")
+
+    release_cases = [
+        (
+            [{"tag_name": "105a"}, {"tag_name": "104"}],
+            "b",
+            "104",
+        ),
+        (
+            [{"tag_name": "105a"}, {"tag_name": "103c"}],
+            "b",
+            "",
+        ),
+        (
+            [{"tag_name": "105a"}, {"tag_name": "104a"}, {"tag_name": "103"}],
+            "a",
+            "105a",
+        ),
+    ]
+    for releases, suffix, expected_tag in release_cases:
+        _, selected_tag = _select_latest_release_for_platform(releases, suffix)
+        _check(
+            selected_tag == expected_tag,
+            f"release selection mismatch for suffix {suffix!r}: expected {expected_tag!r}, got {selected_tag!r}",
+        )
+
+    process_cases = [
+        ("SnowRunner.exe                    123 Console", True),
+        ("1234 C:\\Games\\SnowRunner\\SnowRunner.exe", True),
+        ("snowrunner_editor.exe             456 Console", False),
+        ("1234 python snowrunner_editor.py", False),
+        ("1234 pgrep -af snowrunner", False),
+    ]
+    for raw_line, expected in process_cases:
+        actual = _looks_like_snowrunner_game_process_line(raw_line)
+        _check(actual == expected, f"process detection mismatch for sample line: {raw_line!r}")
+
+    now = 1_700_000_000.0
+    _check(_should_run_background_update_check({}, now_ts=now), "background update throttle helper should run with no prior timestamp")
+    _check(
+        not _should_run_background_update_check(
+            {BACKGROUND_UPDATE_LAST_CHECK_TS_KEY: now - 60.0},
+            now_ts=now,
+        ),
+        "background update throttle helper should throttle recent checks",
+    )
+    _check(
+        _should_run_background_update_check(
+            {BACKGROUND_UPDATE_LAST_CHECK_TS_KEY: now - (BACKGROUND_UPDATE_CHECK_COOLDOWN_SECONDS + 1)},
+            now_ts=now,
+        ),
+        "background update throttle helper should run once cooldown expires",
+    )
+    _check(
+        not _should_run_background_update_check(
+            {
+                BACKGROUND_UPDATE_LAST_CHECK_TS_KEY: now - 60.0,
+                BACKGROUND_UPDATE_LAST_STATUS_KEY: "failed",
+            },
+            now_ts=now,
+        ),
+        "background update throttle helper should honor failure retry cooldown",
+    )
+    _check(
+        _should_run_background_update_check(
+            {
+                BACKGROUND_UPDATE_LAST_CHECK_TS_KEY: now - (BACKGROUND_UPDATE_FAILURE_RETRY_SECONDS + 1),
+                BACKGROUND_UPDATE_LAST_STATUS_KEY: "failed",
+            },
+            now_ts=now,
+        ),
+        "background update throttle helper should retry after failure cooldown",
+    )
+
+    try:
+        startup_calls = {"mark": 0, "thread_started": 0}
+
+        class _StartupTestRoot:
+            def state(self):
+                return "normal"
+
+            def winfo_viewable(self):
+                return True
+
+            def after(self, *_args, **_kwargs):
+                return None
+
+        class _StartupTestThread:
+            def __init__(self, target=None, daemon=None):
+                self.target = target
+                self.daemon = daemon
+
+            def start(self):
+                startup_calls["thread_started"] += 1
+
+        _orig_should = _should_run_background_update_check
+        _orig_mark = _mark_background_update_check_started
+        _orig_thread = threading.Thread
+        try:
+            globals()["_should_run_background_update_check"] = lambda *args, **kwargs: False
+            globals()["_mark_background_update_check_started"] = (
+                lambda *args, **kwargs: startup_calls.__setitem__("mark", startup_calls["mark"] + 1) or now
+            )
+            threading.Thread = _StartupTestThread
+            _check(
+                check_for_updates_background(_StartupTestRoot(), debug=False, startup_managed=True),
+                "startup update check should start on every launch",
+            )
+            _check(startup_calls["mark"] == 1, "startup update check should mark startup attempts")
+            _check(startup_calls["thread_started"] == 1, "startup update check should start worker thread")
+        finally:
+            globals()["_should_run_background_update_check"] = _orig_should
+            globals()["_mark_background_update_check_started"] = _orig_mark
+            threading.Thread = _orig_thread
+    except Exception as e:
+        _check(False, f"startup update check self-test failed: {e}")
+
+    _check(
+        not _should_run_background_objectives_prefetch(
+            {
+                BACKGROUND_OBJECTIVES_PREFETCH_LAST_STATUS_KEY: "success",
+                BACKGROUND_OBJECTIVES_PREFETCH_LAST_SUCCESS_TS_KEY: now - 60.0,
+            },
+            now_ts=now,
+        ),
+        "objectives prefetch should throttle recent successful background runs",
+    )
+    _check(
+        _should_run_background_objectives_prefetch(
+            {
+                BACKGROUND_OBJECTIVES_PREFETCH_LAST_STATUS_KEY: "success",
+                BACKGROUND_OBJECTIVES_PREFETCH_LAST_SUCCESS_TS_KEY: now - (BACKGROUND_OBJECTIVES_PREFETCH_SUCCESS_COOLDOWN_SECONDS + 1),
+            },
+            now_ts=now,
+        ),
+        "objectives prefetch should run again after success cooldown expires",
+    )
+    _check(
+        not _should_run_background_objectives_prefetch(
+            {
+                BACKGROUND_OBJECTIVES_PREFETCH_LAST_STATUS_KEY: "failed",
+                BACKGROUND_OBJECTIVES_PREFETCH_LAST_ATTEMPT_TS_KEY: now - 60.0,
+            },
+            now_ts=now,
+        ),
+        "objectives prefetch should throttle recent failed background runs",
+    )
+    _check(
+        _should_run_background_objectives_prefetch(
+            {
+                BACKGROUND_OBJECTIVES_PREFETCH_LAST_STATUS_KEY: "failed",
+                BACKGROUND_OBJECTIVES_PREFETCH_LAST_ATTEMPT_TS_KEY: now - (BACKGROUND_OBJECTIVES_PREFETCH_FAILURE_RETRY_SECONDS + 1),
+            },
+            now_ts=now,
+        ),
+        "objectives prefetch should retry after failure backoff expires",
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            test_path = os.path.join(td, "atomic_test.txt")
+            _write_text_file_atomic(test_path, "alpha", encoding="utf-8")
+            _write_text_file_atomic(test_path, "beta", encoding="utf-8")
+            with open(test_path, "r", encoding="utf-8") as fh:
+                _check(fh.read() == "beta", "atomic text writer round trip failed")
+    except Exception as e:
+        _check(False, f"atomic text writer self-test failed: {e}")
+
+    class _SelfTestRoot:
+        def __init__(self, state_value, viewable):
+            self._state_value = state_value
+            self._viewable = viewable
+
+        def state(self):
+            return self._state_value
+
+        def winfo_viewable(self):
+            return self._viewable
+
+    _check(_root_can_present_popup(_SelfTestRoot("normal", True)), "popup root helper rejected visible root")
+    _check((not _root_can_present_popup(_SelfTestRoot("iconic", False))), "popup root helper accepted minimized root")
+
+    if failures:
+        raise RuntimeError("Self-test failed: " + "; ".join(failures))
+
+    print("[SelfTest] OK")
+    return True
+
+
 if __name__ == "__main__":
     try:
         argv_flags = {str(a).strip().lower() for a in sys.argv[1:] if str(a).strip()}
         _cleanup_windows_update_artifacts()
         _start_windows_update_artifact_cleanup_retry()
         if "--self-test" in argv_flags:
-            # Lightweight startup probe for the auto-updater:
-            # process must launch and exit cleanly without opening the GUI.
+            # Lightweight non-GUI probe for packaging and release helpers.
+            run_self_test()
             sys.exit(0)
         launch_gui(start_minimized=("--start-minimized" in argv_flags))
     except Exception as e:
@@ -23867,5 +27121,6 @@ if __name__ == "__main__":
             )
         except Exception:
             pass
+        sys.exit(1)
 
 
