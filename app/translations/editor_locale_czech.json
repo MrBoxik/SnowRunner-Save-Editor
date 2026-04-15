@@ -475,7 +475,7 @@
     "Northern Thread": "Severní nit",
     "Not enough space to place mines!": "Není dostatek místa pro umístění min!",
     "Not found": "Nenalezeno",
-    "Objectives+": "Objectives+",
+    "Objectives+": "Cíle+",
     "Objectives+ background refresh failed; fallback data will be used.": "Obnovení Objectives+ na pozadí selhalo; budou použita záložní data.",
     "Objectives+ error": "Chyba Objectives+",
     "Objectives+ fallback data cached in background.": "Záložní data Objectives+ byla uložena do mezipaměti na pozadí.",
@@ -545,7 +545,7 @@
     "Region": "Region",
     "Region traveling price": "Cena cestování mezi regiony",
     "Region:": "Region:",
-    "Regions+": "Regions+",
+    "Regions+": "Regiony+",
     "Releases page link copied to clipboard.": "Odkaz na stránku Releases byl zkopírován do schránky.",
     "Reload Save": "Znovu načíst sejv",
     "Reloading game data": "Znovu načítání herních dat",
@@ -1120,6 +1120,7 @@
     "Current module values loaded.": "Aktuální hodnoty modulů byly načteny.",
     "Backup created: {name}": "Záloha vytvořena: {name}",
     "No changes were needed.": "Nebyly potřeba žádné změny.",
-    "Using initial.pak from {saved}": "Používá se initial.pak z {saved}"
+    "Using initial.pak from {saved}": "Používá se initial.pak z {saved}",
+    "Mods": "Mody"
   }
 }

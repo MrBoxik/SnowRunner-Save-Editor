@@ -1120,6 +1120,7 @@
     "Current module values loaded.": "Current module values loaded.",
     "Backup created: {name}": "Backup created: {name}",
     "No changes were needed.": "No changes were needed.",
-    "Using initial.pak from {saved}": "Using initial.pak from {saved}"
+    "Using initial.pak from {saved}": "Using initial.pak from {saved}",
+    "Mods": "Mods"
   }
 }
