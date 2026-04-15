@@ -33,7 +33,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 - ⚙️ Modify **game rules** (trucks, tires, fuel, repair, etc.)
 - 🌄 Adjust **time settings** (day-only, night-only, multipliers, time stop & more)
 - ✅ Mark **missions, tasks, and contests** as complete
-- 🔓 Unlock **upgrades and watchtowers**
+- 🔓 Unlock **upgrades, Watchtowers, Garages and more**
 - 🏆 Complete **trials**
 - 🏅 Edit **achievements**
 - 🌫️ **Fog Tool** — edit Fog of War directly
@@ -47,7 +47,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 - 👑 Unlock **PROS rewards**
 - 🏠 Unlock **garages**
 - 🔄 Built-in **update checker**
-
+- ➕ **And more**
 ---
 
 ## 💬 Note from the Creator
