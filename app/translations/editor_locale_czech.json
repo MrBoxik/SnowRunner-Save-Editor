@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "Násobič pružnosti rámu",
     "Crane motor strength multiplier": "Násobič síly motoru jeřábu",
     "Crane mass multiplier": "Násobič hmotnosti jeřábu",
+    "Camera collisions": "Kolize kamery",
     "Craneable logs": "Klády zvedatelné jeřábem",
     "Winchable cargo": "Náklad připojitelný navijákem",
     "Grass and debris draw distance multiplier": "Násobič vykreslovací vzdálenosti trávy a nečistot",
@@ -1124,3 +1125,4 @@
     "Mods": "Mody"
   }
 }
+

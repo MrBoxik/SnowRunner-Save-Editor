@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "フレキシブルフレーム倍率",
     "Crane motor strength multiplier": "クレーンモーター強度倍率",
     "Crane mass multiplier": "クレーン質量倍率",
+    "Camera collisions": "カメラ衝突",
     "Craneable logs": "クレーンで持ち上げ可能な丸太",
     "Winchable cargo": "ウインチ接続可能な貨物",
     "Grass and debris draw distance multiplier": "草と破片の描画距離倍率",
@@ -1124,3 +1125,4 @@
     "Mods": "モッド"
   }
 }
+

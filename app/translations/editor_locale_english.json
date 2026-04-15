@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "Flexible frame multiplier",
     "Crane motor strength multiplier": "Crane motor strength multiplier",
     "Crane mass multiplier": "Crane mass multiplier",
+    "Camera collisions": "Camera collisions",
     "Craneable logs": "Craneable logs",
     "Winchable cargo": "Winchable cargo",
     "Grass and debris draw distance multiplier": "Grass and debris draw distance multiplier",
@@ -1124,3 +1125,4 @@
     "Mods": "Mods"
   }
 }
+

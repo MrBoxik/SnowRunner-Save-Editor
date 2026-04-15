@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "Multiplikator für Rahmenflexibilität",
     "Crane motor strength multiplier": "Multiplikator für Kranmotorstärke",
     "Crane mass multiplier": "Multiplikator für Kranmasse",
+    "Camera collisions": "Kamerakollisionen",
     "Craneable logs": "Mit dem Kran hebbare Stämme",
     "Winchable cargo": "Mit der Winde verbindbare Fracht",
     "Grass and debris draw distance multiplier": "Multiplikator für Gras- und Trümmer-Sichtweite",
@@ -1124,3 +1125,4 @@
     "Mods": "Mods"
   }
 }
+

@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "유연한 프레임 배수",
     "Crane motor strength multiplier": "크레인 모터 강도 배수",
     "Crane mass multiplier": "크레인 질량 배수",
+    "Camera collisions": "카메라 충돌",
     "Craneable logs": "크레인으로 들어 올릴 수 있는 통나무",
     "Winchable cargo": "윈치로 연결 가능한 화물",
     "Grass and debris draw distance multiplier": "잔디와 파편 그리기 거리 배수",
@@ -1124,3 +1125,4 @@
     "Mods": "모드"
   }
 }
+

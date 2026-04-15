@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "Множитель гибкости рамы",
     "Crane motor strength multiplier": "Множитель мощности мотора крана",
     "Crane mass multiplier": "Множитель массы крана",
+    "Camera collisions": "Коллизии камеры",
     "Craneable logs": "Бревна, поднимаемые краном",
     "Winchable cargo": "Груз, подключаемый лебедкой",
     "Grass and debris draw distance multiplier": "Множитель дальности прорисовки травы и мусора",
@@ -1124,3 +1125,4 @@
     "Mods": "Моды"
   }
 }
+

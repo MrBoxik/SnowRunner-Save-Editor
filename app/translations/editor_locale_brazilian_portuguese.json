@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "Multiplicador da flexibilidade do chassi",
     "Crane motor strength multiplier": "Multiplicador da força do motor do guindaste",
     "Crane mass multiplier": "Multiplicador da massa do guindaste",
+    "Camera collisions": "Colisões da câmera",
     "Craneable logs": "Toras levantáveis por guindaste",
     "Winchable cargo": "Carga conectável ao guincho",
     "Grass and debris draw distance multiplier": "Multiplicador da distância de renderização da grama e dos detritos",
@@ -1124,3 +1125,4 @@
     "Mods": "Mods"
   }
 }
+

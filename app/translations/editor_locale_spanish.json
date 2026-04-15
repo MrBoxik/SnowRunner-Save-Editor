@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "Multiplicador de flexibilidad del chasis",
     "Crane motor strength multiplier": "Multiplicador de fuerza del motor de la grúa",
     "Crane mass multiplier": "Multiplicador de masa de la grúa",
+    "Camera collisions": "Colisiones de la cámara",
     "Craneable logs": "Troncos elevables con grúa",
     "Winchable cargo": "Carga conectable al cabrestante",
     "Grass and debris draw distance multiplier": "Multiplicador de distancia de dibujo de hierba y escombros",
@@ -1124,3 +1125,4 @@
     "Mods": "Mods"
   }
 }
+

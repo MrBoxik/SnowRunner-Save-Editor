@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "柔性車架倍率",
     "Crane motor strength multiplier": "起重機馬達強度倍率",
     "Crane mass multiplier": "起重機重量倍率",
+    "Camera collisions": "攝影機碰撞",
     "Craneable logs": "可由起重機吊起的原木",
     "Winchable cargo": "可由絞盤連接的貨物",
     "Grass and debris draw distance multiplier": "草地與碎屑繪製距離倍率",
@@ -1124,3 +1125,4 @@
     "Mods": "模組"
   }
 }
+

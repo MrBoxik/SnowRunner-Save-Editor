@@ -1108,6 +1108,7 @@
     "Flexible frame multiplier": "Mnożnik elastyczności ramy",
     "Crane motor strength multiplier": "Mnożnik siły silnika dźwigu",
     "Crane mass multiplier": "Mnożnik masy dźwigu",
+    "Camera collisions": "Kolizje kamery",
     "Craneable logs": "Kłody możliwe do podniesienia dźwigiem",
     "Winchable cargo": "Ładunek możliwy do podłączenia wyciągarką",
     "Grass and debris draw distance multiplier": "Mnożnik odległości rysowania trawy i odłamków",
@@ -1124,3 +1125,4 @@
     "Mods": "Mody"
   }
 }
+
