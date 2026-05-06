@@ -1,7 +1,7 @@
 ---
 name: Bug report
 about: Create a report to help us improve
-title: ''
+title: bug
 labels: bug
 assignees: MrBoxik
 
@@ -9,32 +9,28 @@ assignees: MrBoxik
 
 System Information
 Editor Platform (Windows / Linux / macOS / Other):
-Editor Version:  
+Editor Version: 
 Game Platform (Steam / Epic / Console / Other):
-
----
 
 Bug Description
 (Describe the bug clearly. What happened? What did you expect to happen?)
 
----
-
 Editor Usage
 Did you use the editor before the bug occurred?
-- Yes / No
+
+Yes / No
 
 What changes did you make in the save file?
 (List specific tabs, values, settings, or operations you modified.)
 
----
-
 Steps to Reproduce
 (Provide a step-by-step sequence so the bug can be replicated.)
-1.  
-2.  
-3.  
-
----
+1.
+2.
+3.
 
 Additional Information
 (Logs, screenshots, save files, or any other useful context.)
+
+If the issue appears after loading a save file, please attach that save file to the issue.
+GitHub only allows certain file types, so make sure to compress it into a .zip archive before uploading.
