@@ -39,7 +39,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 - 🌫️ **Fog Tool** — edit Fog of War directly
 - 📊 **Game Stats** viewer & editor
 - 🛡️ **Auto-backup system** (with cleanup & recall)
-- 📦 Supports **all base maps** and **Seasons 1–17** (future-ready for later seasons)
+- 📦 Supports **all base maps** and **Seasons 1–18** (future-ready for later seasons)
 - 📂 Remembers your **last used save file**
 - 🚚 Unstuck trucks and trailers
 - 🔁 Restart completed tasks
@@ -54,7 +54,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 
 > Here is my SnowRunner Save Editor that I made after losing progress in my 300 hour save specifically in the Quebec map.  
 >  
-> All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 17**, and it *should* work fine for upcoming Seasons 18, 19, etc.  
+> All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 18**, and it *should* work fine for upcoming Seasons 19, 20, etc.  
 >  
 > Also no save editor I found could change **game rules**, **game mode** or **time**, so I added those too.  
 >  
