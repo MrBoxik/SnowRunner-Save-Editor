@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # SECTION: Imports & Optional Dependencies
 # Used In: Entire application (core runtime, UI, and utilities)
 # =============================================================================
@@ -37,6 +37,7 @@ import math
 import hashlib
 import uuid
 import weakref
+import email.utils
 from datetime import datetime, timezone
 import webbrowser
 import tkinter as tk
@@ -53,7 +54,7 @@ _NATIVE_ASKYESNO = messagebox.askyesno
 # =============================================================================
 # APP VERSION (manual)
 # =============================================================================
-APP_VERSION = 104
+APP_VERSION = 108
 _UPDATE_STATUS = None  # "update", "dev", "none"
 
 # -----------------------------------------------------------------------------
@@ -82,6 +83,7 @@ SEASON_REGION_MAP = {
     15: ("US_15", "Season 15: Oil & Dirt (Quebec)"),
     16: ("US_16", "Season 16: High Voltage (Washington)"),
     17: ("RU_17", "Season 17: Repair & Rescue (Zurdania)"),
+    18: ("US_18", "Season 18: Patch & Power (Chiapas)"),
 }
 
 BASE_MAPS = [
@@ -104,6 +106,15 @@ def _season_short_name(label: str) -> str:
 # Short names (used by tooltips and misc UI)
 REGION_NAME_MAP = {code: name for code, name in BASE_MAPS}
 REGION_NAME_MAP.update({code: _season_short_name(label) for _, (code, label) in SEASON_ENTRIES})
+
+_MAP_REGION_SLUG_TO_CODE = {}
+for _region_code, _region_name in REGION_NAME_MAP.items():
+    try:
+        _slug = re.sub(r"[^A-Za-z0-9]+", "_", str(_region_name or "").strip()).strip("_").upper()
+    except Exception:
+        _slug = ""
+    if _slug and _slug not in _MAP_REGION_SLUG_TO_CODE:
+        _MAP_REGION_SLUG_TO_CODE[_slug] = str(_region_code or "").strip().upper()
 
 # Full names (used by stats UI)
 REGION_LONG_NAME_MAP = {code: name for code, name in BASE_MAPS}
@@ -187,6 +198,11 @@ _APP_STATUS_RAW_TEXT = _DEFAULT_STATUS_TEXT
 SAVE_FILE_NAME = "snowrunner_editor_save.json"
 _SAVE_FILE_PATH = None
 EDITOR_DATA_DIR_NAME = "snowrunner_save_editor_data"
+EDITOR_BACKUP_DIR_NAME = "backups"
+SAVE_BACKUPS_DIR_NAME = "saves"
+INITIAL_PAK_BACKUPS_DIR_NAME = "initial_pak"
+LEGACY_BACKUP_DIR_NAME = "backup"
+SAVE_BACKUP_ENTRY_PREFIXES = ("backup-", "autobackup-")
 _EDITOR_DATA_DIR = None
 _STATUS_LOG_PATH = None
 _STATUS_LOG_LOCK = threading.Lock()
@@ -466,8 +482,152 @@ def get_editor_data_dir():
         _ensure_dir(fallback)
         _EDITOR_DATA_DIR = fallback
     except Exception:
-        _EDITOR_DATA_DIR = os.getcwd()
+            _EDITOR_DATA_DIR = os.getcwd()
     return _EDITOR_DATA_DIR
+
+
+def get_editor_backup_root():
+    """Central folder for editor-created backups, outside SnowRunner game folders."""
+    root = os.path.join(get_editor_data_dir(), EDITOR_BACKUP_DIR_NAME)
+    if not _ensure_dir(root):
+        raise RuntimeError(f"Could not create editor backup folder: {root}")
+    return root
+
+
+def _path_is_or_inside(path, parent):
+    try:
+        raw_target = str(path or "").strip()
+        raw_base = str(parent or "").strip()
+        if not raw_target or not raw_base:
+            return False
+        target = os.path.abspath(raw_target)
+        base = os.path.abspath(raw_base)
+        return os.path.commonpath([target, base]) == base
+    except Exception:
+        return False
+
+
+def _safe_backup_source_label(path):
+    raw = str(path or "").strip()
+    base = os.path.basename(os.path.normpath(raw)) if raw else "source"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(base or "source")).strip("._-")
+    if not safe:
+        safe = "source"
+    try:
+        digest_src = os.path.abspath(raw or safe)
+    except Exception:
+        digest_src = raw or safe
+    digest = hashlib.sha1(digest_src.encode("utf-8", errors="replace")).hexdigest()[:12]
+    return f"{safe}_{digest}"
+
+
+def _backup_category_dir(category, source_path):
+    safe_category = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(category or "misc")).strip("._-") or "misc"
+    root = get_editor_backup_root()
+    folder = os.path.join(root, safe_category, _safe_backup_source_label(source_path))
+    if not _path_is_or_inside(folder, root):
+        raise RuntimeError("Resolved backup folder is outside the editor backup root.")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _unique_backup_migration_target(parent, name):
+    candidate = os.path.join(parent, name)
+    if not os.path.exists(candidate):
+        return candidate
+    for idx in range(1, 1000):
+        candidate = os.path.join(parent, f"{name} migrated-{idx}")
+        if not os.path.exists(candidate):
+            return candidate
+    raise RuntimeError(f"Could not find an unused backup migration name for: {name}")
+
+
+def _migrate_legacy_backup_entries(legacy_dir, target_dir, prefixes, label):
+    """Move recognized legacy backup entries into the editor-owned backup folder."""
+    if not legacy_dir or not target_dir or not os.path.isdir(legacy_dir):
+        return 0
+
+    try:
+        root = get_editor_backup_root()
+        if not _path_is_or_inside(target_dir, root):
+            raise RuntimeError("target folder is outside the editor backup root")
+        os.makedirs(target_dir, exist_ok=True)
+    except Exception as e:
+        print(f"[Backup] Migration skipped for {label}: {e}")
+        return 0
+
+    legacy_abs = os.path.abspath(legacy_dir)
+    target_abs = os.path.abspath(target_dir)
+    if os.path.normcase(legacy_abs) == os.path.normcase(target_abs):
+        return 0
+    if _path_is_or_inside(target_abs, legacy_abs):
+        print(f"[Backup] Migration skipped for {label}: target is inside legacy folder.")
+        return 0
+
+    try:
+        names = sorted(os.listdir(legacy_dir))
+    except Exception as e:
+        print(f"[Backup] Migration skipped for {label}: {e}")
+        return 0
+
+    lowered_prefixes = tuple(str(p or "").lower() for p in prefixes if str(p or ""))
+    moved = 0
+    for name in names:
+        if not str(name).lower().startswith(lowered_prefixes):
+            continue
+        src = os.path.join(legacy_dir, name)
+        if not _path_is_or_inside(src, legacy_dir):
+            continue
+        try:
+            dst = _unique_backup_migration_target(target_dir, name)
+            shutil.move(src, dst)
+            moved += 1
+        except Exception as e:
+            print(f"[Backup] Could not migrate {label} backup '{name}': {e}")
+
+    if moved:
+        print(f"[Backup] Migrated {moved} {label} backup(s) to: {target_dir}")
+
+    try:
+        os.rmdir(legacy_dir)
+    except OSError:
+        pass
+    except Exception:
+        pass
+    return moved
+
+
+def _save_backup_dir_for_save_dir(save_dir, migrate=True):
+    raw_save_dir = str(save_dir or "").strip()
+    if not raw_save_dir:
+        return ""
+    save_dir = os.path.abspath(raw_save_dir)
+    backup_dir = _backup_category_dir(SAVE_BACKUPS_DIR_NAME, save_dir)
+    if migrate and os.path.isdir(save_dir):
+        _migrate_legacy_backup_entries(
+            os.path.join(save_dir, LEGACY_BACKUP_DIR_NAME),
+            backup_dir,
+            SAVE_BACKUP_ENTRY_PREFIXES,
+            "save",
+        )
+    return backup_dir
+
+
+def _save_scan_should_skip_dir(root, save_dir, active_backup_dir=None):
+    if not root or not save_dir:
+        return False
+    legacy_backup_dir = os.path.join(save_dir, LEGACY_BACKUP_DIR_NAME)
+    if _path_is_or_inside(root, legacy_backup_dir):
+        return True
+    if active_backup_dir and _path_is_or_inside(root, active_backup_dir):
+        return True
+    try:
+        backup_root = get_editor_backup_root()
+        if _path_is_or_inside(root, backup_root):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def get_status_log_path():
@@ -664,6 +824,43 @@ def _set_windows_taskbar_icon(root, ico_path) -> bool:
         if not hwnd:
             return False
         user32 = ctypes.windll.user32
+        set_class_long = getattr(user32, "SetClassLongPtrW", None)
+        if not callable(set_class_long):
+            set_class_long = getattr(user32, "SetClassLongW", None)
+        if callable(set_class_long):
+            try:
+                set_class_long.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+                set_class_long.restype = ctypes.c_void_p
+            except Exception:
+                pass
+        hwnd_candidates = []
+        seen_hwnds = set()
+
+        def _add_hwnd(raw_hwnd):
+            try:
+                if isinstance(raw_hwnd, str):
+                    hwnd_value = int(str(raw_hwnd).strip(), 0)
+                else:
+                    hwnd_value = int(raw_hwnd)
+            except Exception:
+                return
+            if hwnd_value <= 0 or hwnd_value in seen_hwnds:
+                return
+            seen_hwnds.add(hwnd_value)
+            hwnd_candidates.append(hwnd_value)
+
+        _add_hwnd(hwnd)
+        try:
+            _add_hwnd(user32.GetParent(int(hwnd)))
+        except Exception:
+            pass
+        try:
+            frame_hwnd = root.wm_frame()
+        except Exception:
+            frame_hwnd = None
+        _add_hwnd(frame_hwnd)
+        if not hwnd_candidates:
+            return False
         SM_CXICON = 11
         SM_CYICON = 12
         SM_CXSMICON = 49
@@ -679,14 +876,34 @@ def _set_windows_taskbar_icon(root, ico_path) -> bool:
         WM_SETICON = 0x80
         ICON_SMALL = 0
         ICON_BIG = 1
+        GCLP_HICON = -14
+        GCLP_HICONSM = -34
         if hicon_big:
-            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+            for target_hwnd in hwnd_candidates:
+                try:
+                    user32.SendMessageW(target_hwnd, WM_SETICON, ICON_BIG, hicon_big)
+                except Exception:
+                    pass
+                if callable(set_class_long):
+                    try:
+                        set_class_long(target_hwnd, GCLP_HICON, hicon_big)
+                    except Exception:
+                        pass
             try:
                 setattr(root, "_win_icon_big", hicon_big)
             except Exception:
                 pass
         if hicon_small:
-            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+            for target_hwnd in hwnd_candidates:
+                try:
+                    user32.SendMessageW(target_hwnd, WM_SETICON, ICON_SMALL, hicon_small)
+                except Exception:
+                    pass
+                if callable(set_class_long):
+                    try:
+                        set_class_long(target_hwnd, GCLP_HICONSM, hicon_small)
+                    except Exception:
+                        pass
             try:
                 setattr(root, "_win_icon_small", hicon_small)
             except Exception:
@@ -719,6 +936,11 @@ def set_app_icon(root) -> None:
                 # Force taskbar icon via WinAPI (covers cases where Tk only sets small icon)
                 if _set_windows_taskbar_icon(root, ico):
                     did_set = True
+                try:
+                    root.iconbitmap(default=ico)
+                    did_set = True
+                except Exception:
+                    pass
                 try:
                     root.iconbitmap(ico)
                     did_set = True
@@ -1719,6 +1941,89 @@ def _wgs_build_session(source_dir, source_kind="auto"):
 # SECTION: Save Conversion Helpers
 # Used In: Save File tab ("Convert To..." action)
 # =============================================================================
+_COMPLETE_SAVE_BASE_NAMES = {
+    "completesave",
+    "completesave1",
+    "completesave2",
+    "completesave3",
+}
+_COMMON_SSL_BASE_NAMES = {
+    "commonsslsave",
+    "common_ssl_save",
+}
+
+
+def _snowrunner_save_picker_filetypes():
+    return [
+        ("SnowRunner Save", "*.cfg *.dat CompleteSave CompleteSave1 CompleteSave2 CompleteSave3"),
+        ("All files", "*"),
+    ]
+
+
+def _save_name_without_extension(name: Any) -> str:
+    base_name = os.path.basename(str(name or "").strip())
+    if not base_name:
+        return ""
+    return os.path.splitext(base_name)[0]
+
+
+def _is_complete_save_filename(name: Any) -> bool:
+    return _save_name_without_extension(name).strip().lower() in _COMPLETE_SAVE_BASE_NAMES
+
+
+def _is_common_ssl_filename(name: Any) -> bool:
+    return _save_name_without_extension(name).strip().lower() in _COMMON_SSL_BASE_NAMES
+
+
+def _is_probable_snowrunner_save_filename(name: Any, allow_json: bool = False) -> bool:
+    base_name = os.path.basename(str(name or "").strip())
+    if not base_name:
+        return False
+
+    root, ext = os.path.splitext(base_name)
+    ext_lower = ext.lower()
+    if ext_lower:
+        allowed_exts = {".cfg", ".dat"}
+        if allow_json:
+            allowed_exts.add(".json")
+        if ext_lower not in allowed_exts:
+            return False
+
+    root_lower = str(root if ext_lower else base_name).strip().lower()
+    if not root_lower:
+        return False
+    if root_lower in _COMPLETE_SAVE_BASE_NAMES or root_lower in _COMMON_SSL_BASE_NAMES:
+        return True
+    if root_lower.startswith("fog_level"):
+        return True
+    return bool(re.match(r"^(?:\d+_)?sts_level_", root_lower))
+
+
+def _iter_complete_save_candidates(folder: Any) -> List[Tuple[int, str]]:
+    base_dir = os.path.abspath(str(folder or "").strip())
+    if not base_dir or not os.path.isdir(base_dir):
+        return []
+
+    candidates: List[Tuple[int, str]] = []
+    seen: Set[str] = set()
+    for base_name, slot_idx in (
+        ("CompleteSave", 1),
+        ("CompleteSave1", 2),
+        ("CompleteSave2", 3),
+        ("CompleteSave3", 4),
+    ):
+        for suffix in ("", ".cfg", ".dat"):
+            candidate = os.path.join(base_dir, base_name + suffix)
+            if not os.path.isfile(candidate):
+                continue
+            key = os.path.normcase(os.path.abspath(candidate))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((slot_idx, candidate))
+    return candidates
+
+
 def detect_save_platform(path):
     target = os.path.abspath(str(path or "").strip())
     if not target:
@@ -1737,6 +2042,8 @@ def detect_save_platform(path):
         return "steam"
     if ext == ".dat":
         return "epic"
+    if _is_complete_save_filename(target):
+        return "ps4"
     return "unknown"
 
 
@@ -1760,10 +2067,18 @@ def _save_relpath_with_platform_extension(rel_path, target_platform):
     rel = str(rel_path or "")
     root, ext = os.path.splitext(rel)
     ext_lower = ext.lower()
-    if target_platform == "steam" and ext_lower == ".dat":
-        return root + ".cfg"
-    if target_platform == "epic" and ext_lower == ".cfg":
-        return root + ".dat"
+    if target_platform == "steam":
+        if ext_lower == ".dat":
+            return root + ".cfg"
+        if not ext_lower and _is_probable_snowrunner_save_filename(rel, allow_json=False):
+            return rel + ".cfg"
+    if target_platform == "epic":
+        if ext_lower == ".cfg":
+            return root + ".dat"
+        if not ext_lower and _is_probable_snowrunner_save_filename(rel, allow_json=False):
+            return rel + ".dat"
+    if target_platform == "ps4" and ext_lower in {".cfg", ".dat"} and _is_probable_snowrunner_save_filename(rel, allow_json=False):
+        return root
     return rel
 
 
@@ -1893,6 +2208,8 @@ def _wgs_target_relpath_for_source(rel_path):
     root, ext = os.path.splitext(rel)
     if ext.lower() == ".dat":
         return root + ".cfg"
+    if not ext and _is_probable_snowrunner_save_filename(rel, allow_json=False):
+        return rel + ".cfg"
     return rel
 
 
@@ -2205,7 +2522,7 @@ class FogToolApp(ttk.Frame):
             ttk.Checkbutton(self.season_frame, text=name, variable=v).pack(anchor="w")
             self.season_checks[code] = v
 
-        ttk.Label(self.season_frame, text="Other Season number (e.g., 18, 19, 20):").pack(anchor="w")
+        ttk.Label(self.season_frame, text="Other Season number (e.g., 19, 20, 21):").pack(anchor="w")
         self.extra_season_var = tk.StringVar()
         ttk.Entry(self.season_frame, textvariable=self.extra_season_var).pack(anchor="w", fill="x")
 
@@ -3598,26 +3915,24 @@ def _cleanup_backup_history(backup_dir, max_backups=20, max_autobackups=50):
 
 def _create_timestamped_full_backup(save_dir, prefix="backup"):
     """
-    Create a timestamped full backup folder under <save_dir>/backup.
+    Create a timestamped full backup folder under the editor backup root.
     Returns (backup_dir, full_dir, copied_count).
     """
     if not save_dir or not os.path.isdir(save_dir):
         raise ValueError("save directory is missing or invalid")
 
     timestamp = datetime.now().strftime(f"{prefix}-%d.%m.%Y %H-%M-%S")
-    backup_dir = os.path.join(save_dir, "backup")
-    os.makedirs(backup_dir, exist_ok=True)
+    backup_dir = _save_backup_dir_for_save_dir(save_dir)
 
     full_dir = os.path.join(backup_dir, timestamp + "_full")
     os.makedirs(full_dir, exist_ok=True)
 
     copied = 0
-    backup_dir_abs = os.path.abspath(backup_dir)
     for root, _, files in os.walk(save_dir):
-        if os.path.abspath(root).startswith(backup_dir_abs):
+        if _save_scan_should_skip_dir(root, save_dir, active_backup_dir=backup_dir):
             continue
         for file in files:
-            if not file.lower().endswith((".cfg", ".dat")):
+            if not _is_probable_snowrunner_save_filename(file, allow_json=False):
                 continue
             src_path = os.path.join(root, file)
             rel_path = os.path.relpath(src_path, save_dir)
@@ -5492,8 +5807,8 @@ def _bind_autosave_runtime_state_traces():
 
 def _create_autobackup(save_dir, full_backup_mode=None):
     """
-    Copy all .cfg/.dat files from save_dir into backup/autobackup-<timestamp>[_full] preserving subpaths.
-    Uses the same skip logic as make_backup_if_enabled (skips the backup folder itself).
+    Copy SnowRunner save files into the editor backup root, preserving subpaths.
+    Uses the same skip logic as make_backup_if_enabled.
     """
     try:
         if not save_dir or not os.path.isdir(save_dir):
@@ -5502,26 +5817,25 @@ def _create_autobackup(save_dir, full_backup_mode=None):
         if full_backup_mode is None:
             _, full_backup_mode, _ = _get_autosave_runtime_state()
         timestamp = datetime.now().strftime("autobackup-%d.%m.%Y %H-%M-%S")
-        backup_dir = os.path.join(save_dir, "backup")
-        os.makedirs(backup_dir, exist_ok=True)
+        backup_dir = _save_backup_dir_for_save_dir(save_dir)
         folder_name = timestamp + ("_full" if full_backup_mode else "")
         full_dir = os.path.join(backup_dir, folder_name)
         os.makedirs(full_dir, exist_ok=True)
 
         for root, _, files in os.walk(save_dir):
-            # skip backups-of-backups
-            if os.path.abspath(root).startswith(os.path.abspath(backup_dir)):
+            if _save_scan_should_skip_dir(root, save_dir, active_backup_dir=backup_dir):
                 continue
             for file in files:
-                if file.lower().endswith((".cfg", ".dat")):
-                    src_path = os.path.join(root, file)
-                    rel_path = os.path.relpath(src_path, save_dir)
-                    dst_path = os.path.join(full_dir, rel_path)
-                    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-                    try:
-                        shutil.copy2(src_path, dst_path)
-                    except Exception as e:
-                        print(f"[Autosave] copy failed {src_path} -> {dst_path}: {e}")
+                if not _is_probable_snowrunner_save_filename(file, allow_json=False):
+                    continue
+                src_path = os.path.join(root, file)
+                rel_path = os.path.relpath(src_path, save_dir)
+                dst_path = os.path.join(full_dir, rel_path)
+                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+                try:
+                    shutil.copy2(src_path, dst_path)
+                except Exception as e:
+                    print(f"[Autosave] copy failed {src_path} -> {dst_path}: {e}")
         print(f"[Autosave] Created autobackup at: {full_dir}")
         set_app_status(f"Autosave backup created: {os.path.basename(full_dir)}", timeout_ms=5000)
         try:
@@ -5535,21 +5849,21 @@ def _create_autobackup(save_dir, full_backup_mode=None):
 
 
 def _scan_folder_mtimes(save_dir):
-    """Return dict {relative_path: mtime} for .cfg/.dat files in save_dir (non-recursive for file-list consistency)."""
+    """Return dict {relative_path: mtime} for SnowRunner save files in save_dir."""
     mt = {}
     if not save_dir or not os.path.isdir(save_dir):
         return mt
     for root, _, files in os.walk(save_dir):
-        # skip backup folder
-        if os.path.abspath(root).startswith(os.path.abspath(os.path.join(save_dir, "backup"))):
+        if _save_scan_should_skip_dir(root, save_dir):
             continue
         for f in files:
-            if f.lower().endswith((".cfg", ".dat")):
-                full = os.path.join(root, f)
-                try:
-                    mt[os.path.relpath(full, save_dir)] = os.path.getmtime(full)
-                except Exception:
-                    pass
+            if not _is_probable_snowrunner_save_filename(f, allow_json=False):
+                continue
+            full = os.path.join(root, f)
+            try:
+                mt[os.path.relpath(full, save_dir)] = os.path.getmtime(full)
+            except Exception:
+                pass
     return mt
 
 
@@ -5747,10 +6061,11 @@ def make_backup_if_enabled(path, force_full=False):
             set_app_status("Backup skipped: save path is invalid.", timeout_ms=5000)
             return
 
-        save_dir = os.path.dirname(path)
+        save_dir = os.path.abspath(os.path.dirname(path) or ".")
         timestamp = datetime.now().strftime("backup-%d.%m.%Y %H-%M-%S")
-        backup_dir = os.path.join(save_dir, "backup")
-        os.makedirs(backup_dir, exist_ok=True)
+        backup_dir = _save_backup_dir_for_save_dir(save_dir)
+        if not backup_dir:
+            raise RuntimeError("Could not resolve the backup folder.")
 
         full_mode_selected = bool(force_full)
         if not full_mode_selected:
@@ -5792,6 +6107,68 @@ def make_backup_if_enabled(path, force_full=False):
     except Exception as e:
         print(f"[Backup Error] Failed to create backup: {e}")
         set_app_status(f"Backup failed: {e}", timeout_ms=9000)
+
+
+def _save_dir_from_backup_candidate(path):
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    try:
+        if os.path.isdir(raw):
+            return os.path.abspath(raw)
+        parent = os.path.dirname(raw)
+        if parent and os.path.isdir(parent):
+            return os.path.abspath(parent)
+    except Exception:
+        return ""
+    return ""
+
+
+def _migrate_known_legacy_backup_locations():
+    """Move legacy backups for paths the editor already knows about."""
+    cfg = _load_config_safe()
+
+    save_candidates = [
+        cfg.get("last_save_path", ""),
+        cfg.get("saved_path1", ""),
+        cfg.get("saved_path2", ""),
+        cfg.get("common_ssl_path", ""),
+    ]
+    try:
+        save_candidates.append(load_last_path())
+    except Exception:
+        pass
+
+    seen_save_dirs = set()
+    for candidate in save_candidates:
+        save_dir = _save_dir_from_backup_candidate(candidate)
+        if not save_dir:
+            continue
+        key = os.path.normcase(os.path.normpath(save_dir))
+        if key in seen_save_dirs:
+            continue
+        seen_save_dirs.add(key)
+        try:
+            _save_backup_dir_for_save_dir(save_dir, migrate=True)
+        except Exception as e:
+            print(f"[Backup] Could not migrate save backups for {save_dir}: {e}")
+
+    initial_pak_candidates = [cfg.get("objectives_initial_pak_path", "")]
+    seen_paks = set()
+    for candidate in initial_pak_candidates:
+        pak = str(candidate or "").strip()
+        if not pak:
+            continue
+        try:
+            if not os.path.isfile(pak):
+                continue
+            key = os.path.normcase(os.path.normpath(os.path.abspath(pak)))
+            if key in seen_paks:
+                continue
+            seen_paks.add(key)
+            _initial_pak_backup_parent_dir(pak)
+        except Exception as e:
+            print(f"[Backup] Could not migrate initial.pak backups for {pak}: {e}")
         
 # -----------------------------------------------------------------------------
 # END SECTION: Process Detection + Autosave/Backup Utilities
@@ -6038,7 +6415,7 @@ def prompt_save_version_mismatch_and_choose(path, modal=True):
 
     # --- modal handlers ---
     def _handle_select_modal():
-        new = filedialog.askopenfilename(filetypes=[("SnowRunner Save", "*.cfg *.dat")])
+        new = filedialog.askopenfilename(filetypes=_snowrunner_save_picker_filetypes())
         if new:
             # validate first
             if _validate_and_apply_new_path(new):
@@ -6060,7 +6437,7 @@ def prompt_save_version_mismatch_and_choose(path, modal=True):
     def _handle_select_nonmodal():
         new = filedialog.askopenfilename(
             initialdir=os.path.dirname(path) if os.path.isdir(os.path.dirname(path)) else None,
-            filetypes=[("SnowRunner Save", "*.cfg *.dat")]
+            filetypes=_snowrunner_save_picker_filetypes(),
         )
         if not new:
             return  # user cancelled; leave non-modal dialog open
@@ -7242,6 +7619,16 @@ _UPGRADES_GIVER_UNLOCKS_JSON = """{
   "level_us_12_01": {
     "US_12_01_UPGRADE": 2
   },
+  "level_us_18_02": {
+    "US_18_02_UPG_01": 2,
+    "US_18_02_UPG_03": 2,
+    "US_18_02_UPG_02": 2
+  },
+  "level_us_18_01": {
+    "US_18_01_UPG_02": 2,
+    "US_18_01_UPG_01": 2,
+    "US_18_01_UPG_03": 2
+  },
   "level_us_09_01": {
     "US_09_01_UPG_02": 2,
     "US_09_01_UPG_01": 2
@@ -7452,6 +7839,20 @@ _WATCHPOINTS_UNLOCKS_JSON = """{
     "RU_17_02_WATCHPOINT_02": true,
     "RU_17_02_WATCHPOINT_01": true
   },
+  "level_us_18_02": {
+    "US_18_02_WATCHPOINT_05": true,
+    "US_18_02_WATCHPOINT_04": true,
+    "US_18_02_WATCHPOINT_03": true,
+    "US_18_02_WATCHPOINT_02": true,
+    "US_18_02_WATCHPOINT_01": true
+  },
+  "level_us_18_01": {
+    "US_18_01_WATCHTOWER_04": true,
+    "US_18_01_WATCHTOWER_05": true,
+    "US_18_01_WATCHTOWER_03": true,
+    "US_18_01_WATCHTOWER_02": true,
+    "US_18_01_WATCHTOWER_01": true
+  },
   "level_ru_08_02": {
     "WATCHPOINT_01": true,
     "WATCHPOINT_02": true,
@@ -7645,14 +8046,121 @@ _DISCOVERED_TRUCKS_DEFAULTS_JSON = """{
   "level_us_01_04_new": {"current": 0, "all": 1},
   "level_ru_13_01": {"current": 0, "all": 0},
   "level_us_11_02": {"current": 0, "all": 1},
-  "level_us_09_01": {"current": 0, "all": 1}
+  "level_us_09_01": {"current": 0, "all": 1},
+  "level_us_18_01": {"current": 0, "all": 0},
+  "level_us_18_02": {"current": 0, "all": 0}
 }"""
 DISCOVERED_TRUCKS_DEFAULTS = json.loads(_DISCOVERED_TRUCKS_DEFAULTS_JSON)
+
+# Broad regional truck IDs that may become shop-visible through discovery,
+# recovery, task, or contract progression in a region.
+REGIONAL_TRUCK_SHOP_UNLOCKS_BY_LEVEL = {
+    "level_us_01_01": (
+        "chevrolet_ck1500",
+        "chevrolet_kodiakc70",
+        "gmc_9500",
+        "international_fleetstar_f2070a",
+        "international_scout_800",
+    ),
+    "level_us_01_02": (
+        "chevrolet_ck1500",
+        "international_transtar_4070a",
+        "ws_4964_white",
+    ),
+    "level_us_01_03": ("ws_6900xd_twin",),
+    "level_us_01_04_new": ("pacific_p16",),
+    "level_us_02_01": ("hummer_h2", "royal_bm17"),
+    "level_us_02_02_new": ("cat_745c",),
+    "level_us_02_03_new": ("derry_longhorn_3194",),
+    "level_us_02_04_new": ("ank_mk38",),
+    "level_ru_02_01_crop": ("dan_96320",),
+    "level_ru_02_02": ("tayga_6436", "tuz_166"),
+    "level_ru_02_03": ("step_310e", "tuz_420_tatarin"),
+    "level_ru_02_04": ("tuz_420_tatarin",),
+    "level_ru_03_01": ("ford_f750", "tuz_16_actaeon"),
+    "level_ru_03_02": ("tuz_108_warthog",),
+    "level_us_03_01": ("hummer_h2", "pacific_p512"),
+    "level_us_03_02": ("paystar_5600ts",),
+    "level_ru_04_01": ("khan_317_sentinel",),
+    "level_ru_04_02": ("zikz_605r",),
+    "level_us_04_01": ("cat_770g", "cat_th357", "chevrolet_kodiakc70"),
+    "level_us_04_02": ("cat_th357",),
+    "level_ru_05_01": ("tatra_force_t815_7",),
+    "level_ru_05_02": ("tatra_phoenix",),
+    "level_us_06_01": ("aramatsu_forester",),
+    "level_us_07_01": ("azov_43_191_sprinter", "gor_by4"),
+    "level_ru_08_01": ("chevrolet_ck1500", "tayga_6436", "tuz_166"),
+    "level_ru_08_02": ("don_71", "step_39331_pike"),
+    "level_ru_08_03": ("kirovets_k7m",),
+    "level_us_09_01": (
+        "cat_th357",
+        "derry_special_15c177",
+        "hummer_h2",
+        "international_scout_800",
+    ),
+    "level_us_09_02": (
+        "ank_mk38_ht",
+        "freightliner_114sd",
+        "gmc_9500",
+        "international_fleetstar_f2070a",
+        "zikz_566a",
+    ),
+    "level_us_10_01": ("kenworth_963", "ws_4964_white"),
+    "level_us_10_02": ("mack_defense_m917", "tayga_6436"),
+    "level_us_11_01": ("burlak_6x6",),
+    "level_us_11_02": ("neo_falcon_2000", "voron_ae4380"),
+    "level_us_12_01": ("don_71", "mtb_8106"),
+    "level_us_12_03": ("international_scout_800",),
+    "level_us_12_04": ("femm_37at",),
+    "level_ru_13_01": ("aac_58dw", "plad_450"),
+    "level_us_14_01": ("ankatra_1160", "earthroamer_lti"),
+    "level_us_14_02": ("earthroamer_sx", "futom_7290ra"),
+    "level_us_15_01": ("sleiter_mfk816",),
+    "level_us_15_02": ("mercer_k520",),
+    "level_us_16_01": ("plad_440",),
+    "level_us_16_02": ("hib_billert_1980",),
+    "level_us_16_03": ("sleiter_st833_chimera",),
+    "level_ru_17_01": ("jangsu_rx600",),
+    "level_ru_17_02": ("voron_g5352",),
+    "level_us_18_01": ("hib_billert_m816",),
+    "level_us_18_02": ("mercer_6x6r_230",),
+}
+
+# Narrow shop unlock list for the Discoveries action. This follows the
+# discoveredTrucks counters, not all regional mission/reward trucks.
+DISCOVERY_TRUCK_SHOP_UNLOCKS_BY_LEVEL = {
+    "level_us_01_01": (
+        "chevrolet_ck1500",
+        "chevrolet_kodiakc70",
+        "gmc_9500",
+        "international_fleetstar_f2070a",
+        "international_scout_800",
+    ),
+    "level_us_01_02": ("international_transtar_4070a", "ws_4964_white"),
+    "level_us_01_04_new": ("pacific_p16",),
+    "level_us_02_01": ("royal_bm17",),
+    "level_us_02_04_new": ("ank_mk38",),
+    "level_ru_02_03": ("tuz_420_tatarin",),
+    "level_ru_03_01": ("tuz_16_actaeon",),
+    "level_ru_03_02": ("tuz_108_warthog",),
+    "level_us_03_01": ("pacific_p512",),
+    "level_us_03_02": ("paystar_5600ts",),
+    "level_us_04_01": ("cat_770g",),
+    "level_us_04_02": ("cat_th357",),
+    "level_ru_08_01": ("chevrolet_ck1500", "tayga_6436", "tuz_166"),
+    "level_ru_08_02": ("don_71",),
+    "level_us_09_01": ("cat_th357",),
+    "level_us_09_02": ("ank_mk38_ht", "freightliner_114sd", "gmc_9500"),
+    "level_us_10_01": ("kenworth_963",),
+    "level_us_10_02": ("mack_defense_m917",),
+    "level_us_11_02": ("neo_falcon_2000",),
+    "level_us_12_01": ("mtb_8106",),
+}
 
 # Known regions + visited levels defaults
 KNOWN_REGIONS_DEFAULTS = [
     "us_01","us_02","ru_02","us_14","ru_13","us_12","us_11","us_10","us_09","ru_08",
-    "us_07","us_06","ru_05","ru_04","us_03","us_04","ru_03","ru_17","us_16","us_15"
+    "us_07","us_06","ru_05","ru_04","us_03","us_04","ru_03","ru_17","us_18","us_16","us_15"
 ]
 
 VISITED_LEVELS_DEFAULTS = [
@@ -7668,7 +8176,8 @@ VISITED_LEVELS_DEFAULTS = [
     "level_us_09_01","level_us_09_02","level_us_10_01","level_us_10_02",
     "level_us_11_01","level_us_11_02","level_us_12_01","level_us_12_02",
     "level_us_12_03","level_us_12_04","level_us_14_01","level_us_14_02",
-    "level_us_15_01","level_us_15_02","level_us_16_01","level_us_16_02","level_us_16_03"
+    "level_us_15_01","level_us_15_02","level_us_16_01","level_us_16_02","level_us_16_03",
+    "level_us_18_01","level_us_18_02"
 ]
 
 # Garage status defaults (0=no garage, 1=garage locked, 2=garage unlocked)
@@ -7723,7 +8232,9 @@ LEVEL_GARAGE_STATUSES_DEFAULTS = {
     "level_us_07_01": 2,
     "level_ru_13_01": 2,
     "level_us_12_01": 2,
-    "level_us_09_01": 2
+    "level_us_09_01": 2,
+    "level_us_18_01": 1,
+    "level_us_18_02": 0
 }
 
 REGION_LEVELS = {}
@@ -7751,6 +8262,14 @@ def _ensure_upgrades_defaults(upgrades_data):
                 existing[upgrade_key] = 0
                 added += 1
     return added
+
+def _level_key_matches_regions(map_key, selected_region_codes):
+    map_key_low = str(map_key or "").lower()
+    for code in selected_region_codes or []:
+        code_low = str(code or "").strip().lower()
+        if code_low and f"level_{code_low}" in map_key_low:
+            return True
+    return False
 
 def _ensure_watchpoints_defaults(wp_data):
     added = 0
@@ -7804,6 +8323,114 @@ def _set_current_to_all(entry):
         all_val = 0
     entry["all"] = all_val
     entry["current"] = all_val
+
+def _normalize_truck_shop_unlock_id(raw):
+    tid = str(raw or "").strip().lower().replace("-", "_")
+    tid = re.sub(r"_+", "_", tid).strip("_")
+    if not tid or not re.fullmatch(r"[a-z0-9_./]+", tid):
+        return ""
+    return tid
+
+def _truck_shop_unlock_ids_for_regions(selected_region_codes, unlocks_by_level=None):
+    source = unlocks_by_level if isinstance(unlocks_by_level, dict) else DISCOVERY_TRUCK_SHOP_UNLOCKS_BY_LEVEL
+    out = []
+    seen = set()
+    for level_id, truck_ids in source.items():
+        if not _level_key_matches_regions(level_id, selected_region_codes):
+            continue
+        for raw_id in truck_ids or ():
+            tid = _normalize_truck_shop_unlock_id(raw_id)
+            if tid and tid not in seen:
+                out.append(tid)
+                seen.add(tid)
+    return out
+
+def _ensure_truck_shop_unlocks(pp_data, selected_region_codes, include_mission_trucks=False):
+    if not isinstance(pp_data, dict):
+        return {
+            "discovery_added": 0,
+            "discovery_candidates": 0,
+            "mission_added": 0,
+            "mission_candidates": 0,
+        }
+
+    unlocked = pp_data.get("unlockedItemNames")
+    if not isinstance(unlocked, dict):
+        unlocked = {}
+        pp_data["unlockedItemNames"] = unlocked
+
+    discovery_ids = _truck_shop_unlock_ids_for_regions(selected_region_codes, DISCOVERY_TRUCK_SHOP_UNLOCKS_BY_LEVEL)
+    discovery_id_set = set(discovery_ids)
+    discovery_added = 0
+    for truck_id in discovery_ids:
+        if truck_id not in unlocked:
+            unlocked[truck_id] = False
+            discovery_added += 1
+
+    mission_ids = []
+    mission_added = 0
+    if include_mission_trucks:
+        regional_ids = _truck_shop_unlock_ids_for_regions(selected_region_codes, REGIONAL_TRUCK_SHOP_UNLOCKS_BY_LEVEL)
+        mission_ids = [truck_id for truck_id in regional_ids if truck_id not in discovery_id_set]
+        for truck_id in mission_ids:
+            if truck_id not in unlocked:
+                unlocked[truck_id] = False
+                mission_added += 1
+
+    return {
+        "discovery_added": discovery_added,
+        "discovery_candidates": len(discovery_ids),
+        "mission_added": mission_added,
+        "mission_candidates": len(mission_ids),
+    }
+
+def _sum_discovered_trucks_current(dt_data):
+    total = 0
+    if not isinstance(dt_data, dict):
+        return total
+    for entry in dt_data.values():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            current = entry.get("current", 0)
+            if isinstance(current, bool):
+                current = int(current)
+            elif not isinstance(current, (int, float)):
+                current = int(str(current).strip())
+            total += max(0, int(current))
+        except Exception:
+            continue
+    return total
+
+def _ensure_discovered_upgrades_defaults(du_data, selected_region_codes=None):
+    added = 0
+    if not isinstance(du_data, dict):
+        du_data = {}
+    for map_key, upgrades in UPGRADES_GIVER_UNLOCKS.items():
+        map_key_text = str(map_key or "").strip()
+        if not map_key_text.lower().startswith("level_"):
+            continue
+        if selected_region_codes is not None and not _level_key_matches_regions(map_key_text, selected_region_codes):
+            continue
+        all_count = len(upgrades) if isinstance(upgrades, dict) else 0
+        if all_count <= 0:
+            continue
+        existing = du_data.get(map_key_text)
+        if not isinstance(existing, dict):
+            du_data[map_key_text] = {"current": 0, "all": all_count}
+            added += 1
+            continue
+        if "current" not in existing:
+            existing["current"] = 0
+            added += 1
+        try:
+            existing_all = int(existing.get("all", 0))
+        except Exception:
+            existing_all = 0
+        if "all" not in existing or existing_all < all_count:
+            existing["all"] = all_count
+            added += 1
+    return added, du_data
 
 def _ensure_level_garage_statuses_defaults(lg_data):
     added = 0
@@ -8021,37 +8648,31 @@ def unlock_garages(save_path, selected_regions, upgrade_all=False, notify=True, 
     except Exception as e:
         return _action_error(str(e), notify=notify)
 
-def unlock_discoveries(save_path, selected_regions, notify=True, make_backup=True):
+def unlock_discoveries(save_path, selected_regions, notify=True, make_backup=True, include_mission_trucks=False):
     if make_backup:
         make_backup_if_enabled(save_path)
     try:
         with open(save_path, "r", encoding="utf-8") as f:
             content = f.read()
 
-        # Only modify discoveredTrucks under persistentProfileData
         pp_match = re.search(r'"persistentProfileData"\s*:\s*{', content)
         if not pp_match:
             return _action_error("persistentProfileData not found in save file.", notify=notify)
 
         pp_block, pp_start, pp_end = extract_brace_block(content, pp_match.end() - 1)
+        try:
+            pp_data = json.loads(pp_block)
+        except Exception as e:
+            return _action_error(f"Failed to parse persistentProfileData:\n{e}", notify=notify)
 
-        dt_match = re.search(r'"discoveredTrucks"\s*:\s*{', pp_block)
-        if dt_match:
-            dt_block, dt_start, dt_end = extract_brace_block(pp_block, dt_match.end() - 1)
-            try:
-                dt_data = json.loads(dt_block)
-            except Exception:
-                dt_data = {}
-        else:
-            dt_data = {}
-            dt_start = dt_end = None
-
+        dt_data = pp_data.get("discoveredTrucks", {})
         added, dt_data = _ensure_discovered_trucks_defaults(dt_data)
         updated = 0
 
         if not isinstance(dt_data, dict):
             dt_data = {}
 
+        truck_delta = 0
         for map_key, entry in dt_data.items():
             if not isinstance(entry, dict):
                 entry = {"current": 0, "all": 0}
@@ -8059,25 +8680,62 @@ def unlock_discoveries(save_path, selected_regions, notify=True, make_backup=Tru
             map_key_low = map_key.lower()
             for code in selected_regions:
                 if code.lower() in map_key_low:
+                    before_current = entry.get("current")
+                    before_count = _parse_nonnegative_int(before_current, 0)
                     _set_current_to_all(entry)
-                    updated += 1
+                    if entry.get("current") != before_current:
+                        updated += 1
+                        after_count = _parse_nonnegative_int(entry.get("current"), 0)
+                        if after_count > before_count:
+                            truck_delta += after_count - before_count
                     break
 
-        new_block = json.dumps(dt_data, separators=(",", ":"))
-        if dt_start is not None and dt_end is not None:
-            pp_block = pp_block[:dt_start] + new_block + pp_block[dt_end:]
-        else:
-            # Insert discoveredTrucks inside persistentProfileData
-            pp_block = _set_key_in_text(pp_block, "discoveredTrucks", new_block)
+        pp_data["discoveredTrucks"] = dt_data
+        shop_result = _ensure_truck_shop_unlocks(
+            pp_data,
+            selected_regions,
+            include_mission_trucks=bool(include_mission_trucks),
+        )
 
+        pp_block = json.dumps(pp_data, separators=(",", ":"))
         content = content[:pp_start] + pp_block + content[pp_end:]
+
+        total_current = _sum_discovered_trucks_current(dt_data)
+        if re.search(r'"trucksDiscovered"\s*:', content):
+            content = _set_key_in_text(content, "trucksDiscovered", json.dumps(total_current))
 
         with open(save_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        msg = f"Updated {updated} discovery entries."
+        msg = f"Updated {updated} discovery map entries ({truck_delta} truck discoveries)."
         if added:
             msg += f" Added {added} missing entries."
+        discovery_added = int(shop_result.get("discovery_added", 0) or 0)
+        discovery_candidates = int(shop_result.get("discovery_candidates", 0) or 0)
+        mission_added = int(shop_result.get("mission_added", 0) or 0)
+        mission_candidates = int(shop_result.get("mission_candidates", 0) or 0)
+        if discovery_candidates:
+            discovery_existing = max(0, discovery_candidates - discovery_added)
+            msg += (
+                f" Added {discovery_added} discovery shop unlocks "
+                f"({discovery_existing} already present, {discovery_candidates} matching unique trucks)."
+            )
+        else:
+            msg += " No matching discovery shop unlocks found."
+        if include_mission_trucks:
+            if mission_candidates:
+                mission_existing = max(0, mission_candidates - mission_added)
+                msg += (
+                    f" Added {mission_added} mission/reward shop unlocks "
+                    f"({mission_existing} already present, {mission_candidates} optional unique trucks)."
+                )
+            else:
+                msg += " No matching mission/reward shop unlocks found."
+        else:
+            skipped = len(_truck_shop_unlock_ids_for_regions(selected_regions, REGIONAL_TRUCK_SHOP_UNLOCKS_BY_LEVEL))
+            skipped = max(0, skipped - discovery_candidates)
+            if skipped:
+                msg += f" Skipped {skipped} mission/reward shop unlocks."
         return _action_result("Success", msg, notify=notify)
     except Exception as e:
         return _action_error(str(e), notify=notify)
@@ -8389,17 +9047,43 @@ def _read_finished_missions(save_path: str) -> Set[str]:
 # SECTION: Objectives+ Source Helpers
 # Used In: current Objectives+ source loading and shared text/network helpers
 # =============================================================================
-# Objectives+ now always tries local initial.pak first and automatically falls back
-# when local data is unavailable, so the old safe-fallback toggle is disabled.
+# Objectives+ normally tries local initial.pak first and falls back automatically
+# when local data is unavailable. Users can also force the fallback package.
 _OBJECTIVES_SAFE_FALLBACK_MODE = False
 _OBJECTIVES_SAFE_FALLBACK_MODE_LOCK = threading.Lock()
-_OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
+_OBJECTIVES_SAFE_FALLBACK_MODE_SET = False
 
 def _set_objectives_safe_fallback_mode(enabled: bool) -> None:
-    return
+    global _OBJECTIVES_SAFE_FALLBACK_MODE
+    global _OBJECTIVES_SAFE_FALLBACK_MODE_SET
+    try:
+        with _OBJECTIVES_SAFE_FALLBACK_MODE_LOCK:
+            _OBJECTIVES_SAFE_FALLBACK_MODE = bool(enabled)
+            _OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
+    except Exception:
+        _OBJECTIVES_SAFE_FALLBACK_MODE = bool(enabled)
+        _OBJECTIVES_SAFE_FALLBACK_MODE_SET = True
 
 def _get_objectives_safe_fallback_mode() -> bool:
-    return False
+    global _OBJECTIVES_SAFE_FALLBACK_MODE_SET
+    try:
+        with _OBJECTIVES_SAFE_FALLBACK_MODE_LOCK:
+            already_set = bool(_OBJECTIVES_SAFE_FALLBACK_MODE_SET)
+            current = bool(_OBJECTIVES_SAFE_FALLBACK_MODE)
+    except Exception:
+        already_set = bool(_OBJECTIVES_SAFE_FALLBACK_MODE_SET)
+        current = bool(_OBJECTIVES_SAFE_FALLBACK_MODE)
+
+    if already_set:
+        return current
+
+    try:
+        cfg = _load_config_safe()
+    except Exception:
+        cfg = {}
+    enabled = bool((cfg or {}).get("objectives_use_safe_fallback", False))
+    _set_objectives_safe_fallback_mode(enabled)
+    return enabled
 
 def _set_objectives_source_info(**updates):
     try:
@@ -8960,6 +9644,3166 @@ def _objectives_local_probe() -> Dict[str, Any]:
         "available_languages": langs,
         "language": preferred or _OBJECTIVES_LOCAL_DEFAULT_LANGUAGE,
     }
+
+
+# =============================================================================
+# SECTION: initial.pak Mods Helpers
+# Used In: Mods tab (initial.pak editing + backup/restore)
+# =============================================================================
+_INITIAL_PAK_BACKUP_PREFIX = "initial_pak__backup-"
+_INITIAL_PAK_WINCH_DIR_SEGMENT = "classes/winches/"
+_INITIAL_PAK_ENGINE_EXTENDED_TAG_NAMES = (
+    "Engine",
+    "USTruckOldEngine",
+    "USTruckOldHeavyEngine",
+    "RUTruckOldEngine",
+    "RUTruckOldHeavyEngine",
+    "USTruckMilitaryNavistarEngine",
+)
+_INITIAL_PAK_WHEEL_TEMPLATE_MASS_TAG_NAMES = (
+    "TruckWheels",
+    "TruckWheel",
+    "TruckTire",
+    "Offroad",
+    "Mudtires",
+    "Allterrain",
+    "Highway",
+    "Iron",
+    "Superheavy",
+    "Medium",
+    "Light",
+    "Heavy",
+)
+_INITIAL_PAK_WHEEL_SOFTNESS_TAG_NAMES = (
+    "WheelSoftness",
+    "Stiff",
+    "Soft",
+    "ScoutStiff",
+    "ScoutSoft",
+    "ScoutDefault",
+    "Average",
+)
+_INITIAL_PAK_CRANE_FILE_TERMS = ("crane", "loglift", "manipulator")
+_INITIAL_PAK_DIRECT_TRUCK_ENTRY_RE = re.compile(r'(^|/)classes/trucks/[^/]+\.xml$', flags=re.IGNORECASE)
+_INITIAL_PAK_SOFT_SUSPENSION_MIN_SPRING = 50000.0
+_INITIAL_PAK_NUMERIC_MODULE_SPECS = {
+    "winch_length": {
+        "path_segment": "classes/winches/",
+        "tag_name": "Winch",
+        "attr_name": "Length",
+    },
+    "winch_strength": {
+        "path_segment": "classes/winches/",
+        "tag_name": "Winch",
+        "attr_name": "StrengthMult",
+    },
+    "engine_torque": {
+        "path_segment": "classes/engines/",
+        "tag_name": "Engine",
+        "attr_name": "Torque",
+    },
+    "engine_fuel_consumption": {
+        "path_segment": "classes/engines/",
+        "tag_name": "Engine",
+        "attr_name": "FuelConsumption",
+    },
+    "engine_damage_capacity": {
+        "path_segment": "classes/engines/",
+        "tag_names": _INITIAL_PAK_ENGINE_EXTENDED_TAG_NAMES,
+        "attr_name": "DamageCapacity",
+    },
+    "engine_responsiveness": {
+        "path_segment": "classes/engines/",
+        "tag_names": _INITIAL_PAK_ENGINE_EXTENDED_TAG_NAMES,
+        "attr_name": "EngineResponsiveness",
+    },
+    "gearbox_fuel_consumption": {
+        "path_segment": "classes/gearboxes/",
+        "tag_name": "Gearbox",
+        "attr_name": "FuelConsumption",
+    },
+    "gearbox_idle_fuel_modifier": {
+        "path_segment": "classes/gearboxes/",
+        "tag_name": "Gearbox",
+        "attr_name": "IdleFuelModifier",
+    },
+    "gearbox_awd_fuel_penalty": {
+        "path_segment": "classes/gearboxes/",
+        "tag_name": "Gearbox",
+        "attr_name": "AWDConsumptionModifier",
+    },
+    "wheel_radius": {
+        "path_segment": "classes/wheels/",
+        "tag_names": ("TruckWheels", "TruckWheel", "TruckTire"),
+        "attr_name": "Radius",
+    },
+    "wheel_width": {
+        "path_segment": "classes/wheels/",
+        "tag_names": ("TruckWheels", "TruckWheel", "TruckTire"),
+        "attr_name": "Width",
+    },
+    "suspension_height": {
+        "path_segment": "classes/suspensions/",
+        "tag_name": "Suspension",
+        "attr_name": "Height",
+    },
+    "suspension_damage_capacity": {
+        "path_segment": "classes/suspensions/",
+        "tag_name": "SuspensionSet",
+        "attr_name": "DamageCapacity",
+    },
+    "tire_asphalt_grip": {
+        "path_segment": "classes/wheels/",
+        "tag_names": ("WheelFriction", "TruckTire"),
+        "attr_name": "BodyFrictionAsphalt",
+    },
+    "tire_offroad_grip": {
+        "path_segment": "classes/wheels/",
+        "tag_name": "WheelFriction",
+        "attr_name": "BodyFriction",
+    },
+    "tire_mud_grip": {
+        "path_segment": "classes/wheels/",
+        "tag_name": "WheelFriction",
+        "attr_name": "SubstanceFriction",
+    },
+    "truck_fuel_capacity": {
+        "path_segment": "classes/trucks/",
+        "tag_name": "TruckData",
+        "attr_name": "FuelCapacity",
+    },
+    "truck_store_price": {
+        "direct_trucks": True,
+        "tag_name": "GameData",
+        "attr_name": "Price",
+    },
+    "truck_unlock_rank": {
+        "direct_trucks": True,
+        "tag_name": "GameData",
+        "attr_name": "UnlockByRank",
+    },
+    "truck_body_durability": {
+        "path_segment": "classes/trucks/",
+        "tag_name": "FuelTank",
+        "attr_name": "DamageCapacity",
+    },
+    "addon_store_price": {
+        "path_segments": ("classes/trucks/addons/", "classes/trucks/trailers/"),
+        "tag_name": "GameData",
+        "attr_name": "Price",
+    },
+    "service_fuel_capacity": {
+        "path_segments": ("classes/trucks/addons/", "classes/trucks/trailers/"),
+        "tag_name": "TruckData",
+        "attr_name": "FuelCapacity",
+    },
+    "service_repairs_capacity": {
+        "path_segments": ("classes/trucks/addons/", "classes/trucks/trailers/"),
+        "tag_name": "TruckData",
+        "attr_name": "RepairsCapacity",
+    },
+    "service_wheel_repairs_capacity": {
+        "path_segments": ("classes/trucks/addons/", "classes/trucks/trailers/"),
+        "tag_name": "TruckData",
+        "attr_name": "WheelRepairsCapacity",
+    },
+    "water_capacity": {
+        "path_segments": ("classes/trucks/addons/", "classes/trucks/trailers/"),
+        "tag_name": "TruckData",
+        "attr_name": "WaterCapacity",
+    },
+    "truck_camera_max_zoom": {
+        "direct_trucks": True,
+        "tag_name": "CameraPos",
+        "attr_name": "MaxZoom",
+    },
+    "truck_camera_fov": {
+        "direct_trucks": True,
+        "tag_name": "CameraPos",
+        "attr_name": "FOV",
+    },
+    "truck_render_distance": {
+        "direct_trucks": True,
+        "tag_name": "TruckData",
+        "attr_name": "HideDistance",
+    },
+    "truck_shadow_distance": {
+        "direct_trucks": True,
+        "tag_name": "TruckData",
+        "attr_name": "ShadowHideDistance",
+    },
+    "tire_template_mass": {
+        "path_segments": ("classes/wheels/", "_templates/trucks.xml"),
+        "tag_names": _INITIAL_PAK_WHEEL_TEMPLATE_MASS_TAG_NAMES,
+        "attr_name": "Mass",
+    },
+    "wheel_softness": {
+        "path_segments": ("classes/wheels/", "_templates/trucks.xml"),
+        "tag_names": _INITIAL_PAK_WHEEL_SOFTNESS_TAG_NAMES,
+        "attr_name": "SoftForceScale",
+    },
+    "cargo_load_mass": {
+        "path_segment": "classes/trucks/cargo/",
+        "tag_name": "Body",
+        "attr_name": "Mass",
+    },
+    "truck_steering_responsiveness": {
+        "path_segment": "classes/trucks/",
+        "tag_name": "TruckData",
+        "attr_name": "Responsiveness",
+    },
+    "crane_motor_strength": {
+        "path_segment": "classes/trucks/addons/",
+        "tag_name": "Motor",
+        "attr_name": "Force",
+        "entry_name_terms": _INITIAL_PAK_CRANE_FILE_TERMS,
+    },
+    "crane_mass": {
+        "path_segment": "classes/trucks/addons/",
+        "tag_name": "Body",
+        "attr_name": "Mass",
+        "entry_name_terms": _INITIAL_PAK_CRANE_FILE_TERMS,
+    },
+    "grass_draw_distance": {
+        "path_segment": "classes/grass/",
+        "tag_name": "GrassBrand",
+        "attr_name": "FadeDistances",
+        "value_kind": "csv_numbers",
+    },
+    "tire_sink_deflation": {
+        "path_segments": ("classes/wheels/", "_templates/trucks.xml"),
+        "tag_names": _INITIAL_PAK_WHEEL_SOFTNESS_TAG_NAMES,
+        "attr_name": "RadiusOffset",
+    },
+}
+_INITIAL_PAK_WINCH_NUMERIC_MODULE_IDS = {
+    "Length": "winch_length",
+    "StrengthMult": "winch_strength",
+}
+_INITIAL_PAK_WINCH_TAG_RE = re.compile(
+    r'(?P<before><Winch\b[^>]*\bName="(?P<name>[^"]+)"[^>]*\bIsEngineIgnitionRequired=")'
+    r'(?P<flag>true|false)'
+    r'(?P<after>")',
+    flags=re.IGNORECASE,
+)
+_INITIAL_PAK_WINCH_NUMERIC_TAG_PATTERNS = {
+    "Length": re.compile(
+        r'(?P<before><Winch\b[^>]*\bName="(?P<name>[^"]+)"[^>]*\bLength=")'
+        r'(?P<value>[^"]+)'
+        r'(?P<after>")',
+        flags=re.IGNORECASE,
+    ),
+    "StrengthMult": re.compile(
+        r'(?P<before><Winch\b[^>]*\bName="(?P<name>[^"]+)"[^>]*\bStrengthMult=")'
+        r'(?P<value>[^"]+)'
+        r'(?P<after>")',
+        flags=re.IGNORECASE,
+    ),
+}
+_INITIAL_PAK_GAMEDATA_BLOCK_RE = re.compile(
+    r'(?P<open><GameData\b[^>]*>)(?P<body>.*?)(?P<close>[ \t]*</GameData>)',
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_INITIAL_PAK_LOAD_POINT_TAG_RE = re.compile(
+    r'(?P<indent>[ \t]*)<LoadPoint\b[^>]*\bPos="(?P<pos>[^"]+)"[^>]*/?>',
+    flags=re.IGNORECASE,
+)
+_INITIAL_PAK_CRANE_SOCKET_TAG_RE = re.compile(
+    r'(?P<indent>[ \t]*)<CraneSocket\b[^>]*\bPos="(?P<pos>[^"]+)"[^>]*/?>',
+    flags=re.IGNORECASE,
+)
+_INITIAL_PAK_WINCH_SOCKET_TAG_RE = re.compile(
+    r'(?P<indent>[ \t]*)<WinchSocket\b[^>]*\bPos="(?P<pos>[^"]+)"[^>]*/?>',
+    flags=re.IGNORECASE,
+)
+_INITIAL_PAK_PRIMARY_MODEL_TAG_RE = re.compile(
+    r'<(?P<tag>[A-Za-z_][\w:.-]*)\b(?P<attrs>[^>]*)>',
+    flags=re.IGNORECASE,
+)
+_INITIAL_PAK_CLIP_CAMERA_ATTR_RE = re.compile(
+    r'(?P<before>\bClipCamera\s*=\s*")(?P<value>[^"]*)(?P<after>")',
+    flags=re.IGNORECASE,
+)
+_INITIAL_PAK_REMOVE_ATTR = object()
+_INITIAL_PAK_ALL_STORE_COUNTRIES = "US,RU,NE,CE,CAS,WA"
+_INITIAL_PAK_ALL_STORE_COUNTRY_CODES = tuple(_INITIAL_PAK_ALL_STORE_COUNTRIES.split(","))
+_INITIAL_PAK_BOOLEAN_ATTR_MODULE_SPECS = {
+    "all_tires_ignore_ice": {
+        "path_segments": ("classes/wheels/", "_templates/trucks.xml"),
+        "tag_name": "WheelFriction",
+        "attr_name": "IsIgnoreIce",
+    },
+}
+
+
+def _initial_pak_source_label(source_kind: Any) -> str:
+    source = str(source_kind or "").strip().lower()
+    return {
+        "config": "Saved path",
+        "env": "Environment",
+        "steam": "Auto-detected",
+        "manifest": "Auto-detected",
+        "scan": "Auto-detected",
+    }.get(source, source.capitalize() if source else "Detected")
+
+
+def _initial_pak_resolve_path(path: Any = None) -> str:
+    raw = str(path or "").strip()
+    if raw:
+        try:
+            return os.path.abspath(os.path.expanduser(raw))
+        except Exception:
+            return raw
+    detected = _objectives_detect_initial_pak()
+    return str(detected.get("path", "") or "").strip()
+
+
+def _initial_pak_probe() -> Dict[str, Any]:
+    detected = _objectives_detect_initial_pak()
+    pak_path = str(detected.get("path", "") or "").strip()
+    backup_info = _initial_pak_get_backup_info(pak_path) if pak_path else {}
+    return {
+        "path": pak_path,
+        "source": str(detected.get("source", "") or "").strip(),
+        "backup": backup_info if isinstance(backup_info, dict) else {},
+    }
+
+
+def _initial_pak_decode_text(raw_bytes: bytes) -> Tuple[str, str]:
+    payload = raw_bytes if isinstance(raw_bytes, (bytes, bytearray)) else bytes(raw_bytes or b"")
+    if payload.startswith(codecs.BOM_UTF8):
+        try:
+            return payload.decode("utf-8-sig"), "utf-8-sig"
+        except Exception:
+            pass
+    for encoding in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return payload.decode(encoding), encoding
+        except Exception:
+            pass
+    return payload.decode("latin-1", errors="replace"), "latin-1"
+
+
+def _initial_pak_encode_text(text: str, encoding: str) -> bytes:
+    codec = str(encoding or "utf-8")
+    try:
+        return str(text or "").encode(codec)
+    except Exception:
+        return str(text or "").encode("utf-8")
+
+
+def _initial_pak_list_entry_names_for_segment(zip_handle, segment: str) -> List[str]:
+    target = str(segment or "").strip().replace("\\", "/").lower()
+    names = []
+    for info in zip_handle.infolist():
+        filename = str(getattr(info, "filename", "") or "")
+        lower = filename.replace("\\", "/").lower()
+        if target not in lower:
+            continue
+        if not lower.endswith(".xml"):
+            continue
+        names.append(filename)
+    names.sort(key=lambda item: item.lower())
+    return names
+
+
+def _initial_pak_list_direct_truck_entry_names(zip_handle) -> List[str]:
+    names = []
+    for info in zip_handle.infolist():
+        filename = str(getattr(info, "filename", "") or "")
+        lower = filename.replace("\\", "/").lower()
+        if not _INITIAL_PAK_DIRECT_TRUCK_ENTRY_RE.search(lower):
+            continue
+        names.append(filename)
+    names.sort(key=lambda item: item.lower())
+    return names
+
+
+def _initial_pak_list_entry_names_for_spec(zip_handle, spec: Dict[str, Any]) -> List[str]:
+    if bool(spec.get("direct_trucks")):
+        direct_names = _initial_pak_list_direct_truck_entry_names(zip_handle)
+        raw_terms = spec.get("entry_name_terms")
+        if isinstance(raw_terms, (list, tuple, set)):
+            terms = [str(item or "").strip().lower() for item in raw_terms if str(item or "").strip()]
+        else:
+            single_term = str(raw_terms or "").strip().lower()
+            terms = [single_term] if single_term else []
+        if not terms:
+            return direct_names
+        return [
+            filename
+            for filename in direct_names
+            if any(term in filename.replace("\\", "/").lower() for term in terms)
+        ]
+
+    raw_segments = spec.get("path_segments")
+    if isinstance(raw_segments, (list, tuple, set)):
+        segments = [str(item or "").strip() for item in raw_segments if str(item or "").strip()]
+    else:
+        single_segment = str(spec.get("path_segment") or "").strip()
+        segments = [single_segment] if single_segment else []
+
+    raw_terms = spec.get("entry_name_terms")
+    if isinstance(raw_terms, (list, tuple, set)):
+        terms = [str(item or "").strip().lower() for item in raw_terms if str(item or "").strip()]
+    else:
+        single_term = str(raw_terms or "").strip().lower()
+        terms = [single_term] if single_term else []
+
+    collected = []
+    seen = set()
+    for segment in segments:
+        for filename in _initial_pak_list_entry_names_for_segment(zip_handle, segment):
+            lower = filename.replace("\\", "/").lower()
+            if terms and not any(term in lower for term in terms):
+                continue
+            if lower in seen:
+                continue
+            seen.add(lower)
+            collected.append(filename)
+    collected.sort(key=lambda item: item.lower())
+    return collected
+
+
+def _initial_pak_target_entry_names(zip_handle) -> List[str]:
+    return _initial_pak_list_entry_names_for_segment(zip_handle, _INITIAL_PAK_WINCH_DIR_SEGMENT)
+
+
+def _initial_pak_extract_winch_flags(text: str) -> List[Dict[str, Any]]:
+    found = []
+    for match in _INITIAL_PAK_WINCH_TAG_RE.finditer(str(text or "")):
+        flag_raw = str(match.group("flag") or "").strip().lower()
+        found.append(
+            {
+                "name": str(match.group("name") or "").strip(),
+                "flag": flag_raw,
+                "is_engine_required": (flag_raw == "true"),
+            }
+        )
+    return found
+
+
+def _initial_pak_build_winch_flag_map(text: str) -> Dict[str, str]:
+    mapping = {}
+    for item in _initial_pak_extract_winch_flags(text):
+        key = str(item.get("name") or "").strip().casefold()
+        if key:
+            mapping[key] = "true" if bool(item.get("is_engine_required")) else "false"
+    return mapping
+
+
+def _initial_pak_get_winch_numeric_pattern(attr_name: str):
+    key = str(attr_name or "").strip()
+    pattern = _INITIAL_PAK_WINCH_NUMERIC_TAG_PATTERNS.get(key)
+    if pattern is None:
+        raise ValueError(f"Unsupported winch numeric attribute: {attr_name}")
+    return pattern
+
+
+def _initial_pak_extract_winch_numeric_values(text: str, attr_name: str) -> List[Dict[str, Any]]:
+    found = []
+    pattern = _initial_pak_get_winch_numeric_pattern(attr_name)
+    for match in pattern.finditer(str(text or "")):
+        raw_value = str(match.group("value") or "").strip()
+        try:
+            numeric_value = float(raw_value)
+        except Exception:
+            numeric_value = None
+        found.append(
+            {
+                "name": str(match.group("name") or "").strip(),
+                "raw": raw_value,
+                "value": numeric_value,
+            }
+        )
+    return found
+
+
+def _initial_pak_build_winch_numeric_map(text: str, attr_name: str) -> Dict[str, Dict[str, Any]]:
+    mapping = {}
+    for item in _initial_pak_extract_winch_numeric_values(text, attr_name):
+        key = str(item.get("name") or "").strip().casefold()
+        if key:
+            mapping[key] = dict(item)
+    return mapping
+
+
+def _initial_pak_format_scaled_numeric(default_raw: Any, scaled_value: float, attr_name: str) -> str:
+    raw_text = str(default_raw or "").strip()
+    numeric = float(scaled_value)
+    if not math.isfinite(numeric):
+        raise ValueError(f"Scaled value for {attr_name} is not finite.")
+    if abs(numeric - round(numeric)) < 1e-9:
+        int_text = str(int(round(numeric)))
+        if ("." in raw_text) or (str(attr_name or "").strip() == "StrengthMult"):
+            return int_text + ".0"
+        return int_text
+    text = f"{numeric:.6f}".rstrip("0").rstrip(".")
+    if (not text) or text in {"-0", "+0"}:
+        text = "0"
+    if ("." not in text) and (("." in raw_text) or (str(attr_name or "").strip() == "StrengthMult")):
+        text += ".0"
+    return text
+
+
+def _initial_pak_analyze_winches(pak_path: str) -> Dict[str, Any]:
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        return {
+            "path": pak,
+            "entry_count": 0,
+            "file_count": 0,
+            "winch_count": 0,
+            "engine_required_count": 0,
+            "autonomous_count": 0,
+            "mode": "missing",
+            "entries": [],
+        }
+
+    entries = []
+    try:
+        with zipfile.ZipFile(pak, "r") as zf:
+            for name in _initial_pak_target_entry_names(zf):
+                raw_bytes = zf.read(name)
+                text, _encoding = _initial_pak_decode_text(raw_bytes)
+                matches = _initial_pak_extract_winch_flags(text)
+                if not matches:
+                    continue
+                entries.append(
+                    {
+                        "entry_name": name,
+                        "match_count": len(matches),
+                        "engine_required_count": sum(1 for item in matches if item.get("is_engine_required")),
+                        "autonomous_count": sum(1 for item in matches if not item.get("is_engine_required")),
+                    }
+                )
+    except Exception as e:
+        return {
+            "path": pak,
+            "entry_count": 0,
+            "file_count": 0,
+            "winch_count": 0,
+            "engine_required_count": 0,
+            "autonomous_count": 0,
+            "mode": "error",
+            "error": str(e),
+            "entries": [],
+        }
+
+    entry_count = len(entries)
+    engine_required_count = sum(int(item.get("engine_required_count") or 0) for item in entries)
+    autonomous_count = sum(int(item.get("autonomous_count") or 0) for item in entries)
+    winch_count = int(engine_required_count + autonomous_count)
+
+    if winch_count <= 0:
+        mode = "empty"
+    elif engine_required_count == winch_count:
+        mode = "engine"
+    elif autonomous_count == winch_count:
+        mode = "autonomous"
+    else:
+        mode = "mixed"
+
+    return {
+        "path": pak,
+        "entry_count": entry_count,
+        "file_count": entry_count,
+        "winch_count": winch_count,
+        "engine_required_count": engine_required_count,
+        "autonomous_count": autonomous_count,
+        "mode": mode,
+        "entries": entries,
+    }
+
+
+def _initial_pak_raw_local_entry_size(info) -> int:
+    if int(getattr(info, "flag_bits", 0) or 0) != 0:
+        raise ValueError("ZIP entries with flag_bits are not supported for raw-copy updates.")
+    filename_bytes, _flag_bits = info._encodeFilenameFlags()
+    return int(zipfile.sizeFileHeader + len(filename_bytes) + len(info.extra or b"") + int(info.compress_size or 0))
+
+
+def _initial_pak_copy_raw_local_entry(src_handle, dst_handle, info, chunk_size=1024 * 1024) -> int:
+    total = _initial_pak_raw_local_entry_size(info)
+    src_handle.seek(int(info.header_offset or 0))
+    remaining = total
+    copied = 0
+    while remaining > 0:
+        chunk = src_handle.read(min(chunk_size, remaining))
+        if not chunk:
+            raise EOFError(f"Unexpected EOF while copying raw ZIP entry '{info.filename}'.")
+        dst_handle.write(chunk)
+        copied += len(chunk)
+        remaining -= len(chunk)
+    return copied
+
+
+def _initial_pak_compress_entry_payload(data: bytes, compress_type: int) -> bytes:
+    payload = data if isinstance(data, (bytes, bytearray)) else bytes(data or b"")
+    method = int(compress_type or 0)
+    if method == zipfile.ZIP_STORED:
+        return bytes(payload)
+    if method == zipfile.ZIP_DEFLATED:
+        compressor = zipfile._get_compressor(method)
+        if compressor is None:
+            raise RuntimeError("Could not create ZIP_DEFLATED compressor.")
+        return compressor.compress(payload) + compressor.flush()
+    raise NotImplementedError(f"Unsupported ZIP compression method: {compress_type}")
+
+
+def _initial_pak_write_central_directory(dst_handle, infos, archive_comment=b"") -> None:
+    comment = archive_comment if isinstance(archive_comment, (bytes, bytearray)) else bytes(archive_comment or b"")
+    start_dir = dst_handle.tell()
+    for zinfo in infos:
+        dt = zinfo.date_time
+        dosdate = (dt[0] - 1980) << 9 | dt[1] << 5 | dt[2]
+        dostime = dt[3] << 11 | dt[4] << 5 | (dt[5] // 2)
+        filename, flag_bits = zinfo._encodeFilenameFlags()
+        extra_data = zinfo.extra or b""
+        entry_comment = zinfo.comment or b""
+        centdir = struct.pack(
+            zipfile.structCentralDir,
+            zipfile.stringCentralDir,
+            int(zinfo.create_version or 20),
+            int(zinfo.create_system or 0),
+            int(zinfo.extract_version or 20),
+            int(zinfo.reserved or 0),
+            int(flag_bits or 0),
+            int(zinfo.compress_type or 0),
+            int(dostime),
+            int(dosdate),
+            int(zinfo.CRC or 0),
+            int(zinfo.compress_size or 0),
+            int(zinfo.file_size or 0),
+            len(filename),
+            len(extra_data),
+            len(entry_comment),
+            0,
+            int(zinfo.internal_attr or 0),
+            int(zinfo.external_attr or 0),
+            int(zinfo.header_offset or 0),
+        )
+        dst_handle.write(centdir)
+        dst_handle.write(filename)
+        dst_handle.write(extra_data)
+        dst_handle.write(entry_comment)
+
+    end_dir = dst_handle.tell()
+    count = len(infos)
+    size = end_dir - start_dir
+    endrec = struct.pack(
+        zipfile.structEndArchive,
+        zipfile.stringEndArchive,
+        0,
+        0,
+        count,
+        count,
+        size,
+        start_dir,
+        len(comment),
+    )
+    dst_handle.write(endrec)
+    dst_handle.write(comment)
+    dst_handle.flush()
+
+
+def _initial_pak_clone_zip_info_preserve_raw_name(info):
+    clone = copy.copy(info)
+    raw_name = str(getattr(info, "orig_filename", "") or getattr(info, "filename", "") or "")
+    if raw_name:
+        clone.filename = raw_name
+        try:
+            clone.orig_filename = raw_name
+        except Exception:
+            pass
+    return clone
+
+
+def _initial_pak_replace_zip_entries(zip_path: str, replacements: Dict[str, bytes]) -> Dict[str, Any]:
+    target = _initial_pak_resolve_path(zip_path)
+    if not target or not os.path.isfile(target):
+        raise FileNotFoundError("initial.pak was not found.")
+    updates = {
+        str(name): (value if isinstance(value, (bytes, bytearray)) else bytes(value or b""))
+        for name, value in dict(replacements or {}).items()
+    }
+    if not updates:
+        return {"path": target, "updated_entries": 0}
+
+    parent = os.path.dirname(target) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(target) + ".",
+        suffix=".tmp",
+        dir=parent,
+    )
+    os.close(tmp_fd)
+    try:
+        output_infos = []
+        with open(target, "rb") as src_handle, zipfile.ZipFile(target, "r") as src, open(tmp_path, "wb") as dst_handle:
+            archive_comment = bytes(src.comment or b"")
+            for info in src.infolist():
+                name = str(info.filename or "")
+                clone = _initial_pak_clone_zip_info_preserve_raw_name(info)
+                clone.header_offset = int(dst_handle.tell())
+                data = updates.get(name)
+                if data is None:
+                    _initial_pak_copy_raw_local_entry(src_handle, dst_handle, info)
+                else:
+                    payload = data if isinstance(data, (bytes, bytearray)) else bytes(data or b"")
+                    compressed = _initial_pak_compress_entry_payload(payload, info.compress_type)
+                    clone.file_size = len(payload)
+                    clone.compress_size = len(compressed)
+                    clone.CRC = zlib.crc32(payload) & 0xFFFFFFFF
+                    clone.flag_bits = 0
+                    dst_handle.write(clone.FileHeader(False))
+                    dst_handle.write(compressed)
+                output_infos.append(clone)
+            _initial_pak_write_central_directory(dst_handle, output_infos, archive_comment=archive_comment)
+        os.replace(tmp_path, target)
+        tmp_path = ""
+        return {"path": target, "updated_entries": len(updates)}
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def _initial_pak_backup_parent_dir(pak_path: str) -> str:
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak:
+        return ""
+    parent = _backup_category_dir(INITIAL_PAK_BACKUPS_DIR_NAME, pak)
+    _migrate_legacy_backup_entries(
+        os.path.join(os.path.dirname(pak), LEGACY_BACKUP_DIR_NAME),
+        parent,
+        (_INITIAL_PAK_BACKUP_PREFIX,),
+        "initial.pak",
+    )
+    return parent
+
+
+def _initial_pak_list_backups(pak_path: str) -> List[Dict[str, Any]]:
+    parent = _initial_pak_backup_parent_dir(pak_path)
+    if not parent or not os.path.isdir(parent):
+        return []
+
+    items = []
+    for name in os.listdir(parent):
+        folder = os.path.join(parent, name)
+        if not os.path.isdir(folder):
+            continue
+        if not str(name).lower().startswith(_INITIAL_PAK_BACKUP_PREFIX.lower()):
+            continue
+        try:
+            mtime = float(os.path.getmtime(folder))
+        except Exception:
+            mtime = 0.0
+        items.append(
+            {
+                "name": str(name),
+                "path": folder,
+                "mtime": mtime,
+                "file_path": os.path.join(folder, "initial.pak"),
+            }
+        )
+    items.sort(key=lambda item: (float(item.get("mtime") or 0.0), str(item.get("name") or "").casefold()), reverse=True)
+    return items
+
+
+def _initial_pak_get_backup_info(pak_path: str) -> Dict[str, Any]:
+    for item in _initial_pak_list_backups(pak_path):
+        file_path = str(item.get("file_path") or "").strip()
+        if file_path and os.path.isfile(file_path):
+            return dict(item)
+    return {}
+
+
+def _initial_pak_create_backup(pak_path: str, replace_existing: bool = False) -> Dict[str, Any]:
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    existing = _initial_pak_get_backup_info(pak)
+    if existing and not replace_existing:
+        result = dict(existing)
+        result["created"] = False
+        return result
+
+    parent = _initial_pak_backup_parent_dir(pak)
+    if not parent:
+        raise RuntimeError("Could not resolve the backup folder for initial.pak.")
+    os.makedirs(parent, exist_ok=True)
+
+    if replace_existing:
+        for item in _initial_pak_list_backups(pak):
+            folder = str(item.get("path") or "").strip()
+            if folder and os.path.isdir(folder):
+                shutil.rmtree(folder)
+
+    stamp = datetime.now().strftime("%d.%m.%Y %H-%M-%S")
+    folder_name = f"{_INITIAL_PAK_BACKUP_PREFIX}{stamp}"
+    folder_path = os.path.join(parent, folder_name)
+    os.makedirs(folder_path, exist_ok=False)
+    backup_file = os.path.join(folder_path, os.path.basename(pak))
+    shutil.copy2(pak, backup_file)
+    return {
+        "name": folder_name,
+        "path": folder_path,
+        "mtime": _file_mtime_ns(folder_path),
+        "file_path": backup_file,
+        "created": True,
+    }
+
+
+def _initial_pak_restore_backup(pak_path: str) -> Dict[str, Any]:
+    target = _initial_pak_resolve_path(pak_path)
+    if not target:
+        raise FileNotFoundError("initial.pak path is not set.")
+    backup = _initial_pak_get_backup_info(target)
+    backup_file = str(backup.get("file_path") or "").strip()
+    if not backup_file or not os.path.isfile(backup_file):
+        raise FileNotFoundError("No initial.pak backup was found.")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    shutil.copy2(backup_file, target)
+    result = dict(backup)
+    result["restored_path"] = target
+    return result
+
+
+def _initial_pak_get_numeric_module_spec(module_id: str) -> Dict[str, Any]:
+    key = str(module_id or "").strip()
+    spec = _INITIAL_PAK_NUMERIC_MODULE_SPECS.get(key)
+    if spec is None:
+        raise ValueError(f"Unsupported initial.pak numeric module: {module_id}")
+    return dict(spec)
+
+
+def _initial_pak_build_open_tag_regex(tag_names: Any):
+    if isinstance(tag_names, (list, tuple, set)):
+        names = [str(item or "").strip() for item in tag_names]
+    else:
+        names = [str(tag_names or "").strip()]
+    escaped = [re.escape(item) for item in names if item]
+    if not escaped:
+        raise ValueError("At least one tag name is required.")
+    return re.compile(rf"<(?:{'|'.join(escaped)})\b[^>]*>", flags=re.IGNORECASE)
+
+
+def _initial_pak_extract_tag_numeric_values(text: str, tag_names: Any, attr_name: str) -> List[Dict[str, Any]]:
+    source = str(text or "")
+    tag_re = _initial_pak_build_open_tag_regex(tag_names)
+    attr_re = re.compile(rf'\b{re.escape(str(attr_name or "").strip())}\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    found = []
+    match_index = 0
+    for tag_match in tag_re.finditer(source):
+        tag_text = tag_match.group(0)
+        attr_match = attr_re.search(tag_text)
+        if not attr_match:
+            continue
+        raw_value = str(attr_match.group("value") or "").strip()
+        try:
+            numeric_value = float(raw_value)
+        except Exception:
+            numeric_value = None
+        found.append(
+            {
+                "index": match_index,
+                "raw": raw_value,
+                "value": numeric_value,
+            }
+        )
+        match_index += 1
+    return found
+
+
+def _initial_pak_replace_tag_numeric_values(text: str, tag_names: Any, attr_name: str, resolver) -> Tuple[str, int]:
+    source = str(text or "")
+    tag_re = _initial_pak_build_open_tag_regex(tag_names)
+    attr_re = re.compile(rf'\b{re.escape(str(attr_name or "").strip())}\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    parts = []
+    last_end = 0
+    match_index = 0
+    changed_tags = 0
+    for tag_match in tag_re.finditer(source):
+        start = int(tag_match.start())
+        end = int(tag_match.end())
+        parts.append(source[last_end:start])
+        tag_text = tag_match.group(0)
+        new_tag_text = tag_text
+        attr_match = attr_re.search(tag_text)
+        if attr_match:
+            current_raw = str(attr_match.group("value") or "").strip()
+            replacement_raw = resolver(match_index, current_raw)
+            if replacement_raw is not None:
+                replacement_text = str(replacement_raw)
+                new_tag_text = (
+                    tag_text[: attr_match.start("value")]
+                    + replacement_text
+                    + tag_text[attr_match.end("value") :]
+                )
+                if new_tag_text != tag_text:
+                    changed_tags += 1
+            match_index += 1
+        parts.append(new_tag_text)
+        last_end = end
+    parts.append(source[last_end:])
+    return "".join(parts), changed_tags
+
+
+def _initial_pak_extract_tag_attr_values(text: str, tag_names: Any, attr_name: str) -> List[Dict[str, Any]]:
+    source = str(text or "")
+    tag_re = _initial_pak_build_open_tag_regex(tag_names)
+    attr_re = re.compile(rf'\b{re.escape(str(attr_name or "").strip())}\s*=\s*"(?P<value>[^"]*)"', flags=re.IGNORECASE)
+    found = []
+    for match_index, tag_match in enumerate(tag_re.finditer(source)):
+        tag_text = tag_match.group(0)
+        attr_match = attr_re.search(tag_text)
+        raw_value = str(attr_match.group("value") or "") if attr_match else ""
+        found.append(
+            {
+                "index": match_index,
+                "raw": raw_value,
+                "has_attr": bool(attr_match),
+            }
+        )
+    return found
+
+
+def _initial_pak_insert_attr_into_open_tag(tag_text: str, attr_name: str, attr_value: Any) -> str:
+    source = str(tag_text or "")
+    value_text = str(attr_value if attr_value is not None else "")
+    if source.endswith("/>"):
+        insert_at = len(source) - 2
+    elif source.endswith(">"):
+        insert_at = len(source) - 1
+    else:
+        return source
+    prefix = source[:insert_at]
+    suffix = source[insert_at:]
+    spacer = "" if prefix.endswith((" ", "\t", "\r", "\n")) else " "
+    return f'{prefix}{spacer}{attr_name}="{value_text}"{suffix}'
+
+
+def _initial_pak_replace_tag_attr_values(text: str, tag_names: Any, attr_name: str, resolver) -> Tuple[str, int]:
+    source = str(text or "")
+    attr_key = str(attr_name or "").strip()
+    tag_re = _initial_pak_build_open_tag_regex(tag_names)
+    attr_re = re.compile(rf'\b{re.escape(attr_key)}\s*=\s*"(?P<value>[^"]*)"', flags=re.IGNORECASE)
+    attr_remove_re = re.compile(rf'\s+\b{re.escape(attr_key)}\s*=\s*"[^"]*"', flags=re.IGNORECASE)
+    parts = []
+    last_end = 0
+    changed_tags = 0
+    for match_index, tag_match in enumerate(tag_re.finditer(source)):
+        start = int(tag_match.start())
+        end = int(tag_match.end())
+        parts.append(source[last_end:start])
+        tag_text = tag_match.group(0)
+        new_tag_text = tag_text
+        attr_match = attr_re.search(tag_text)
+        current_raw = str(attr_match.group("value") or "") if attr_match else ""
+        replacement = resolver(match_index, current_raw, bool(attr_match))
+        if replacement is _INITIAL_PAK_REMOVE_ATTR:
+            if attr_match:
+                new_tag_text = attr_remove_re.sub("", tag_text, count=1)
+        elif replacement is not None:
+            replacement_text = str(replacement)
+            if attr_match:
+                new_tag_text = (
+                    tag_text[: attr_match.start("value")]
+                    + replacement_text
+                    + tag_text[attr_match.end("value") :]
+                )
+            else:
+                new_tag_text = _initial_pak_insert_attr_into_open_tag(tag_text, attr_key, replacement_text)
+        if new_tag_text != tag_text:
+            changed_tags += 1
+        parts.append(new_tag_text)
+        last_end = end
+    parts.append(source[last_end:])
+    return "".join(parts), changed_tags
+
+
+def _initial_pak_restore_tag_attr_values_from_backup(
+    current_text: str,
+    backup_text: str,
+    tag_names: Any,
+    attr_name: str,
+) -> Tuple[str, int, bool]:
+    default_values = _initial_pak_extract_tag_attr_values(backup_text, tag_names, attr_name)
+    unmatched = False
+
+    def _restore_attr(index: int, current_raw: str, has_current_attr: bool):
+        nonlocal unmatched
+        if index >= len(default_values):
+            unmatched = True
+            return None
+        default_item = default_values[index]
+        if bool(default_item.get("has_attr")):
+            return str(default_item.get("raw") or "")
+        return _INITIAL_PAK_REMOVE_ATTR if has_current_attr else None
+
+    updated_text, changed_count = _initial_pak_replace_tag_attr_values(
+        current_text,
+        tag_names,
+        attr_name,
+        _restore_attr,
+    )
+    current_count = len(_initial_pak_extract_tag_attr_values(current_text, tag_names, attr_name))
+    if current_count != len(default_values):
+        unmatched = True
+    return updated_text, changed_count, unmatched
+
+
+def _initial_pak_extract_tag_numeric_sequence_values(text: str, tag_names: Any, attr_name: str) -> List[Dict[str, Any]]:
+    source = str(text or "")
+    tag_re = _initial_pak_build_open_tag_regex(tag_names)
+    attr_re = re.compile(rf'\b{re.escape(str(attr_name or "").strip())}\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    found = []
+    match_index = 0
+    for tag_match in tag_re.finditer(source):
+        tag_text = tag_match.group(0)
+        attr_match = attr_re.search(tag_text)
+        if not attr_match:
+            continue
+        raw_value = str(attr_match.group("value") or "").strip()
+        raw_parts = [part.strip() for part in raw_value.split(",")]
+        numeric_parts = []
+        try:
+            for part in raw_parts:
+                if not part:
+                    raise ValueError("Empty numeric sequence part.")
+                numeric_parts.append(float(part))
+        except Exception:
+            numeric_parts = None
+        found.append(
+            {
+                "index": match_index,
+                "raw": raw_value,
+                "parts": raw_parts,
+                "values": numeric_parts,
+            }
+        )
+        match_index += 1
+    return found
+
+
+def _initial_pak_format_scaled_numeric_sequence(default_parts: List[str], scaled_values: List[float], attr_name: str) -> str:
+    parts = []
+    for index, scaled_value in enumerate(list(scaled_values or [])):
+        raw_part = default_parts[index] if index < len(default_parts) else ""
+        parts.append(_initial_pak_format_scaled_numeric(raw_part, scaled_value, attr_name))
+    return ", ".join(parts)
+
+
+def _initial_pak_analyze_numeric_sequence_module(pak_path: str, module_id: str) -> Dict[str, Any]:
+    spec = _initial_pak_get_numeric_module_spec(module_id)
+    tag_names = spec.get("tag_names", spec.get("tag_name"))
+    attr_name = str(spec.get("attr_name") or "")
+
+    pak = _initial_pak_resolve_path(pak_path)
+    result = {
+        "path": pak,
+        "module_id": str(module_id or "").strip(),
+        "attribute": attr_name,
+        "multiplier": 1.0,
+        "matched_count": 0,
+        "file_count": 0,
+        "state": "missing",
+    }
+    if not pak or not os.path.isfile(pak):
+        return result
+
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        entry_names = _initial_pak_list_entry_names_for_spec(current_zip, spec)
+        result["file_count"] = len(entry_names)
+        if not backup_file or not os.path.isfile(backup_file):
+            matched = 0
+            for entry_name in entry_names:
+                current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+                for item in _initial_pak_extract_tag_numeric_sequence_values(current_text, tag_names, attr_name):
+                    matched += len(item.get("values") or [])
+            result["matched_count"] = matched
+            result["state"] = "no_backup" if matched > 0 else "empty"
+            return result
+
+        ratios = []
+        matched_count = 0
+        structure_mismatch = False
+        with zipfile.ZipFile(backup_file, "r") as backup_zip:
+            backup_names = set(backup_zip.namelist())
+            for entry_name in entry_names:
+                if entry_name not in backup_names:
+                    structure_mismatch = True
+                    continue
+                current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+                backup_text, _enc2 = _initial_pak_decode_text(backup_zip.read(entry_name))
+                current_values = _initial_pak_extract_tag_numeric_sequence_values(current_text, tag_names, attr_name)
+                backup_values = _initial_pak_extract_tag_numeric_sequence_values(backup_text, tag_names, attr_name)
+                if len(current_values) != len(backup_values):
+                    structure_mismatch = True
+                for index in range(min(len(current_values), len(backup_values))):
+                    current_item = current_values[index]
+                    backup_item = backup_values[index]
+                    current_parts = current_item.get("values")
+                    default_parts = backup_item.get("values")
+                    if (not isinstance(current_parts, list)) or (not isinstance(default_parts, list)):
+                        continue
+                    if len(current_parts) != len(default_parts):
+                        structure_mismatch = True
+                        continue
+                    for value_index in range(len(default_parts)):
+                        current_float = float(current_parts[value_index])
+                        default_float = float(default_parts[value_index])
+                        matched_count += 1
+                        if abs(default_float) <= 1e-12:
+                            if abs(current_float) > 1e-12:
+                                result["matched_count"] = matched_count
+                                result["state"] = "mixed"
+                                return result
+                            continue
+                        ratios.append(current_float / default_float)
+
+        result["matched_count"] = matched_count
+        if matched_count <= 0:
+            result["state"] = "empty"
+            return result
+        if structure_mismatch:
+            result["state"] = "mixed"
+            return result
+        if not ratios:
+            result["state"] = "uniform"
+            result["multiplier"] = 1.0
+            return result
+
+        reference = float(ratios[0])
+        tolerance = max(1e-6, abs(reference) * 1e-6)
+        if all(abs(float(item) - reference) <= tolerance for item in ratios[1:]):
+            result["state"] = "uniform"
+            result["multiplier"] = reference
+        else:
+            result["state"] = "mixed"
+            result["multiplier"] = 1.0
+        return result
+
+
+def _initial_pak_apply_numeric_sequence_module(pak_path: str, module_id: str, multiplier: Any) -> Dict[str, Any]:
+    spec = _initial_pak_get_numeric_module_spec(module_id)
+    tag_names = spec.get("tag_names", spec.get("tag_name"))
+    attr_name = str(spec.get("attr_name") or "")
+
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    target_multiplier = float(multiplier)
+    if not math.isfinite(target_multiplier):
+        raise ValueError(f"Invalid {attr_name} multiplier: {multiplier}")
+
+    created_backup = False
+    tol = 1e-9
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+    if (not backup_file or not os.path.isfile(backup_file)) and abs(target_multiplier - 1.0) > tol:
+        backup = _initial_pak_create_backup(pak, replace_existing=False)
+        backup_file = str(backup.get("file_path") or "").strip()
+        created_backup = bool(backup.get("created"))
+
+    if not backup_file or not os.path.isfile(backup_file):
+        result = _initial_pak_analyze_numeric_sequence_module(pak, module_id)
+        result.update(
+            {
+                "requested_multiplier": target_multiplier,
+                "created_backup": created_backup,
+                "changed_files": 0,
+                "changed_values": 0,
+                "missing_defaults": [],
+                "unmatched_defaults": [],
+                "updated_entries": 0,
+            }
+        )
+        return result
+
+    replacements = {}
+    changed_files = 0
+    changed_values = 0
+    missing_defaults = []
+    unmatched_defaults = []
+
+    with zipfile.ZipFile(pak, "r") as current_zip, zipfile.ZipFile(backup_file, "r") as backup_zip:
+        entry_names = _initial_pak_list_entry_names_for_spec(current_zip, spec)
+        backup_names = set(backup_zip.namelist())
+        for entry_name in entry_names:
+            if entry_name not in backup_names:
+                missing_defaults.append(entry_name)
+                continue
+
+            current_raw = current_zip.read(entry_name)
+            backup_raw = backup_zip.read(entry_name)
+            current_text, current_encoding = _initial_pak_decode_text(current_raw)
+            backup_text, _backup_encoding = _initial_pak_decode_text(backup_raw)
+            current_values = _initial_pak_extract_tag_numeric_sequence_values(current_text, tag_names, attr_name)
+            if not current_values:
+                continue
+            default_values = _initial_pak_extract_tag_numeric_sequence_values(backup_text, tag_names, attr_name)
+            if not default_values:
+                missing_defaults.append(entry_name)
+                continue
+            if len(current_values) != len(default_values):
+                unmatched_defaults.append(f"{entry_name}:count_mismatch")
+
+            file_changed = False
+            unmatched_indexes = set()
+
+            def _replace_value(index: int, current_raw_value: str):
+                nonlocal changed_values, file_changed
+                if index >= len(default_values):
+                    if index not in unmatched_indexes:
+                        unmatched_defaults.append(f"{entry_name}:#{index}")
+                        unmatched_indexes.add(index)
+                    return None
+
+                default_item = default_values[index]
+                default_raw = str(default_item.get("raw") or "").strip()
+                default_parts = list(default_item.get("parts") or [])
+                default_numeric = default_item.get("values")
+                if (not isinstance(default_numeric, list)) or (not default_parts) or (len(default_parts) != len(default_numeric)):
+                    if index not in unmatched_indexes:
+                        unmatched_defaults.append(f"{entry_name}:#{index}")
+                        unmatched_indexes.add(index)
+                    return None
+
+                if abs(target_multiplier - 1.0) <= tol:
+                    target_raw = default_raw
+                else:
+                    scaled_values = [float(item) * target_multiplier for item in default_numeric]
+                    target_raw = _initial_pak_format_scaled_numeric_sequence(default_parts, scaled_values, attr_name)
+                if str(current_raw_value or "").strip() != target_raw:
+                    file_changed = True
+                    changed_values += 1
+                return target_raw
+
+            updated_text, _changed_tags = _initial_pak_replace_tag_numeric_values(
+                current_text,
+                tag_names,
+                attr_name,
+                _replace_value,
+            )
+            if file_changed:
+                replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+                changed_files += 1
+
+    if replacements:
+        _initial_pak_replace_zip_entries(pak, replacements)
+
+    result = _initial_pak_analyze_numeric_sequence_module(pak, module_id)
+    result.update(
+        {
+            "path": pak,
+            "module_id": str(module_id or "").strip(),
+            "attribute": attr_name,
+            "requested_multiplier": target_multiplier,
+            "created_backup": created_backup,
+            "changed_files": changed_files,
+            "changed_values": changed_values,
+            "missing_defaults": missing_defaults,
+            "unmatched_defaults": unmatched_defaults,
+            "updated_entries": len(replacements),
+        }
+    )
+    return result
+
+
+def _initial_pak_analyze_numeric_module(pak_path: str, module_id: str) -> Dict[str, Any]:
+    spec = _initial_pak_get_numeric_module_spec(module_id)
+    value_kind = str(spec.get("value_kind") or "scalar").strip().lower()
+    if value_kind == "csv_numbers":
+        return _initial_pak_analyze_numeric_sequence_module(pak_path, module_id)
+    tag_names = spec.get("tag_names", spec.get("tag_name"))
+    attr_name = str(spec.get("attr_name") or "")
+
+    pak = _initial_pak_resolve_path(pak_path)
+    result = {
+        "path": pak,
+        "module_id": str(module_id or "").strip(),
+        "attribute": attr_name,
+        "multiplier": 1.0,
+        "matched_count": 0,
+        "file_count": 0,
+        "state": "missing",
+    }
+    if not pak or not os.path.isfile(pak):
+        return result
+
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        entry_names = _initial_pak_list_entry_names_for_spec(current_zip, spec)
+        result["file_count"] = len(entry_names)
+        if not backup_file or not os.path.isfile(backup_file):
+            matched = 0
+            for entry_name in entry_names:
+                current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+                matched += len(_initial_pak_extract_tag_numeric_values(current_text, tag_names, attr_name))
+            result["matched_count"] = matched
+            result["state"] = "no_backup" if matched > 0 else "empty"
+            return result
+
+        ratios = []
+        matched_count = 0
+        structure_mismatch = False
+        with zipfile.ZipFile(backup_file, "r") as backup_zip:
+            backup_names = set(backup_zip.namelist())
+            for entry_name in entry_names:
+                if entry_name not in backup_names:
+                    structure_mismatch = True
+                    continue
+                current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+                backup_text, _enc2 = _initial_pak_decode_text(backup_zip.read(entry_name))
+                current_values = _initial_pak_extract_tag_numeric_values(current_text, tag_names, attr_name)
+                backup_values = _initial_pak_extract_tag_numeric_values(backup_text, tag_names, attr_name)
+                if len(current_values) != len(backup_values):
+                    structure_mismatch = True
+                for index in range(min(len(current_values), len(backup_values))):
+                    current_item = current_values[index]
+                    backup_item = backup_values[index]
+                    current_value = current_item.get("value")
+                    default_value = backup_item.get("value")
+                    if current_value is None or default_value is None:
+                        continue
+                    matched_count += 1
+                    default_float = float(default_value)
+                    current_float = float(current_value)
+                    if abs(default_float) <= 1e-12:
+                        if abs(current_float) > 1e-12:
+                            result["matched_count"] = matched_count
+                            result["state"] = "mixed"
+                            return result
+                        continue
+                    ratios.append(current_float / default_float)
+
+        result["matched_count"] = matched_count
+        if matched_count <= 0:
+            result["state"] = "empty"
+            return result
+        if structure_mismatch:
+            result["state"] = "mixed"
+            return result
+        if not ratios:
+            result["state"] = "uniform"
+            result["multiplier"] = 1.0
+            return result
+
+        reference = float(ratios[0])
+        tolerance = max(1e-6, abs(reference) * 1e-6)
+        if all(abs(float(item) - reference) <= tolerance for item in ratios[1:]):
+            result["state"] = "uniform"
+            result["multiplier"] = reference
+        else:
+            result["state"] = "mixed"
+            result["multiplier"] = 1.0
+        return result
+
+
+def _initial_pak_apply_numeric_module(pak_path: str, module_id: str, multiplier: Any) -> Dict[str, Any]:
+    spec = _initial_pak_get_numeric_module_spec(module_id)
+    value_kind = str(spec.get("value_kind") or "scalar").strip().lower()
+    if value_kind == "csv_numbers":
+        return _initial_pak_apply_numeric_sequence_module(pak_path, module_id, multiplier)
+    tag_names = spec.get("tag_names", spec.get("tag_name"))
+    attr_name = str(spec.get("attr_name") or "")
+
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    target_multiplier = float(multiplier)
+    if not math.isfinite(target_multiplier):
+        raise ValueError(f"Invalid {attr_name} multiplier: {multiplier}")
+
+    created_backup = False
+    tol = 1e-9
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+    if (not backup_file or not os.path.isfile(backup_file)) and abs(target_multiplier - 1.0) > tol:
+        backup = _initial_pak_create_backup(pak, replace_existing=False)
+        backup_file = str(backup.get("file_path") or "").strip()
+        created_backup = bool(backup.get("created"))
+
+    if not backup_file or not os.path.isfile(backup_file):
+        result = _initial_pak_analyze_numeric_module(pak, module_id)
+        result.update(
+            {
+                "requested_multiplier": target_multiplier,
+                "created_backup": created_backup,
+                "changed_files": 0,
+                "changed_values": 0,
+                "missing_defaults": [],
+                "unmatched_defaults": [],
+                "updated_entries": 0,
+            }
+        )
+        return result
+
+    replacements = {}
+    changed_files = 0
+    changed_values = 0
+    missing_defaults = []
+    unmatched_defaults = []
+
+    with zipfile.ZipFile(pak, "r") as current_zip, zipfile.ZipFile(backup_file, "r") as backup_zip:
+        entry_names = _initial_pak_list_entry_names_for_spec(current_zip, spec)
+        backup_names = set(backup_zip.namelist())
+        for entry_name in entry_names:
+            if entry_name not in backup_names:
+                missing_defaults.append(entry_name)
+                continue
+
+            current_raw = current_zip.read(entry_name)
+            backup_raw = backup_zip.read(entry_name)
+            current_text, current_encoding = _initial_pak_decode_text(current_raw)
+            backup_text, _backup_encoding = _initial_pak_decode_text(backup_raw)
+            current_values = _initial_pak_extract_tag_numeric_values(current_text, tag_names, attr_name)
+            if not current_values:
+                continue
+            default_values = _initial_pak_extract_tag_numeric_values(backup_text, tag_names, attr_name)
+            if not default_values:
+                missing_defaults.append(entry_name)
+                continue
+            if len(current_values) != len(default_values):
+                unmatched_defaults.append(f"{entry_name}:count_mismatch")
+
+            file_changed = False
+            unmatched_indexes = set()
+
+            def _replace_value(index: int, current_raw_value: str):
+                nonlocal changed_values, file_changed
+                if index >= len(default_values):
+                    if index not in unmatched_indexes:
+                        unmatched_defaults.append(f"{entry_name}:#{index}")
+                        unmatched_indexes.add(index)
+                    return None
+
+                default_item = default_values[index]
+                if default_item.get("value") is None:
+                    if index not in unmatched_indexes:
+                        unmatched_defaults.append(f"{entry_name}:#{index}")
+                        unmatched_indexes.add(index)
+                    return None
+
+                default_raw = str(default_item.get("raw") or "").strip()
+                default_value = float(default_item.get("value"))
+                if abs(target_multiplier - 1.0) <= tol:
+                    target_raw = default_raw
+                else:
+                    target_raw = _initial_pak_format_scaled_numeric(
+                        default_raw,
+                        default_value * target_multiplier,
+                        attr_name,
+                    )
+                if str(current_raw_value or "").strip() != target_raw:
+                    file_changed = True
+                    changed_values += 1
+                return target_raw
+
+            updated_text, _changed_tags = _initial_pak_replace_tag_numeric_values(
+                current_text,
+                tag_names,
+                attr_name,
+                _replace_value,
+            )
+            if file_changed:
+                replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+                changed_files += 1
+
+    if replacements:
+        _initial_pak_replace_zip_entries(pak, replacements)
+
+    result = _initial_pak_analyze_numeric_module(pak, module_id)
+    result.update(
+        {
+            "path": pak,
+            "module_id": str(module_id or "").strip(),
+            "attribute": attr_name,
+            "requested_multiplier": target_multiplier,
+            "created_backup": created_backup,
+            "changed_files": changed_files,
+            "changed_values": changed_values,
+            "missing_defaults": missing_defaults,
+            "unmatched_defaults": unmatched_defaults,
+            "updated_entries": len(replacements),
+        }
+    )
+    return result
+
+
+def _initial_pak_extract_flexible_frame_values(text: str) -> List[Dict[str, Any]]:
+    source = str(text or "")
+    twist_re = re.compile(r'(?P<open><Twist\b[^>]*>)(?P<body>.*?)(?P<close></Twist>)', flags=re.IGNORECASE | re.DOTALL)
+    constraint_re = re.compile(r'<Constraint\b(?P<attrs>[^>]*)>', flags=re.IGNORECASE | re.DOTALL)
+    type_re = re.compile(r'\bType\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    min_re = re.compile(r'\bMinLimit\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    max_re = re.compile(r'\bMaxLimit\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    found = []
+    match_index = 0
+    for twist_match in twist_re.finditer(source):
+        body_text = str(twist_match.group("body") or "")
+        constraint_match = constraint_re.search(body_text)
+        if constraint_match is None:
+            continue
+        tag_text = constraint_match.group(0)
+        type_match = type_re.search(tag_text)
+        if (type_match is None) or (str(type_match.group("value") or "").strip().lower() != "hinge"):
+            continue
+        min_match = min_re.search(tag_text)
+        max_match = max_re.search(tag_text)
+        if (min_match is None) or (max_match is None):
+            continue
+        min_raw = str(min_match.group("value") or "").strip()
+        max_raw = str(max_match.group("value") or "").strip()
+        try:
+            min_value = float(min_raw)
+            max_value = float(max_raw)
+        except Exception:
+            min_value = None
+            max_value = None
+        found.append(
+            {
+                "index": match_index,
+                "min_raw": min_raw,
+                "max_raw": max_raw,
+                "min_value": min_value,
+                "max_value": max_value,
+            }
+        )
+        match_index += 1
+    return found
+
+
+def _initial_pak_replace_flexible_frame_values(text: str, resolver) -> Tuple[str, int]:
+    source = str(text or "")
+    twist_re = re.compile(r'(?P<open><Twist\b[^>]*>)(?P<body>.*?)(?P<close></Twist>)', flags=re.IGNORECASE | re.DOTALL)
+    constraint_re = re.compile(r'<Constraint\b(?P<attrs>[^>]*)>', flags=re.IGNORECASE | re.DOTALL)
+    type_re = re.compile(r'\bType\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    min_re = re.compile(r'\bMinLimit\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    max_re = re.compile(r'\bMaxLimit\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    parts = []
+    last_end = 0
+    match_index = 0
+    changed_tags = 0
+    for twist_match in twist_re.finditer(source):
+        start = int(twist_match.start())
+        end = int(twist_match.end())
+        parts.append(source[last_end:start])
+        block_text = twist_match.group(0)
+        body_text = str(twist_match.group("body") or "")
+        new_block_text = block_text
+        constraint_match = constraint_re.search(body_text)
+        if constraint_match is not None:
+            tag_text = constraint_match.group(0)
+            type_match = type_re.search(tag_text)
+            if (type_match is not None) and (str(type_match.group("value") or "").strip().lower() == "hinge"):
+                min_match = min_re.search(tag_text)
+                max_match = max_re.search(tag_text)
+            else:
+                min_match = None
+                max_match = None
+        else:
+            min_match = None
+            max_match = None
+        if (constraint_match is not None) and (min_match is not None) and (max_match is not None):
+            replacement = resolver(
+                match_index,
+                str(min_match.group("value") or "").strip(),
+                str(max_match.group("value") or "").strip(),
+            )
+            if replacement is not None:
+                replacement_min, replacement_max = replacement
+                new_tag_text = min_re.sub(
+                    lambda m: m.group(0)[: m.start("value") - m.start(0)] + str(replacement_min) + m.group(0)[m.end("value") - m.start(0) :],
+                    tag_text,
+                    count=1,
+                )
+                new_tag_text = max_re.sub(
+                    lambda m: m.group(0)[: m.start("value") - m.start(0)] + str(replacement_max) + m.group(0)[m.end("value") - m.start(0) :],
+                    new_tag_text,
+                    count=1,
+                )
+                if new_tag_text != tag_text:
+                    changed_tags += 1
+                    body_start = int(constraint_match.start())
+                    body_end = int(constraint_match.end())
+                    new_body_text = body_text[:body_start] + new_tag_text + body_text[body_end:]
+                    new_block_text = f"{twist_match.group('open')}{new_body_text}{twist_match.group('close')}"
+            match_index += 1
+        parts.append(new_block_text)
+        last_end = end
+    parts.append(source[last_end:])
+    return "".join(parts), changed_tags
+
+
+def _initial_pak_analyze_flexible_frame_module(pak_path: str) -> Dict[str, Any]:
+    pak = _initial_pak_resolve_path(pak_path)
+    result = {
+        "path": pak,
+        "module_id": "flexible_frame",
+        "attribute": "MinLimit/MaxLimit",
+        "multiplier": 1.0,
+        "matched_count": 0,
+        "file_count": 0,
+        "state": "missing",
+    }
+    if not pak or not os.path.isfile(pak):
+        return result
+
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        entry_names = _initial_pak_list_entry_names_for_segment(current_zip, "classes/trucks/")
+        result["file_count"] = len(entry_names)
+        if not backup_file or not os.path.isfile(backup_file):
+            matched = 0
+            for entry_name in entry_names:
+                current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+                matched += len(_initial_pak_extract_flexible_frame_values(current_text)) * 2
+            result["matched_count"] = matched
+            result["state"] = "no_backup" if matched > 0 else "empty"
+            return result
+
+        ratios = []
+        matched_count = 0
+        structure_mismatch = False
+        with zipfile.ZipFile(backup_file, "r") as backup_zip:
+            backup_names = set(backup_zip.namelist())
+            for entry_name in entry_names:
+                if entry_name not in backup_names:
+                    structure_mismatch = True
+                    continue
+                current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+                backup_text, _enc2 = _initial_pak_decode_text(backup_zip.read(entry_name))
+                current_values = _initial_pak_extract_flexible_frame_values(current_text)
+                backup_values = _initial_pak_extract_flexible_frame_values(backup_text)
+                if len(current_values) != len(backup_values):
+                    structure_mismatch = True
+                for index in range(min(len(current_values), len(backup_values))):
+                    current_item = current_values[index]
+                    backup_item = backup_values[index]
+                    for current_key, default_key in (("min_value", "min_value"), ("max_value", "max_value")):
+                        current_value = current_item.get(current_key)
+                        default_value = backup_item.get(default_key)
+                        if (current_value is None) or (default_value is None):
+                            continue
+                        matched_count += 1
+                        default_float = float(default_value)
+                        current_float = float(current_value)
+                        if abs(default_float) <= 1e-12:
+                            if abs(current_float) > 1e-12:
+                                result["matched_count"] = matched_count
+                                result["state"] = "mixed"
+                                return result
+                            continue
+                        ratios.append(current_float / default_float)
+
+    result["matched_count"] = matched_count
+    if matched_count <= 0:
+        result["state"] = "empty"
+        return result
+    if structure_mismatch:
+        result["state"] = "mixed"
+        return result
+    if not ratios:
+        result["state"] = "uniform"
+        result["multiplier"] = 1.0
+        return result
+
+    reference = float(ratios[0])
+    tolerance = max(1e-6, abs(reference) * 1e-6)
+    if all(abs(float(item) - reference) <= tolerance for item in ratios[1:]):
+        result["state"] = "uniform"
+        result["multiplier"] = reference
+    else:
+        result["state"] = "mixed"
+        result["multiplier"] = 1.0
+    return result
+
+
+def _initial_pak_apply_flexible_frame_module(pak_path: str, multiplier: Any) -> Dict[str, Any]:
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    target_multiplier = float(multiplier)
+    if not math.isfinite(target_multiplier):
+        raise ValueError(f"Invalid flexible frame multiplier: {multiplier}")
+
+    created_backup = False
+    tol = 1e-9
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+    if (not backup_file or not os.path.isfile(backup_file)) and abs(target_multiplier - 1.0) > tol:
+        backup = _initial_pak_create_backup(pak, replace_existing=False)
+        backup_file = str(backup.get("file_path") or "").strip()
+        created_backup = bool(backup.get("created"))
+
+    result = {
+        "path": pak,
+        "module_id": "flexible_frame",
+        "attribute": "MinLimit/MaxLimit",
+        "requested_multiplier": target_multiplier,
+        "created_backup": created_backup,
+        "changed_files": 0,
+        "changed_values": 0,
+        "missing_defaults": [],
+        "unmatched_defaults": [],
+        "updated_entries": 0,
+        "state": "missing",
+    }
+    if not backup_file or not os.path.isfile(backup_file):
+        result = _initial_pak_analyze_flexible_frame_module(pak)
+        result.update(
+            {
+                "requested_multiplier": target_multiplier,
+                "created_backup": created_backup,
+                "changed_files": 0,
+                "changed_values": 0,
+                "missing_defaults": [],
+                "unmatched_defaults": [],
+                "updated_entries": 0,
+            }
+        )
+        return result
+
+    replacements = {}
+    changed_files = 0
+    changed_values = 0
+    missing_defaults = []
+    unmatched_defaults = []
+
+    with zipfile.ZipFile(pak, "r") as current_zip, zipfile.ZipFile(backup_file, "r") as backup_zip:
+        entry_names = _initial_pak_list_entry_names_for_segment(current_zip, "classes/trucks/")
+        backup_names = set(backup_zip.namelist())
+        for entry_name in entry_names:
+            if entry_name not in backup_names:
+                missing_defaults.append(entry_name)
+                continue
+
+            current_raw = current_zip.read(entry_name)
+            backup_raw = backup_zip.read(entry_name)
+            current_text, current_encoding = _initial_pak_decode_text(current_raw)
+            backup_text, _backup_encoding = _initial_pak_decode_text(backup_raw)
+            current_values = _initial_pak_extract_flexible_frame_values(current_text)
+            if not current_values:
+                continue
+            default_values = _initial_pak_extract_flexible_frame_values(backup_text)
+            if not default_values:
+                missing_defaults.append(entry_name)
+                continue
+            if len(current_values) != len(default_values):
+                unmatched_defaults.append(f"{entry_name}:count_mismatch")
+
+            file_changed = False
+            unmatched_indexes = set()
+
+            def _replace_value(index: int, current_min_raw: str, current_max_raw: str):
+                nonlocal changed_values, file_changed
+                if index >= len(default_values):
+                    if index not in unmatched_indexes:
+                        unmatched_defaults.append(f"{entry_name}:#{index}")
+                        unmatched_indexes.add(index)
+                    return None
+
+                default_item = default_values[index]
+                default_min = default_item.get("min_value")
+                default_max = default_item.get("max_value")
+                if (default_min is None) or (default_max is None):
+                    if index not in unmatched_indexes:
+                        unmatched_defaults.append(f"{entry_name}:#{index}")
+                        unmatched_indexes.add(index)
+                    return None
+
+                default_min_raw = str(default_item.get("min_raw") or "").strip()
+                default_max_raw = str(default_item.get("max_raw") or "").strip()
+                if abs(target_multiplier - 1.0) <= tol:
+                    target_min_raw = default_min_raw
+                    target_max_raw = default_max_raw
+                else:
+                    scaled_min = float(default_min) * target_multiplier
+                    scaled_max = float(default_max) * target_multiplier
+                    target_min_raw = _initial_pak_format_scaled_numeric(default_min_raw, scaled_min, "MinLimit")
+                    target_max_raw = _initial_pak_format_scaled_numeric(default_max_raw, scaled_max, "MaxLimit")
+
+                if (str(current_min_raw or "").strip() != target_min_raw) or (str(current_max_raw or "").strip() != target_max_raw):
+                    file_changed = True
+                    changed_values += 2
+                return target_min_raw, target_max_raw
+
+            updated_text, _changed_tags = _initial_pak_replace_flexible_frame_values(current_text, _replace_value)
+            if file_changed:
+                replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+                changed_files += 1
+
+    if replacements:
+        _initial_pak_replace_zip_entries(pak, replacements)
+
+    result = _initial_pak_analyze_flexible_frame_module(pak)
+    result.update(
+        {
+            "changed_files": changed_files,
+            "changed_values": changed_values,
+            "missing_defaults": missing_defaults,
+            "unmatched_defaults": unmatched_defaults,
+            "updated_entries": len(replacements),
+        }
+    )
+    return result
+
+
+def _initial_pak_extract_soft_suspension_values(text: str) -> List[Dict[str, Any]]:
+    source = str(text or "")
+    constraint_re = re.compile(r'<Constraint\b(?P<attrs>[^>]*)>(?P<body>.*?)</Constraint>', flags=re.IGNORECASE | re.DOTALL)
+    axis_re = re.compile(r'\bAxisLocal\s*=\s*"\(1;\s*0;\s*0\)"', flags=re.IGNORECASE)
+    type_re = re.compile(r'\bType\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    spring_re = re.compile(r'\bSpring\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    damping_re = re.compile(r'\bDamping\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    found = []
+    match_index = 0
+    for constraint_match in constraint_re.finditer(source):
+        constraint_text = constraint_match.group(0)
+        if axis_re.search(constraint_text) is None:
+            continue
+        type_match = type_re.search(constraint_text)
+        if (type_match is None) or (str(type_match.group("value") or "").strip().lower() != "hinge"):
+            continue
+        spring_match = spring_re.search(constraint_text)
+        damping_match = damping_re.search(constraint_text)
+        if (spring_match is None) or (damping_match is None):
+            continue
+        spring_raw = str(spring_match.group("value") or "").strip()
+        damping_raw = str(damping_match.group("value") or "").strip()
+        try:
+            spring_value = float(spring_raw)
+        except Exception:
+            spring_value = None
+        try:
+            damping_value = float(damping_raw)
+        except Exception:
+            damping_value = None
+        if (spring_value is None) or (not math.isfinite(spring_value)) or (abs(spring_value) < _INITIAL_PAK_SOFT_SUSPENSION_MIN_SPRING):
+            continue
+        if (damping_value is None) or (not math.isfinite(damping_value)):
+            continue
+        found.append(
+            {
+                "index": match_index,
+                "spring_raw": spring_raw,
+                "spring_value": spring_value,
+                "damping_raw": damping_raw,
+                "damping_value": damping_value,
+            }
+        )
+        match_index += 1
+    return found
+
+
+def _initial_pak_replace_soft_suspension_values(text: str, resolver) -> Tuple[str, int]:
+    source = str(text or "")
+    constraint_re = re.compile(r'<Constraint\b(?P<attrs>[^>]*)>(?P<body>.*?)</Constraint>', flags=re.IGNORECASE | re.DOTALL)
+    axis_re = re.compile(r'\bAxisLocal\s*=\s*"\(1;\s*0;\s*0\)"', flags=re.IGNORECASE)
+    type_re = re.compile(r'\bType\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    spring_re = re.compile(r'\bSpring\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    damping_re = re.compile(r'\bDamping\s*=\s*"(?P<value>[^"]+)"', flags=re.IGNORECASE)
+    parts = []
+    last_end = 0
+    match_index = 0
+    changed_tags = 0
+    for constraint_match in constraint_re.finditer(source):
+        start = int(constraint_match.start())
+        end = int(constraint_match.end())
+        parts.append(source[last_end:start])
+        constraint_text = constraint_match.group(0)
+        new_constraint_text = constraint_text
+        if axis_re.search(constraint_text) is not None:
+            type_match = type_re.search(constraint_text)
+            if (type_match is not None) and (str(type_match.group("value") or "").strip().lower() == "hinge"):
+                spring_match = spring_re.search(constraint_text)
+                damping_match = damping_re.search(constraint_text)
+            else:
+                spring_match = None
+                damping_match = None
+        else:
+            spring_match = None
+            damping_match = None
+        if (spring_match is not None) and (damping_match is not None):
+            try:
+                spring_value = float(str(spring_match.group("value") or "").strip())
+            except Exception:
+                spring_value = None
+            if (spring_value is not None) and math.isfinite(spring_value) and (abs(spring_value) >= _INITIAL_PAK_SOFT_SUSPENSION_MIN_SPRING):
+                replacement = resolver(
+                    match_index,
+                    str(spring_match.group("value") or "").strip(),
+                    str(damping_match.group("value") or "").strip(),
+                )
+                if replacement is not None:
+                    replacement_spring, replacement_damping = replacement
+                    new_constraint_text = spring_re.sub(
+                        lambda m: m.group(0)[: m.start("value") - m.start(0)] + str(replacement_spring) + m.group(0)[m.end("value") - m.start(0) :],
+                        new_constraint_text,
+                        count=1,
+                    )
+                    new_constraint_text = damping_re.sub(
+                        lambda m: m.group(0)[: m.start("value") - m.start(0)] + str(replacement_damping) + m.group(0)[m.end("value") - m.start(0) :],
+                        new_constraint_text,
+                        count=1,
+                    )
+                    if new_constraint_text != constraint_text:
+                        changed_tags += 1
+                match_index += 1
+        parts.append(new_constraint_text)
+        last_end = end
+    parts.append(source[last_end:])
+    return "".join(parts), changed_tags
+
+
+def _initial_pak_analyze_soft_suspension_module(pak_path: str) -> Dict[str, Any]:
+    pak = _initial_pak_resolve_path(pak_path)
+    result = {
+        "path": pak,
+        "module_id": "soft_suspension",
+        "attribute": "Spring/Damping",
+        "multiplier": 1.0,
+        "matched_count": 0,
+        "file_count": 0,
+        "state": "missing",
+    }
+    if not pak or not os.path.isfile(pak):
+        return result
+
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        entry_names = _initial_pak_list_direct_truck_entry_names(current_zip)
+        result["file_count"] = len(entry_names)
+        if not backup_file or not os.path.isfile(backup_file):
+            matched = 0
+            for entry_name in entry_names:
+                current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+                matched += len(_initial_pak_extract_soft_suspension_values(current_text)) * 2
+            result["matched_count"] = matched
+            result["state"] = "no_backup" if matched > 0 else "empty"
+            return result
+
+        ratios = []
+        matched_count = 0
+        structure_mismatch = False
+        with zipfile.ZipFile(backup_file, "r") as backup_zip:
+            backup_names = set(backup_zip.namelist())
+            for entry_name in entry_names:
+                if entry_name not in backup_names:
+                    structure_mismatch = True
+                    continue
+                current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+                backup_text, _enc2 = _initial_pak_decode_text(backup_zip.read(entry_name))
+                current_values = _initial_pak_extract_soft_suspension_values(current_text)
+                backup_values = _initial_pak_extract_soft_suspension_values(backup_text)
+                if len(current_values) != len(backup_values):
+                    structure_mismatch = True
+                for index in range(min(len(current_values), len(backup_values))):
+                    current_item = current_values[index]
+                    backup_item = backup_values[index]
+                    for current_key, default_key in (("spring_value", "spring_value"), ("damping_value", "damping_value")):
+                        current_value = current_item.get(current_key)
+                        default_value = backup_item.get(default_key)
+                        if (current_value is None) or (default_value is None):
+                            continue
+                        matched_count += 1
+                        default_float = float(default_value)
+                        current_float = float(current_value)
+                        if abs(default_float) <= 1e-12:
+                            if abs(current_float) > 1e-12:
+                                result["matched_count"] = matched_count
+                                result["state"] = "mixed"
+                                return result
+                            continue
+                        ratios.append(current_float / default_float)
+
+    result["matched_count"] = matched_count
+    if matched_count <= 0:
+        result["state"] = "empty"
+        return result
+    if structure_mismatch:
+        result["state"] = "mixed"
+        return result
+    if not ratios:
+        result["state"] = "uniform"
+        result["multiplier"] = 1.0
+        return result
+
+    reference = float(ratios[0])
+    tolerance = max(1e-6, abs(reference) * 1e-6)
+    if all(abs(float(item) - reference) <= tolerance for item in ratios[1:]):
+        result["state"] = "uniform"
+        result["multiplier"] = reference
+    else:
+        result["state"] = "mixed"
+        result["multiplier"] = 1.0
+    return result
+
+
+def _initial_pak_apply_soft_suspension_module(pak_path: str, multiplier: Any) -> Dict[str, Any]:
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    target_multiplier = float(multiplier)
+    if not math.isfinite(target_multiplier):
+        raise ValueError(f"Invalid soft suspension multiplier: {multiplier}")
+
+    created_backup = False
+    tol = 1e-9
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+    if (not backup_file or not os.path.isfile(backup_file)) and abs(target_multiplier - 1.0) > tol:
+        backup = _initial_pak_create_backup(pak, replace_existing=False)
+        backup_file = str(backup.get("file_path") or "").strip()
+        created_backup = bool(backup.get("created"))
+
+    if not backup_file or not os.path.isfile(backup_file):
+        result = _initial_pak_analyze_soft_suspension_module(pak)
+        result.update(
+            {
+                "requested_multiplier": target_multiplier,
+                "created_backup": created_backup,
+                "changed_files": 0,
+                "changed_values": 0,
+                "missing_defaults": [],
+                "unmatched_defaults": [],
+                "updated_entries": 0,
+            }
+        )
+        return result
+
+    replacements = {}
+    changed_files = 0
+    changed_values = 0
+    missing_defaults = []
+    unmatched_defaults = []
+
+    with zipfile.ZipFile(pak, "r") as current_zip, zipfile.ZipFile(backup_file, "r") as backup_zip:
+        entry_names = _initial_pak_list_direct_truck_entry_names(current_zip)
+        backup_names = set(backup_zip.namelist())
+        for entry_name in entry_names:
+            if entry_name not in backup_names:
+                missing_defaults.append(entry_name)
+                continue
+
+            current_raw = current_zip.read(entry_name)
+            backup_raw = backup_zip.read(entry_name)
+            current_text, current_encoding = _initial_pak_decode_text(current_raw)
+            backup_text, _backup_encoding = _initial_pak_decode_text(backup_raw)
+            current_values = _initial_pak_extract_soft_suspension_values(current_text)
+            if not current_values:
+                continue
+            default_values = _initial_pak_extract_soft_suspension_values(backup_text)
+            if not default_values:
+                missing_defaults.append(entry_name)
+                continue
+            if len(current_values) != len(default_values):
+                unmatched_defaults.append(f"{entry_name}:count_mismatch")
+
+            file_changed = False
+            unmatched_indexes = set()
+
+            def _replace_value(index: int, current_spring_raw: str, current_damping_raw: str):
+                nonlocal changed_values, file_changed
+                if index >= len(default_values):
+                    if index not in unmatched_indexes:
+                        unmatched_defaults.append(f"{entry_name}:#{index}")
+                        unmatched_indexes.add(index)
+                    return None
+
+                default_item = default_values[index]
+                default_spring = default_item.get("spring_value")
+                default_damping = default_item.get("damping_value")
+                if (default_spring is None) or (default_damping is None):
+                    if index not in unmatched_indexes:
+                        unmatched_defaults.append(f"{entry_name}:#{index}")
+                        unmatched_indexes.add(index)
+                    return None
+
+                default_spring_raw = str(default_item.get("spring_raw") or "").strip()
+                default_damping_raw = str(default_item.get("damping_raw") or "").strip()
+                if abs(target_multiplier - 1.0) <= tol:
+                    target_spring_raw = default_spring_raw
+                    target_damping_raw = default_damping_raw
+                else:
+                    target_spring_raw = _initial_pak_format_scaled_numeric(default_spring_raw, float(default_spring) * target_multiplier, "Spring")
+                    target_damping_raw = _initial_pak_format_scaled_numeric(default_damping_raw, float(default_damping) * target_multiplier, "Damping")
+
+                if str(current_spring_raw or "").strip() != target_spring_raw:
+                    file_changed = True
+                    changed_values += 1
+                if str(current_damping_raw or "").strip() != target_damping_raw:
+                    file_changed = True
+                    changed_values += 1
+                return target_spring_raw, target_damping_raw
+
+            updated_text, _changed_tags = _initial_pak_replace_soft_suspension_values(current_text, _replace_value)
+            if file_changed:
+                replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+                changed_files += 1
+
+    if replacements:
+        _initial_pak_replace_zip_entries(pak, replacements)
+
+    result = _initial_pak_analyze_soft_suspension_module(pak)
+    result.update(
+        {
+            "requested_multiplier": target_multiplier,
+            "created_backup": created_backup,
+            "changed_files": changed_files,
+            "changed_values": changed_values,
+            "missing_defaults": missing_defaults,
+            "unmatched_defaults": unmatched_defaults,
+            "updated_entries": len(replacements),
+        }
+    )
+    return result
+
+
+def _initial_pak_restore_entries_from_backup(pak_path: str, entry_names: List[str]) -> Dict[str, Any]:
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+    if not backup_file or not os.path.isfile(backup_file):
+        raise FileNotFoundError("No initial.pak backup exists yet for restoring defaults.")
+
+    requested_names = []
+    seen = set()
+    for entry_name in list(entry_names or []):
+        normalized = str(entry_name or "").strip()
+        if not normalized:
+            continue
+        key = normalized.replace("\\", "/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        requested_names.append(normalized)
+
+    replacements = {}
+    changed_files = 0
+    missing_defaults = []
+    with zipfile.ZipFile(pak, "r") as current_zip, zipfile.ZipFile(backup_file, "r") as backup_zip:
+        backup_names = set(backup_zip.namelist())
+        for entry_name in requested_names:
+            if entry_name not in backup_names:
+                missing_defaults.append(entry_name)
+                continue
+            current_raw = current_zip.read(entry_name)
+            backup_raw = backup_zip.read(entry_name)
+            if current_raw == backup_raw:
+                continue
+            replacements[entry_name] = backup_raw
+            changed_files += 1
+
+    if replacements:
+        _initial_pak_replace_zip_entries(pak, replacements)
+
+    return {
+        "path": pak,
+        "changed_files": changed_files,
+        "updated_entries": len(replacements),
+        "missing_defaults": missing_defaults,
+    }
+
+
+def _initial_pak_normalize_socket_pos(raw_pos: Any) -> str:
+    return re.sub(r"\s+", "", str(raw_pos or "").strip())
+
+
+def _initial_pak_find_primary_model_tag(text: str):
+    source = str(text or "")
+    for match in _INITIAL_PAK_PRIMARY_MODEL_TAG_RE.finditer(source):
+        tag_name = str(match.group("tag") or "").strip().lower()
+        if not tag_name or tag_name == "_templates":
+            continue
+        return match
+    return None
+
+
+def _initial_pak_collect_model_clip_camera_state(text: str) -> Dict[str, Any]:
+    source = str(text or "")
+    match = _initial_pak_find_primary_model_tag(source)
+    if match is None:
+        return {"eligible": False, "enabled": False, "has_attr": False}
+    open_tag = str(match.group(0) or "")
+    attr_match = _INITIAL_PAK_CLIP_CAMERA_ATTR_RE.search(open_tag)
+    clip_value = str(attr_match.group("value") or "").strip() if attr_match else ""
+    return {
+        "eligible": True,
+        "enabled": clip_value.lower() == "false",
+        "has_attr": bool(attr_match),
+        "clip_value": clip_value,
+    }
+
+
+def _initial_pak_set_model_clip_camera_false(text: str) -> Tuple[str, int]:
+    return _initial_pak_set_model_clip_camera_value(text, "false")
+
+
+def _initial_pak_set_model_clip_camera_value(text: str, clip_value: Any = None, remove_attr: bool = False) -> Tuple[str, int]:
+    source = str(text or "")
+    match = _initial_pak_find_primary_model_tag(source)
+    if match is None:
+        return source, 0
+
+    open_tag = str(match.group(0) or "")
+    updated_open_tag = open_tag
+
+    if remove_attr:
+        updated_open_tag = re.sub(
+            r'\s+\bClipCamera\s*=\s*"[^"]*"',
+            "",
+            open_tag,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+        if updated_open_tag == open_tag:
+            return source, 0
+    else:
+        desired_value = str(clip_value if clip_value is not None else "").strip() or "false"
+        attr_match = _INITIAL_PAK_CLIP_CAMERA_ATTR_RE.search(open_tag)
+        if attr_match:
+            current_value = str(attr_match.group("value") or "").strip()
+            if current_value.lower() == desired_value.lower():
+                return source, 0
+            updated_open_tag = _INITIAL_PAK_CLIP_CAMERA_ATTR_RE.sub(
+                lambda found: f'{found.group("before")}{desired_value}{found.group("after")}',
+                open_tag,
+                count=1,
+            )
+        else:
+            if open_tag.endswith("/>"):
+                prefix = open_tag[:-2]
+                suffix = "/>"
+            else:
+                prefix = open_tag[:-1]
+                suffix = ">"
+            spacer = "" if prefix.endswith((" ", "\t", "\r", "\n")) else " "
+            updated_open_tag = f'{prefix}{spacer}ClipCamera="{desired_value}"{suffix}'
+
+    updated_text = f"{source[:match.start()]}{updated_open_tag}{source[match.end():]}"
+    return updated_text, 1
+
+
+def _initial_pak_restore_model_clip_camera_from_backup(current_text: str, backup_text: str) -> Tuple[str, int]:
+    backup_match = _initial_pak_find_primary_model_tag(backup_text)
+    if backup_match is None:
+        return current_text, 0
+    backup_open_tag = str(backup_match.group(0) or "")
+    backup_attr_match = _INITIAL_PAK_CLIP_CAMERA_ATTR_RE.search(backup_open_tag)
+    if backup_attr_match:
+        return _initial_pak_set_model_clip_camera_value(current_text, backup_attr_match.group("value"))
+    return _initial_pak_set_model_clip_camera_value(current_text, remove_attr=True)
+
+
+def _initial_pak_collect_toggle_targets(text: str, module_id: str) -> Dict[str, Any]:
+    source = str(text or "")
+    lower = source.lower()
+
+    if module_id == "camera_collisions":
+        clip_state = _initial_pak_collect_model_clip_camera_state(source)
+        if not clip_state.get("eligible"):
+            return {"eligible": False, "target_positions": [], "missing_positions": []}
+        return {
+            "eligible": True,
+            "target_positions": ["ClipCamera"],
+            "missing_positions": ([] if clip_state.get("enabled") else ["ClipCamera"]),
+        }
+
+    if module_id == "craneable_logs_everywhere":
+        looks_like_log_model = ("<loadpoint" in lower) and (
+            ('loadaddons="load_logs' in lower)
+            or bool(re.search(r'loadtype="[^"]*log', lower))
+            or ("log_" in lower)
+        )
+        load_points = [str(match.group("pos") or "").strip() for match in _INITIAL_PAK_LOAD_POINT_TAG_RE.finditer(source)]
+        if (not looks_like_log_model) or (not load_points):
+            return {"eligible": False, "target_positions": [], "missing_positions": []}
+        existing_targets = {
+            _initial_pak_normalize_socket_pos(match.group("pos"))
+            for match in _INITIAL_PAK_CRANE_SOCKET_TAG_RE.finditer(source)
+        }
+        missing_positions = []
+        for pos in load_points:
+            pos_key = _initial_pak_normalize_socket_pos(pos)
+            if pos_key not in existing_targets:
+                missing_positions.append(pos)
+        return {
+            "eligible": True,
+            "target_positions": load_points,
+            "missing_positions": missing_positions,
+            "source_tag": "LoadPoint",
+            "target_tag": "CraneSocket",
+        }
+
+    if module_id == "winchable_cargo_everywhere":
+        looks_like_cargo_model = ("<games" not in lower) and bool(
+            re.search(r"<GameData\b[^>]*(LoadType|PackSlotsNumber|LoadAddons)=", source, flags=re.IGNORECASE)
+        )
+        crane_positions = [str(match.group("pos") or "").strip() for match in _INITIAL_PAK_CRANE_SOCKET_TAG_RE.finditer(source)]
+        if (not looks_like_cargo_model) or (not crane_positions):
+            return {"eligible": False, "target_positions": [], "missing_positions": []}
+        existing_targets = {
+            _initial_pak_normalize_socket_pos(match.group("pos"))
+            for match in _INITIAL_PAK_WINCH_SOCKET_TAG_RE.finditer(source)
+        }
+        missing_positions = []
+        for pos in crane_positions:
+            pos_key = _initial_pak_normalize_socket_pos(pos)
+            if pos_key not in existing_targets:
+                missing_positions.append(pos)
+        return {
+            "eligible": True,
+            "target_positions": crane_positions,
+            "missing_positions": missing_positions,
+            "source_tag": "CraneSocket",
+            "target_tag": "WinchSocket",
+        }
+
+    raise ValueError(f"Unsupported initial.pak toggle module: {module_id}")
+
+
+def _initial_pak_add_missing_game_data_sockets(text: str, source_tag: str, target_tag: str) -> Tuple[str, int]:
+    source = str(text or "")
+    newline = "\r\n" if "\r\n" in source else "\n"
+    if source_tag == "LoadPoint":
+        source_re = _INITIAL_PAK_LOAD_POINT_TAG_RE
+    elif source_tag == "CraneSocket":
+        source_re = _INITIAL_PAK_CRANE_SOCKET_TAG_RE
+    else:
+        raise ValueError(f"Unsupported source socket tag: {source_tag}")
+
+    if target_tag == "CraneSocket":
+        target_re = _INITIAL_PAK_CRANE_SOCKET_TAG_RE
+    elif target_tag == "WinchSocket":
+        target_re = _INITIAL_PAK_WINCH_SOCKET_TAG_RE
+    else:
+        raise ValueError(f"Unsupported target socket tag: {target_tag}")
+
+    added_count = 0
+
+    def _replace_block(match):
+        nonlocal added_count
+        body = str(match.group("body") or "")
+        source_matches = list(source_re.finditer(body))
+        if not source_matches:
+            return match.group(0)
+
+        existing_positions = {
+            _initial_pak_normalize_socket_pos(found.group("pos"))
+            for found in target_re.finditer(body)
+        }
+        lines_to_add = []
+        for source_match in source_matches:
+            raw_pos = str(source_match.group("pos") or "").strip()
+            if not raw_pos:
+                continue
+            pos_key = _initial_pak_normalize_socket_pos(raw_pos)
+            if pos_key in existing_positions:
+                continue
+            existing_positions.add(pos_key)
+            indent = str(source_match.group("indent") or "")
+            if not indent:
+                indent = "\t\t"
+            lines_to_add.append(f"{indent}<{target_tag} Pos=\"{raw_pos}\" />")
+            added_count += 1
+
+        if not lines_to_add:
+            return match.group(0)
+
+        updated_body = body
+        if updated_body and not updated_body.endswith(("\n", "\r")):
+            updated_body += newline
+        updated_body += newline.join(lines_to_add)
+        if not updated_body.endswith(("\n", "\r")):
+            updated_body += newline
+        return f"{match.group('open')}{updated_body}{match.group('close')}"
+
+    updated_text = _INITIAL_PAK_GAMEDATA_BLOCK_RE.sub(_replace_block, source, count=1)
+    return updated_text, added_count
+
+
+def _initial_pak_get_boolean_attr_module_spec(module_id: str) -> Dict[str, Any]:
+    key = str(module_id or "").strip()
+    spec = _INITIAL_PAK_BOOLEAN_ATTR_MODULE_SPECS.get(key)
+    if spec is None:
+        raise ValueError(f"Unsupported initial.pak boolean attribute module: {module_id}")
+    return dict(spec)
+
+
+def _initial_pak_boolean_attr_entry_names(zip_handle, module_id: str) -> List[str]:
+    spec = _initial_pak_get_boolean_attr_module_spec(module_id)
+    return _initial_pak_list_entry_names_for_spec(zip_handle, spec)
+
+
+def _initial_pak_analyze_boolean_attr_module(pak_path: str, module_id: str) -> Dict[str, Any]:
+    spec = _initial_pak_get_boolean_attr_module_spec(module_id)
+    tag_names = spec.get("tag_names", spec.get("tag_name"))
+    attr_name = str(spec.get("attr_name") or "")
+    pak = _initial_pak_resolve_path(pak_path)
+    result = {
+        "path": pak,
+        "module_id": str(module_id or "").strip(),
+        "attribute": attr_name,
+        "file_count": 0,
+        "target_count": 0,
+        "true_count": 0,
+        "false_count": 0,
+        "missing_count": 0,
+        "other_count": 0,
+        "state": "missing",
+    }
+    if not pak or not os.path.isfile(pak):
+        return result
+
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        entry_names = _initial_pak_boolean_attr_entry_names(current_zip, module_id)
+        file_count = 0
+        for entry_name in entry_names:
+            current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+            values = _initial_pak_extract_tag_attr_values(current_text, tag_names, attr_name)
+            if not values:
+                continue
+            file_count += 1
+            result["target_count"] += len(values)
+            for item in values:
+                if not bool(item.get("has_attr")):
+                    result["missing_count"] += 1
+                    continue
+                value = str(item.get("raw") or "").strip().lower()
+                if value == "true":
+                    result["true_count"] += 1
+                elif value == "false":
+                    result["false_count"] += 1
+                else:
+                    result["other_count"] += 1
+        result["file_count"] = file_count
+
+    target_count = int(result.get("target_count") or 0)
+    true_count = int(result.get("true_count") or 0)
+    false_count = int(result.get("false_count") or 0)
+    missing_count = int(result.get("missing_count") or 0)
+    other_count = int(result.get("other_count") or 0)
+    if target_count <= 0:
+        result["state"] = "empty"
+    elif true_count == target_count:
+        result["state"] = "enabled"
+    elif false_count == target_count:
+        result["state"] = "disabled"
+    elif true_count <= 0 and other_count <= 0:
+        result["state"] = "default"
+    else:
+        result["state"] = "mixed"
+    return result
+
+
+def _initial_pak_apply_boolean_attr_module(pak_path: str, module_id: str, mode: str) -> Dict[str, Any]:
+    target_mode = str(mode or "").strip().lower()
+    if target_mode not in {"on", "off", "default"}:
+        raise ValueError(f"Unsupported initial.pak toggle mode: {mode}")
+
+    spec = _initial_pak_get_boolean_attr_module_spec(module_id)
+    tag_names = spec.get("tag_names", spec.get("tag_name"))
+    attr_name = str(spec.get("attr_name") or "")
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    if target_mode == "default":
+        backup = _initial_pak_get_backup_info(pak)
+        backup_file = str(backup.get("file_path") or "").strip()
+        if not backup_file or not os.path.isfile(backup_file):
+            result = _initial_pak_analyze_boolean_attr_module(pak, module_id)
+            result.update(
+                {
+                    "requested_mode": target_mode,
+                    "created_backup": False,
+                    "no_backup": True,
+                    "changed_files": 0,
+                    "changed_values": 0,
+                    "missing_defaults": [],
+                    "unmatched_defaults": [],
+                    "updated_entries": 0,
+                }
+            )
+            return result
+
+        replacements = {}
+        changed_files = 0
+        changed_values = 0
+        missing_defaults = []
+        unmatched_defaults = []
+        with zipfile.ZipFile(pak, "r") as current_zip, zipfile.ZipFile(backup_file, "r") as backup_zip:
+            backup_names = set(backup_zip.namelist())
+            for entry_name in _initial_pak_boolean_attr_entry_names(current_zip, module_id):
+                current_raw = current_zip.read(entry_name)
+                current_text, current_encoding = _initial_pak_decode_text(current_raw)
+                if not _initial_pak_extract_tag_attr_values(current_text, tag_names, attr_name):
+                    continue
+                if entry_name not in backup_names:
+                    missing_defaults.append(entry_name)
+                    continue
+                backup_text, _backup_encoding = _initial_pak_decode_text(backup_zip.read(entry_name))
+                updated_text, changed_count, unmatched = _initial_pak_restore_tag_attr_values_from_backup(
+                    current_text,
+                    backup_text,
+                    tag_names,
+                    attr_name,
+                )
+                if unmatched:
+                    unmatched_defaults.append(entry_name)
+                if changed_count <= 0 or updated_text == current_text:
+                    continue
+                replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+                changed_files += 1
+                changed_values += changed_count
+
+        if replacements:
+            _initial_pak_replace_zip_entries(pak, replacements)
+
+        result = _initial_pak_analyze_boolean_attr_module(pak, module_id)
+        result.update(
+            {
+                "requested_mode": target_mode,
+                "created_backup": False,
+                "no_backup": False,
+                "changed_files": changed_files,
+                "changed_values": changed_values,
+                "missing_defaults": missing_defaults,
+                "unmatched_defaults": unmatched_defaults,
+                "updated_entries": len(replacements),
+            }
+        )
+        return result
+
+    created_backup = False
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+    if not backup_file or not os.path.isfile(backup_file):
+        backup = _initial_pak_create_backup(pak, replace_existing=False)
+        created_backup = bool(backup.get("created"))
+
+    desired_value = "true" if target_mode == "on" else "false"
+    replacements = {}
+    changed_files = 0
+    changed_values = 0
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        for entry_name in _initial_pak_boolean_attr_entry_names(current_zip, module_id):
+            current_raw = current_zip.read(entry_name)
+            current_text, current_encoding = _initial_pak_decode_text(current_raw)
+            if not _initial_pak_extract_tag_attr_values(current_text, tag_names, attr_name):
+                continue
+
+            def _set_attr(_index: int, current_attr: str, _has_attr: bool):
+                return None if str(current_attr or "").strip().lower() == desired_value else desired_value
+
+            updated_text, changed_count = _initial_pak_replace_tag_attr_values(
+                current_text,
+                tag_names,
+                attr_name,
+                _set_attr,
+            )
+            if changed_count <= 0 or updated_text == current_text:
+                continue
+            replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+            changed_files += 1
+            changed_values += changed_count
+
+    if replacements:
+        _initial_pak_replace_zip_entries(pak, replacements)
+
+    result = _initial_pak_analyze_boolean_attr_module(pak, module_id)
+    result.update(
+        {
+            "requested_mode": target_mode,
+            "created_backup": created_backup,
+            "no_backup": False,
+            "changed_files": changed_files,
+            "changed_values": changed_values,
+            "missing_defaults": [],
+            "unmatched_defaults": [],
+            "updated_entries": len(replacements),
+        }
+    )
+    return result
+
+
+def _initial_pak_country_code_set(raw_value: Any) -> set:
+    return {
+        str(part or "").strip().upper()
+        for part in str(raw_value or "").split(",")
+        if str(part or "").strip()
+    }
+
+
+def _initial_pak_country_value_has_all_stores(raw_value: Any) -> bool:
+    codes = _initial_pak_country_code_set(raw_value)
+    return all(code in codes for code in _INITIAL_PAK_ALL_STORE_COUNTRY_CODES)
+
+
+def _initial_pak_analyze_truck_store_everywhere_module(pak_path: str) -> Dict[str, Any]:
+    pak = _initial_pak_resolve_path(pak_path)
+    result = {
+        "path": pak,
+        "module_id": "truck_store_everywhere",
+        "attribute": "Country",
+        "file_count": 0,
+        "target_count": 0,
+        "enabled_count": 0,
+        "missing_count": 0,
+        "state": "missing",
+    }
+    if not pak or not os.path.isfile(pak):
+        return result
+
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        file_count = 0
+        for entry_name in _initial_pak_list_direct_truck_entry_names(current_zip):
+            current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+            values = _initial_pak_extract_tag_attr_values(current_text, "GameData", "Country")
+            targets = [item for item in values if bool(item.get("has_attr"))]
+            if not values:
+                continue
+            if targets:
+                file_count += 1
+            result["target_count"] += len(targets)
+            result["missing_count"] += len(values) - len(targets)
+            for item in targets:
+                if _initial_pak_country_value_has_all_stores(item.get("raw")):
+                    result["enabled_count"] += 1
+        result["file_count"] = file_count
+
+    target_count = int(result.get("target_count") or 0)
+    enabled_count = int(result.get("enabled_count") or 0)
+    if target_count <= 0:
+        result["state"] = "empty"
+    elif enabled_count == target_count:
+        result["state"] = "enabled"
+    elif enabled_count <= 0:
+        result["state"] = "default"
+    else:
+        result["state"] = "mixed"
+    return result
+
+
+def _initial_pak_apply_truck_store_everywhere_module(pak_path: str, mode: str) -> Dict[str, Any]:
+    target_mode = str(mode or "").strip().lower()
+    if target_mode not in {"on", "off", "default"}:
+        raise ValueError(f"Unsupported initial.pak toggle mode: {mode}")
+
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    if target_mode in {"off", "default"}:
+        backup = _initial_pak_get_backup_info(pak)
+        backup_file = str(backup.get("file_path") or "").strip()
+        if not backup_file or not os.path.isfile(backup_file):
+            result = _initial_pak_analyze_truck_store_everywhere_module(pak)
+            result.update(
+                {
+                    "requested_mode": target_mode,
+                    "created_backup": False,
+                    "no_backup": True,
+                    "changed_files": 0,
+                    "changed_values": 0,
+                    "missing_defaults": [],
+                    "unmatched_defaults": [],
+                    "updated_entries": 0,
+                }
+            )
+            return result
+
+        replacements = {}
+        changed_files = 0
+        changed_values = 0
+        missing_defaults = []
+        unmatched_defaults = []
+        with zipfile.ZipFile(pak, "r") as current_zip, zipfile.ZipFile(backup_file, "r") as backup_zip:
+            backup_names = set(backup_zip.namelist())
+            for entry_name in _initial_pak_list_direct_truck_entry_names(current_zip):
+                current_raw = current_zip.read(entry_name)
+                current_text, current_encoding = _initial_pak_decode_text(current_raw)
+                if not _initial_pak_extract_tag_attr_values(current_text, "GameData", "Country"):
+                    continue
+                if entry_name not in backup_names:
+                    missing_defaults.append(entry_name)
+                    continue
+                backup_text, _backup_encoding = _initial_pak_decode_text(backup_zip.read(entry_name))
+                updated_text, changed_count, unmatched = _initial_pak_restore_tag_attr_values_from_backup(
+                    current_text,
+                    backup_text,
+                    "GameData",
+                    "Country",
+                )
+                if unmatched:
+                    unmatched_defaults.append(entry_name)
+                if changed_count <= 0 or updated_text == current_text:
+                    continue
+                replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+                changed_files += 1
+                changed_values += changed_count
+
+        if replacements:
+            _initial_pak_replace_zip_entries(pak, replacements)
+
+        result = _initial_pak_analyze_truck_store_everywhere_module(pak)
+        result.update(
+            {
+                "requested_mode": target_mode,
+                "created_backup": False,
+                "no_backup": False,
+                "changed_files": changed_files,
+                "changed_values": changed_values,
+                "missing_defaults": missing_defaults,
+                "unmatched_defaults": unmatched_defaults,
+                "updated_entries": len(replacements),
+            }
+        )
+        return result
+
+    created_backup = False
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+    if not backup_file or not os.path.isfile(backup_file):
+        backup = _initial_pak_create_backup(pak, replace_existing=False)
+        created_backup = bool(backup.get("created"))
+
+    replacements = {}
+    changed_files = 0
+    changed_values = 0
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        for entry_name in _initial_pak_list_direct_truck_entry_names(current_zip):
+            current_raw = current_zip.read(entry_name)
+            current_text, current_encoding = _initial_pak_decode_text(current_raw)
+            values = _initial_pak_extract_tag_attr_values(current_text, "GameData", "Country")
+            if not any(bool(item.get("has_attr")) for item in values):
+                continue
+
+            def _set_country(_index: int, current_attr: str, has_attr: bool):
+                if not has_attr:
+                    return None
+                return None if _initial_pak_country_value_has_all_stores(current_attr) else _INITIAL_PAK_ALL_STORE_COUNTRIES
+
+            updated_text, changed_count = _initial_pak_replace_tag_attr_values(
+                current_text,
+                "GameData",
+                "Country",
+                _set_country,
+            )
+            if changed_count <= 0 or updated_text == current_text:
+                continue
+            replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+            changed_files += 1
+            changed_values += changed_count
+
+    if replacements:
+        _initial_pak_replace_zip_entries(pak, replacements)
+
+    result = _initial_pak_analyze_truck_store_everywhere_module(pak)
+    result.update(
+        {
+            "requested_mode": target_mode,
+            "created_backup": created_backup,
+            "no_backup": False,
+            "changed_files": changed_files,
+            "changed_values": changed_values,
+            "missing_defaults": [],
+            "unmatched_defaults": [],
+            "updated_entries": len(replacements),
+        }
+    )
+    return result
+
+
+def _initial_pak_analyze_toggle_module(pak_path: str, module_id: str) -> Dict[str, Any]:
+    if str(module_id or "").strip() in _INITIAL_PAK_BOOLEAN_ATTR_MODULE_SPECS:
+        return _initial_pak_analyze_boolean_attr_module(pak_path, module_id)
+    if str(module_id or "").strip() == "truck_store_everywhere":
+        return _initial_pak_analyze_truck_store_everywhere_module(pak_path)
+
+    pak = _initial_pak_resolve_path(pak_path)
+    result = {
+        "path": pak,
+        "module_id": str(module_id or "").strip(),
+        "file_count": 0,
+        "target_count": 0,
+        "missing_count": 0,
+        "state": "missing",
+    }
+    if not pak or not os.path.isfile(pak):
+        return result
+
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        entry_names = _initial_pak_list_entry_names_for_segment(current_zip, "classes/models/")
+        result["file_count"] = len(entry_names)
+        eligible_files = 0
+        target_count = 0
+        missing_count = 0
+        for entry_name in entry_names:
+            current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+            snapshot = _initial_pak_collect_toggle_targets(current_text, module_id)
+            if not snapshot.get("eligible"):
+                continue
+            eligible_files += 1
+            target_count += len(snapshot.get("target_positions") or [])
+            missing_count += len(snapshot.get("missing_positions") or [])
+
+        result["file_count"] = eligible_files
+        result["target_count"] = target_count
+        result["missing_count"] = missing_count
+        if eligible_files <= 0 or target_count <= 0:
+            result["state"] = "empty"
+        elif missing_count <= 0:
+            result["state"] = "enabled"
+        elif missing_count >= target_count:
+            result["state"] = "default"
+        else:
+            result["state"] = "mixed"
+        return result
+
+
+def _initial_pak_apply_toggle_module(pak_path: str, module_id: str, mode: str) -> Dict[str, Any]:
+    target_mode = str(mode or "").strip().lower()
+    if target_mode not in {"on", "off", "default"}:
+        raise ValueError(f"Unsupported initial.pak toggle mode: {mode}")
+
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    if str(module_id or "").strip() in _INITIAL_PAK_BOOLEAN_ATTR_MODULE_SPECS:
+        return _initial_pak_apply_boolean_attr_module(pak, module_id, target_mode)
+
+    if str(module_id or "").strip() == "truck_store_everywhere":
+        return _initial_pak_apply_truck_store_everywhere_module(pak, target_mode)
+
+    if module_id == "camera_collisions":
+        if target_mode == "default":
+            backup = _initial_pak_get_backup_info(pak)
+            backup_file = str(backup.get("file_path") or "").strip()
+            if not backup_file or not os.path.isfile(backup_file):
+                result = _initial_pak_analyze_toggle_module(pak, module_id)
+                result.update(
+                    {
+                        "requested_mode": target_mode,
+                        "created_backup": False,
+                        "no_backup": True,
+                        "changed_files": 0,
+                        "changed_values": 0,
+                        "missing_defaults": [],
+                        "updated_entries": 0,
+                    }
+                )
+                return result
+            replacements = {}
+            changed_files = 0
+            changed_values = 0
+            missing_defaults = []
+            with zipfile.ZipFile(pak, "r") as current_zip, zipfile.ZipFile(backup_file, "r") as backup_zip:
+                for entry_name in _initial_pak_list_entry_names_for_segment(current_zip, "classes/models/"):
+                    current_raw = current_zip.read(entry_name)
+                    current_text, current_encoding = _initial_pak_decode_text(current_raw)
+                    snapshot = _initial_pak_collect_toggle_targets(current_text, module_id)
+                    if not snapshot.get("eligible"):
+                        continue
+                    try:
+                        backup_raw = backup_zip.read(entry_name)
+                    except KeyError:
+                        missing_defaults.append(entry_name)
+                        continue
+                    backup_text, _backup_encoding = _initial_pak_decode_text(backup_raw)
+                    updated_text, restored_count = _initial_pak_restore_model_clip_camera_from_backup(current_text, backup_text)
+                    if restored_count <= 0 or updated_text == current_text:
+                        continue
+                    replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+                    changed_files += 1
+                    changed_values += restored_count
+            if replacements:
+                _initial_pak_replace_zip_entries(pak, replacements)
+            result = _initial_pak_analyze_toggle_module(pak, module_id)
+            result.update(
+                {
+                    "requested_mode": target_mode,
+                    "created_backup": False,
+                    "no_backup": False,
+                    "changed_files": changed_files,
+                    "changed_values": changed_values,
+                    "missing_defaults": missing_defaults,
+                    "updated_entries": len(replacements),
+                }
+            )
+            return result
+
+        created_backup = False
+        backup = _initial_pak_get_backup_info(pak)
+        backup_file = str(backup.get("file_path") or "").strip()
+        if not backup_file or not os.path.isfile(backup_file):
+            backup = _initial_pak_create_backup(pak, replace_existing=False)
+            created_backup = bool(backup.get("created"))
+
+        desired_clip_value = "true" if target_mode == "on" else "false"
+        replacements = {}
+        changed_files = 0
+        changed_values = 0
+        with zipfile.ZipFile(pak, "r") as current_zip:
+            for entry_name in _initial_pak_list_entry_names_for_segment(current_zip, "classes/models/"):
+                current_raw = current_zip.read(entry_name)
+                current_text, current_encoding = _initial_pak_decode_text(current_raw)
+                snapshot = _initial_pak_collect_toggle_targets(current_text, module_id)
+                if not snapshot.get("eligible"):
+                    continue
+                updated_text, changed_count = _initial_pak_set_model_clip_camera_value(current_text, desired_clip_value)
+                if changed_count <= 0 or updated_text == current_text:
+                    continue
+                replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+                changed_files += 1
+                changed_values += changed_count
+
+        if replacements:
+            _initial_pak_replace_zip_entries(pak, replacements)
+
+        result = _initial_pak_analyze_toggle_module(pak, module_id)
+        result.update(
+            {
+                "requested_mode": target_mode,
+                "created_backup": created_backup,
+                "no_backup": False,
+                "changed_files": changed_files,
+                "changed_values": changed_values,
+                "missing_defaults": [],
+                "updated_entries": len(replacements),
+            }
+        )
+        return result
+
+    if target_mode in {"off", "default"}:
+        backup = _initial_pak_get_backup_info(pak)
+        backup_file = str(backup.get("file_path") or "").strip()
+        if not backup_file or not os.path.isfile(backup_file):
+            result = _initial_pak_analyze_toggle_module(pak, module_id)
+            result.update(
+                {
+                    "requested_mode": target_mode,
+                    "created_backup": False,
+                    "no_backup": True,
+                    "changed_files": 0,
+                    "changed_values": 0,
+                    "missing_defaults": [],
+                    "updated_entries": 0,
+                }
+            )
+            return result
+        with zipfile.ZipFile(pak, "r") as current_zip:
+            entry_names = []
+            for entry_name in _initial_pak_list_entry_names_for_segment(current_zip, "classes/models/"):
+                current_text, _enc = _initial_pak_decode_text(current_zip.read(entry_name))
+                snapshot = _initial_pak_collect_toggle_targets(current_text, module_id)
+                if snapshot.get("eligible"):
+                    entry_names.append(entry_name)
+        restore_result = _initial_pak_restore_entries_from_backup(pak, entry_names)
+        result = _initial_pak_analyze_toggle_module(pak, module_id)
+        result.update(
+            {
+                "requested_mode": target_mode,
+                "created_backup": False,
+                "no_backup": False,
+                "changed_files": int(restore_result.get("changed_files") or 0),
+                "changed_values": int(restore_result.get("changed_files") or 0),
+                "missing_defaults": list(restore_result.get("missing_defaults") or []),
+                "updated_entries": int(restore_result.get("updated_entries") or 0),
+            }
+        )
+        return result
+
+    created_backup = False
+    backup = _initial_pak_get_backup_info(pak)
+    backup_file = str(backup.get("file_path") or "").strip()
+    if not backup_file or not os.path.isfile(backup_file):
+        backup = _initial_pak_create_backup(pak, replace_existing=False)
+        created_backup = bool(backup.get("created"))
+
+    replacements = {}
+    changed_files = 0
+    changed_values = 0
+    with zipfile.ZipFile(pak, "r") as current_zip:
+        for entry_name in _initial_pak_list_entry_names_for_segment(current_zip, "classes/models/"):
+            current_raw = current_zip.read(entry_name)
+            current_text, current_encoding = _initial_pak_decode_text(current_raw)
+            snapshot = _initial_pak_collect_toggle_targets(current_text, module_id)
+            if not snapshot.get("eligible"):
+                continue
+            if module_id == "camera_collisions":
+                updated_text, added_count = _initial_pak_set_model_clip_camera_false(current_text)
+            else:
+                source_tag = str(snapshot.get("source_tag") or "").strip()
+                target_tag = str(snapshot.get("target_tag") or "").strip()
+                updated_text, added_count = _initial_pak_add_missing_game_data_sockets(current_text, source_tag, target_tag)
+            if added_count <= 0 or updated_text == current_text:
+                continue
+            replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+            changed_files += 1
+            changed_values += added_count
+
+    if replacements:
+        _initial_pak_replace_zip_entries(pak, replacements)
+
+    result = _initial_pak_analyze_toggle_module(pak, module_id)
+    result.update(
+        {
+            "requested_mode": target_mode,
+            "created_backup": created_backup,
+            "no_backup": False,
+            "changed_files": changed_files,
+            "changed_values": changed_values,
+            "missing_defaults": [],
+            "updated_entries": len(replacements),
+        }
+    )
+    return result
+
+
+def _initial_pak_apply_winch_mode(pak_path: str, mode: str) -> Dict[str, Any]:
+    target_mode = str(mode or "").strip().lower()
+    if target_mode not in {"autonomous", "engine", "default"}:
+        raise ValueError(f"Unsupported winch mode: {mode}")
+
+    pak = _initial_pak_resolve_path(pak_path)
+    if not pak or not os.path.isfile(pak):
+        raise FileNotFoundError("initial.pak was not found.")
+
+    replacements = {}
+    changed_files = 0
+    changed_values = 0
+    missing_defaults = []
+    unmatched_defaults = []
+
+    if target_mode == "default":
+        backup = _initial_pak_get_backup_info(pak)
+        backup_file = str(backup.get("file_path") or "").strip()
+        if not backup_file or not os.path.isfile(backup_file):
+            raise FileNotFoundError("No initial.pak backup exists yet for restoring defaults.")
+
+        with zipfile.ZipFile(pak, "r") as current_zip, zipfile.ZipFile(backup_file, "r") as backup_zip:
+            backup_names = set(backup_zip.namelist())
+            for entry_name in _initial_pak_target_entry_names(current_zip):
+                if entry_name not in backup_names:
+                    missing_defaults.append(entry_name)
+                    continue
+                current_raw = current_zip.read(entry_name)
+                backup_raw = backup_zip.read(entry_name)
+                current_text, current_encoding = _initial_pak_decode_text(current_raw)
+                backup_text, _backup_encoding = _initial_pak_decode_text(backup_raw)
+                if not _initial_pak_extract_winch_flags(current_text):
+                    continue
+                default_flags = _initial_pak_build_winch_flag_map(backup_text)
+                if not default_flags:
+                    missing_defaults.append(entry_name)
+                    continue
+
+                file_changed = False
+
+                def _restore_flag(match):
+                    nonlocal changed_values, file_changed
+                    key = str(match.group("name") or "").strip().casefold()
+                    default_flag = str(default_flags.get(key) or "").strip().lower()
+                    if default_flag not in {"true", "false"}:
+                        unmatched_defaults.append(f"{entry_name}:{match.group('name')}")
+                        return match.group(0)
+                    current_flag = str(match.group("flag") or "").strip().lower()
+                    if current_flag != default_flag:
+                        file_changed = True
+                        changed_values += 1
+                    return f"{match.group('before')}{default_flag}{match.group('after')}"
+
+                updated_text = _INITIAL_PAK_WINCH_TAG_RE.sub(_restore_flag, current_text)
+                if file_changed:
+                    replacements[entry_name] = _initial_pak_encode_text(updated_text, current_encoding)
+                    changed_files += 1
+    else:
+        target_flag = "false" if target_mode == "autonomous" else "true"
+        with zipfile.ZipFile(pak, "r") as zf:
+            for entry_name in _initial_pak_target_entry_names(zf):
+                raw_bytes = zf.read(entry_name)
+                text, encoding = _initial_pak_decode_text(raw_bytes)
+                file_changed = False
+
+                def _set_flag(match):
+                    nonlocal changed_values, file_changed
+                    current_flag = str(match.group("flag") or "").strip().lower()
+                    if current_flag != target_flag:
+                        file_changed = True
+                        changed_values += 1
+                    return f"{match.group('before')}{target_flag}{match.group('after')}"
+
+                updated_text = _INITIAL_PAK_WINCH_TAG_RE.sub(_set_flag, text)
+                if file_changed:
+                    replacements[entry_name] = _initial_pak_encode_text(updated_text, encoding)
+                    changed_files += 1
+
+    if replacements:
+        _initial_pak_replace_zip_entries(pak, replacements)
+
+    result = _initial_pak_analyze_winches(pak)
+    result.update(
+        {
+            "path": pak,
+            "requested_mode": target_mode,
+            "changed_files": changed_files,
+            "changed_values": changed_values,
+            "missing_defaults": missing_defaults,
+            "unmatched_defaults": unmatched_defaults,
+            "updated_entries": len(replacements),
+        }
+    )
+    return result
+
+
+def _initial_pak_analyze_winch_multiplier(pak_path: str, attr_name: str) -> Dict[str, Any]:
+    key = str(attr_name or "").strip()
+    module_id = _INITIAL_PAK_WINCH_NUMERIC_MODULE_IDS.get(key)
+    if not module_id:
+        raise ValueError(f"Unsupported winch numeric attribute: {attr_name}")
+    result = _initial_pak_analyze_numeric_module(pak_path, module_id)
+    result["attribute"] = key
+    return result
+
+
+def _initial_pak_apply_winch_multiplier(pak_path: str, attr_name: str, multiplier: Any) -> Dict[str, Any]:
+    key = str(attr_name or "").strip()
+    module_id = _INITIAL_PAK_WINCH_NUMERIC_MODULE_IDS.get(key)
+    if not module_id:
+        raise ValueError(f"Unsupported winch numeric attribute: {attr_name}")
+    result = _initial_pak_apply_numeric_module(pak_path, module_id, multiplier)
+    result["attribute"] = key
+    return result
+
+
+# -----------------------------------------------------------------------------
+# END SECTION: initial.pak Mods Helpers
+# -----------------------------------------------------------------------------
 
 
 class _ObjectivesLocalSsoParser:
@@ -9649,6 +13493,10 @@ def _objectives_invalidate_runtime_caches() -> None:
     except Exception:
         pass
     try:
+        _cargo_loading_invalidate_runtime_caches()
+    except Exception:
+        pass
+    try:
         _vehicle_invalidate_metadata_caches(clear_disk=True)
     except Exception:
         pass
@@ -10015,6 +13863,83 @@ def _objectives_fallback_get_source(
     }
 
 
+def _objectives_local_source_validation_issues(
+    info: Dict[str, Any],
+    *,
+    allow_download: bool = True,
+) -> List[str]:
+    rows = info.get("rows") if isinstance(info, dict) else []
+    if not isinstance(rows, list) or not rows:
+        return []
+
+    kinds: Set[str] = set()
+    regions: Set[str] = set()
+    unresolved_names = 0
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_kind = str(
+            row.get("source")
+            or row.get("kind")
+            or row.get("objective_kind")
+            or row.get("type")
+            or ""
+        ).strip().upper()
+        kind = {
+            "TASKS": "TASK",
+            "TASK": "TASK",
+            "CONTRACTS": "CONTRACT",
+            "CONTRACT": "CONTRACT",
+            "CONTESTS": "CONTEST",
+            "CONTEST": "CONTEST",
+        }.get(raw_kind, "")
+        if kind:
+            kinds.add(kind)
+        region = str(row.get("region") or row.get("region_name") or "").strip().upper()
+        if region:
+            regions.add(region)
+
+        key = str(row.get("key") or row.get("id") or "").strip()
+        display = _objectives_local_clean_text(row.get("displayname") or row.get("name") or key)
+        if (not display) or _objectives_local_is_probably_token(display):
+            unresolved_names += 1
+            continue
+        if key and display == _objectives_local_humanize_identifier(key):
+            unresolved_names += 1
+
+    row_count = max(1, len(rows))
+    unresolved_ratio = unresolved_names / float(row_count)
+    issues: List[str] = []
+
+    missing_kinds = [kind for kind in ("TASK", "CONTRACT") if kind not in kinds]
+    if missing_kinds:
+        issues.append(f"missing core objective categories ({', '.join(missing_kinds)})")
+
+    core_regions = {str(code).strip().upper() for code, _ in BASE_MAPS}
+    missing_regions = sorted(core_regions - regions)
+    if len(missing_regions) >= 2:
+        issues.append(f"missing core regions ({', '.join(missing_regions[:3])})")
+
+    if len(rows) >= 40 and unresolved_ratio >= 0.35:
+        issues.append(f"{int(round(unresolved_ratio * 100.0))}% of objective names were unresolved")
+
+    manifest_count = 0
+    try:
+        manifest_info = _objectives_fallback_get_manifest(force_refresh=False, allow_download=allow_download)
+        manifest = manifest_info.get("manifest") if isinstance(manifest_info, dict) else {}
+        manifest_count = _parse_nonnegative_int((manifest or {}).get("definition_count"), 0)
+    except Exception:
+        manifest_count = 0
+
+    if manifest_count:
+        minimum_reasonable_rows = max(180, int(manifest_count * 0.30))
+        if (len(rows) < minimum_reasonable_rows) and (issues or unresolved_ratio >= 0.20):
+            issues.append(f"only {len(rows)} rows loaded vs {manifest_count} fallback definitions")
+
+    return issues
+
+
 def _objectives_get_preferred_source(
     force_reload: bool = False,
     language: Optional[str] = None,
@@ -10027,14 +13952,18 @@ def _objectives_get_preferred_source(
         except Exception:
             prefer_fallback = False
 
-    loaders = [
-        ("fallback", lambda: _objectives_fallback_get_source(force_reload=force_reload, language=language, allow_download=allow_download)),
-        ("local", lambda: _objectives_local_get_source(force_reload=force_reload, language=language)),
-    ]
-    if not prefer_fallback:
-        loaders.reverse()
+    if prefer_fallback:
+        loaders = [
+            ("fallback", lambda: _objectives_fallback_get_source(force_reload=force_reload, language=language, allow_download=allow_download)),
+        ]
+    else:
+        loaders = [
+            ("local", lambda: _objectives_local_get_source(force_reload=force_reload, language=language)),
+            ("fallback", lambda: _objectives_fallback_get_source(force_reload=force_reload, language=language, allow_download=allow_download)),
+        ]
 
     errors = []
+    deferred_local_result = None
     for kind, loader in loaders:
         try:
             info = loader() or {}
@@ -10044,10 +13973,24 @@ def _objectives_get_preferred_source(
         if isinstance(rows, list) and rows:
             result = dict(info)
             result["kind"] = kind
+            if kind == "local":
+                validation_issues = _objectives_local_source_validation_issues(
+                    result,
+                    allow_download=allow_download,
+                )
+                if validation_issues:
+                    issue_text = "; ".join(validation_issues)
+                    result["validation_warning"] = issue_text
+                    deferred_local_result = result
+                    errors.append(f"local: suspected partial initial.pak parse ({issue_text})")
+                    continue
             return result
         err = str(info.get("error") or "").strip() if isinstance(info, dict) else ""
         if err:
             errors.append(f"{kind}: {err}")
+
+    if isinstance(deferred_local_result, dict) and deferred_local_result.get("rows"):
+        return deferred_local_result
 
     return {
         "kind": "",
@@ -10098,6 +14041,648 @@ _EDITOR_TRANSLATION_RAW_TREEVIEW_HEADING = ttk.Treeview.heading
 _EDITOR_TRANSLATION_RAW_TREEVIEW_INSERT = ttk.Treeview.insert
 _EDITOR_TRANSLATION_RAW_TREEVIEW_ITEM = ttk.Treeview.item
 _EDITOR_TRANSLATION_COMBOBOX_VARS: Dict[str, Dict[str, Any]] = {}
+_EDITOR_TRANSLATION_SUPPLEMENT_COMMON = {
+    "brazilian_portuguese": {
+        "Add Cargo to Zone": "Adicionar carga à zona",
+        "Cargo Loading": "Carregamento de carga",
+        "Cargo loading is already in progress.": "O carregamento de carga já está em andamento.",
+        "Could not load remembered save: {error_text}": "Não foi possível carregar o salvamento lembrado: {error_text}",
+        "Count": "Quantidade",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "A quantidade não pode ser negativa aqui. Entradas ilimitadas permanecem em -1.",
+        "Count must be a whole number.": "A quantidade deve ser um número inteiro.",
+        "Create Backup": "Criar backup",
+        "Failed to delete selected cargo entries.": "Falha ao excluir as entradas de carga selecionadas.",
+        "Hide unlimited": "Ocultar ilimitados",
+        "'objectiveStates' not found in save file.": "'objectiveStates' não foi encontrado no arquivo de salvamento.",
+        "Lift Selected (+Y)": "Elevar selecionados (+Y)",
+        "Loading remembered save...": "Carregando salvamento lembrado...",
+        "No editable cargo transform found in the selected rows.": "Nenhuma transformação de carga editável encontrada nas linhas selecionadas.",
+        "No cargo selected.": "Nenhuma carga selecionada.",
+        "No matching missions found.": "Nenhuma missão correspondente encontrada.",
+        "No new contests were modified.": "Nenhuma nova competição foi modificada.",
+        "No upgradesGiverData found in file.": "Nenhum upgradesGiverData encontrado no arquivo.",
+        "No watchPointsData found in file.": "Nenhum watchPointsData encontrado no arquivo.",
+        "persistentProfileData not found in save file.": "persistentProfileData não encontrado no arquivo de salvamento.",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "Exportações PS4 usam os mesmos nomes de arquivo, mas sem .cfg/.dat (exemplo: CompleteSave, CompleteSave1). Use Procurar... para escolher o arquivo diretamente.",
+        "Remembered save not found: {path}": "Salvamento lembrado não encontrado: {path}",
+        "Saved cargo loading counts to file.": "Quantidades de carregamento de carga salvas no arquivo.",
+        "Select a cargo entry first.": "Selecione uma entrada de carga primeiro.",
+        "Select a cargo type to add.": "Selecione um tipo de carga para adicionar.",
+        "Selected cargo does not have isolated world transforms to edit.": "A carga selecionada não tem transformações de mundo isoladas para editar.",
+        "Selected missions marked complete.": "Missões selecionadas marcadas como concluídas.",
+        "SslValue block not found in save file.": "Bloco SslValue não encontrado no arquivo de salvamento.",
+        "State:": "Estado:",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "Esta carga já existe na zona selecionada. Use Atualizar quantidade selecionada.",
+        "Unlimited": "Ilimitado",
+        "Update Selected Count": "Atualizar quantidade selecionada",
+        "Wait for cargo loading to finish first.": "Aguarde o carregamento de carga terminar primeiro.",
+        "Water cannot be added to craft zones from the cargo tab.": "Água não pode ser adicionada a zonas de criação pela aba de carga.",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "As entradas de água são armazenadas como pontos pelo jogo e não são editáveis na aba de carga.",
+    },
+    "chinese_simplified": {
+        "Add Cargo to Zone": "将货物添加到区域",
+        "Cargo Loading": "货物装载",
+        "Cargo loading is already in progress.": "货物装载已在进行中。",
+        "Could not load remembered save: {error_text}": "无法加载记住的存档：{error_text}",
+        "Count": "数量",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "这里的数量不能为负数。无限条目保持为 -1。",
+        "Count must be a whole number.": "数量必须是整数。",
+        "Create Backup": "创建备份",
+        "Failed to delete selected cargo entries.": "无法删除选定的货物条目。",
+        "Hide unlimited": "隐藏无限",
+        "'objectiveStates' not found in save file.": "存档文件中未找到 'objectiveStates'。",
+        "Lift Selected (+Y)": "抬升所选项 (+Y)",
+        "Loading remembered save...": "正在加载记住的存档...",
+        "No editable cargo transform found in the selected rows.": "在所选行中未找到可编辑的货物变换。",
+        "No cargo selected.": "未选择货物。",
+        "No matching missions found.": "未找到匹配的任务。",
+        "No new contests were modified.": "未修改任何新竞赛。",
+        "No upgradesGiverData found in file.": "文件中未找到 upgradesGiverData。",
+        "No watchPointsData found in file.": "文件中未找到 watchPointsData。",
+        "persistentProfileData not found in save file.": "存档文件中未找到 persistentProfileData。",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "PS4 导出使用相同的文件名，但不带 .cfg/.dat（例如：CompleteSave、CompleteSave1）。请使用浏览... 直接选择文件。",
+        "Remembered save not found: {path}": "未找到记住的存档：{path}",
+        "Saved cargo loading counts to file.": "货物装载数量已保存到文件。",
+        "Select a cargo entry first.": "请先选择一个货物条目。",
+        "Select a cargo type to add.": "请选择要添加的货物类型。",
+        "Selected cargo does not have isolated world transforms to edit.": "选定的货物没有可编辑的独立世界变换。",
+        "Selected missions marked complete.": "已将所选任务标记为完成。",
+        "SslValue block not found in save file.": "存档文件中未找到 SslValue 块。",
+        "State:": "状态：",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "此货物已存在于所选区域。请使用更新所选数量。",
+        "Unlimited": "无限",
+        "Update Selected Count": "更新所选数量",
+        "Wait for cargo loading to finish first.": "请先等待货物装载完成。",
+        "Water cannot be added to craft zones from the cargo tab.": "不能从货物标签页向制作区域添加水。",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "水条目由游戏存储为点，不能在货物标签页中编辑。",
+    },
+    "chinese_traditional": {
+        "Add Cargo to Zone": "將貨物新增到區域",
+        "Cargo Loading": "貨物裝載",
+        "Cargo loading is already in progress.": "貨物裝載已在進行中。",
+        "Could not load remembered save: {error_text}": "無法載入記住的存檔：{error_text}",
+        "Count": "數量",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "這裡的數量不能為負數。無限項目保持為 -1。",
+        "Count must be a whole number.": "數量必須是整數。",
+        "Create Backup": "建立備份",
+        "Failed to delete selected cargo entries.": "無法刪除選定的貨物項目。",
+        "Hide unlimited": "隱藏無限",
+        "'objectiveStates' not found in save file.": "存檔檔案中未找到 'objectiveStates'。",
+        "Lift Selected (+Y)": "抬升所選項目 (+Y)",
+        "Loading remembered save...": "正在載入記住的存檔...",
+        "No editable cargo transform found in the selected rows.": "在所選列中未找到可編輯的貨物變換。",
+        "No cargo selected.": "未選擇貨物。",
+        "No matching missions found.": "未找到相符的任務。",
+        "No new contests were modified.": "未修改任何新競賽。",
+        "No upgradesGiverData found in file.": "檔案中未找到 upgradesGiverData。",
+        "No watchPointsData found in file.": "檔案中未找到 watchPointsData。",
+        "persistentProfileData not found in save file.": "存檔檔案中未找到 persistentProfileData。",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "PS4 匯出使用相同的檔名，但不含 .cfg/.dat（例如：CompleteSave、CompleteSave1）。請使用瀏覽... 直接選擇檔案。",
+        "Remembered save not found: {path}": "找不到記住的存檔：{path}",
+        "Saved cargo loading counts to file.": "貨物裝載數量已儲存到檔案。",
+        "Select a cargo entry first.": "請先選擇一個貨物項目。",
+        "Select a cargo type to add.": "請選擇要新增的貨物類型。",
+        "Selected cargo does not have isolated world transforms to edit.": "選定的貨物沒有可編輯的獨立世界變換。",
+        "Selected missions marked complete.": "已將所選任務標記為完成。",
+        "SslValue block not found in save file.": "存檔檔案中未找到 SslValue 區塊。",
+        "State:": "狀態：",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "此貨物已存在於選定區域。請改用更新所選數量。",
+        "Unlimited": "無限",
+        "Update Selected Count": "更新所選數量",
+        "Wait for cargo loading to finish first.": "請先等待貨物裝載完成。",
+        "Water cannot be added to craft zones from the cargo tab.": "不能從貨物分頁向製作區域新增水。",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "水項目由遊戲儲存為點，不能在貨物分頁中編輯。",
+    },
+    "czech": {
+        "Add Cargo to Zone": "Přidat náklad do zóny",
+        "Cargo Loading": "Nakládání nákladu",
+        "Cargo loading is already in progress.": "Nakládání nákladu už probíhá.",
+        "Could not load remembered save: {error_text}": "Nepodařilo se načíst zapamatovaný save: {error_text}",
+        "Count": "Počet",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "Počet zde nemůže být záporný. Neomezené položky zůstávají na -1.",
+        "Count must be a whole number.": "Počet musí být celé číslo.",
+        "Create Backup": "Vytvořit zálohu",
+        "Failed to delete selected cargo entries.": "Nepodařilo se odstranit vybrané položky nákladu.",
+        "Hide unlimited": "Skrýt neomezené",
+        "'objectiveStates' not found in save file.": "'objectiveStates' nebylo v souboru savu nalezeno.",
+        "Lift Selected (+Y)": "Zvednout vybrané (+Y)",
+        "Loading remembered save...": "Načítám zapamatovaný save...",
+        "No editable cargo transform found in the selected rows.": "Ve vybraných řádcích nebyla nalezena žádná upravitelná transformace nákladu.",
+        "No cargo selected.": "Není vybrán žádný náklad.",
+        "No matching missions found.": "Nebyly nalezeny žádné odpovídající mise.",
+        "No new contests were modified.": "Nebyly upraveny žádné nové soutěže.",
+        "No upgradesGiverData found in file.": "V souboru nebyla nalezena data upgradesGiverData.",
+        "No watchPointsData found in file.": "V souboru nebyla nalezena data watchPointsData.",
+        "persistentProfileData not found in save file.": "persistentProfileData nebyla v souboru savu nalezena.",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "Exporty PS4 používají stejné názvy souborů, ale bez .cfg/.dat (například CompleteSave, CompleteSave1). Použij Procházet... a vyber soubor přímo.",
+        "Remembered save not found: {path}": "Zapamatovaný save nebyl nalezen: {path}",
+        "Saved cargo loading counts to file.": "Počty nakládání nákladu byly uloženy do souboru.",
+        "Select a cargo entry first.": "Nejprve vyber položku nákladu.",
+        "Select a cargo type to add.": "Vyber typ nákladu k přidání.",
+        "Selected cargo does not have isolated world transforms to edit.": "Vybraný náklad nemá samostatné světové transformace k úpravě.",
+        "Selected missions marked complete.": "Vybrané mise byly označeny jako dokončené.",
+        "SslValue block not found in save file.": "Blok SslValue nebyl v souboru savu nalezen.",
+        "State:": "Stav:",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "Tento náklad už ve vybrané zóně existuje. Použij Aktualizovat vybraný počet.",
+        "Unlimited": "Neomezeně",
+        "Update Selected Count": "Aktualizovat vybraný počet",
+        "Wait for cargo loading to finish first.": "Nejprve počkej, až se nakládání nákladu dokončí.",
+        "Water cannot be added to craft zones from the cargo tab.": "Vodu nelze přidat do výrobních zón z karty nákladu.",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "Položky vody hra ukládá jako body a v kartě nákladu je nelze upravit.",
+    },
+    "french": {
+        "Add Cargo to Zone": "Ajouter une cargaison à la zone",
+        "Cargo Loading": "Chargement de cargaison",
+        "Cargo loading is already in progress.": "Le chargement de cargaison est déjà en cours.",
+        "Could not load remembered save: {error_text}": "Impossible de charger la sauvegarde mémorisée : {error_text}",
+        "Count": "Quantité",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "La quantité ne peut pas être négative ici. Les entrées illimitées restent à -1.",
+        "Count must be a whole number.": "La quantité doit être un nombre entier.",
+        "Create Backup": "Créer une sauvegarde",
+        "Failed to delete selected cargo entries.": "Impossible de supprimer les entrées de cargaison sélectionnées.",
+        "Hide unlimited": "Masquer les illimitées",
+        "'objectiveStates' not found in save file.": "'objectiveStates' est introuvable dans le fichier de sauvegarde.",
+        "Lift Selected (+Y)": "Lever la sélection (+Y)",
+        "Loading remembered save...": "Chargement de la sauvegarde mémorisée...",
+        "No editable cargo transform found in the selected rows.": "Aucune transformation de cargaison modifiable trouvée dans les lignes sélectionnées.",
+        "No cargo selected.": "Aucune cargaison sélectionnée.",
+        "No matching missions found.": "Aucune mission correspondante trouvée.",
+        "No new contests were modified.": "Aucun nouveau concours n'a été modifié.",
+        "No upgradesGiverData found in file.": "Aucun upgradesGiverData trouvé dans le fichier.",
+        "No watchPointsData found in file.": "Aucun watchPointsData trouvé dans le fichier.",
+        "persistentProfileData not found in save file.": "persistentProfileData est introuvable dans le fichier de sauvegarde.",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "Les exports PS4 utilisent les mêmes noms de fichiers, mais sans .cfg/.dat (exemple : CompleteSave, CompleteSave1). Utilisez Parcourir... pour choisir directement le fichier.",
+        "Remembered save not found: {path}": "Sauvegarde mémorisée introuvable : {path}",
+        "Saved cargo loading counts to file.": "Quantités de chargement de cargaison enregistrées dans le fichier.",
+        "Select a cargo entry first.": "Sélectionnez d'abord une entrée de cargaison.",
+        "Select a cargo type to add.": "Sélectionnez un type de cargaison à ajouter.",
+        "Selected cargo does not have isolated world transforms to edit.": "La cargaison sélectionnée n'a pas de transformations monde isolées à modifier.",
+        "Selected missions marked complete.": "Missions sélectionnées marquées comme terminées.",
+        "SslValue block not found in save file.": "Bloc SslValue introuvable dans le fichier de sauvegarde.",
+        "State:": "État :",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "Cette cargaison existe déjà dans la zone sélectionnée. Utilisez Mettre à jour la quantité sélectionnée.",
+        "Unlimited": "Illimité",
+        "Update Selected Count": "Mettre à jour la quantité sélectionnée",
+        "Wait for cargo loading to finish first.": "Attendez d'abord la fin du chargement de cargaison.",
+        "Water cannot be added to craft zones from the cargo tab.": "L'eau ne peut pas être ajoutée aux zones de fabrication depuis l'onglet cargaison.",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "Les entrées d'eau sont stockées comme des points par le jeu et ne sont pas modifiables dans l'onglet cargaison.",
+    },
+    "german": {
+        "Add Cargo to Zone": "Fracht zur Zone hinzufügen",
+        "Cargo Loading": "Frachtbeladung",
+        "Cargo loading is already in progress.": "Die Frachtbeladung läuft bereits.",
+        "Could not load remembered save: {error_text}": "Gemerkter Spielstand konnte nicht geladen werden: {error_text}",
+        "Count": "Anzahl",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "Die Anzahl kann hier nicht negativ sein. Unbegrenzte Einträge bleiben bei -1.",
+        "Count must be a whole number.": "Die Anzahl muss eine ganze Zahl sein.",
+        "Create Backup": "Backup erstellen",
+        "Failed to delete selected cargo entries.": "Ausgewählte Frachteinträge konnten nicht gelöscht werden.",
+        "Hide unlimited": "Unbegrenzte ausblenden",
+        "'objectiveStates' not found in save file.": "'objectiveStates' wurde in der Speicherdatei nicht gefunden.",
+        "Lift Selected (+Y)": "Ausgewählte anheben (+Y)",
+        "Loading remembered save...": "Gemerkten Spielstand laden...",
+        "No editable cargo transform found in the selected rows.": "In den ausgewählten Zeilen wurde keine bearbeitbare Fracht-Transformation gefunden.",
+        "No cargo selected.": "Keine Fracht ausgewählt.",
+        "No matching missions found.": "Keine passenden Missionen gefunden.",
+        "No new contests were modified.": "Es wurden keine neuen Wettbewerbe geändert.",
+        "No upgradesGiverData found in file.": "Keine upgradesGiverData in der Datei gefunden.",
+        "No watchPointsData found in file.": "Keine watchPointsData in der Datei gefunden.",
+        "persistentProfileData not found in save file.": "persistentProfileData wurde in der Speicherdatei nicht gefunden.",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "PS4-Exporte verwenden dieselben Dateinamen, aber ohne .cfg/.dat (Beispiel: CompleteSave, CompleteSave1). Verwende Durchsuchen..., um die Datei direkt auszuwählen.",
+        "Remembered save not found: {path}": "Gemerkter Spielstand nicht gefunden: {path}",
+        "Saved cargo loading counts to file.": "Frachtbeladungs-Anzahlen wurden in die Datei gespeichert.",
+        "Select a cargo entry first.": "Wähle zuerst einen Frachteintrag aus.",
+        "Select a cargo type to add.": "Wähle einen Frachttyp zum Hinzufügen aus.",
+        "Selected cargo does not have isolated world transforms to edit.": "Die ausgewählte Fracht hat keine isolierten Welt-Transformationen zum Bearbeiten.",
+        "Selected missions marked complete.": "Ausgewählte Missionen als abgeschlossen markiert.",
+        "SslValue block not found in save file.": "SslValue-Block wurde in der Speicherdatei nicht gefunden.",
+        "State:": "Status:",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "Diese Fracht existiert bereits in der ausgewählten Zone. Verwende stattdessen Ausgewählte Anzahl aktualisieren.",
+        "Unlimited": "Unbegrenzt",
+        "Update Selected Count": "Ausgewählte Anzahl aktualisieren",
+        "Wait for cargo loading to finish first.": "Warte zuerst, bis die Frachtbeladung abgeschlossen ist.",
+        "Water cannot be added to craft zones from the cargo tab.": "Wasser kann nicht über den Fracht-Tab zu Fertigungszonen hinzugefügt werden.",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "Wassereinträge werden vom Spiel als Punkte gespeichert und können im Fracht-Tab nicht bearbeitet werden.",
+    },
+    "italian": {
+        "Add Cargo to Zone": "Aggiungi carico alla zona",
+        "Cargo Loading": "Caricamento carico",
+        "Cargo loading is already in progress.": "Il caricamento del carico è già in corso.",
+        "Could not load remembered save: {error_text}": "Impossibile caricare il salvataggio ricordato: {error_text}",
+        "Count": "Quantità",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "La quantità non può essere negativa qui. Le voci illimitate restano a -1.",
+        "Count must be a whole number.": "La quantità deve essere un numero intero.",
+        "Create Backup": "Crea backup",
+        "Failed to delete selected cargo entries.": "Impossibile eliminare le voci di carico selezionate.",
+        "Hide unlimited": "Nascondi illimitati",
+        "'objectiveStates' not found in save file.": "'objectiveStates' non trovato nel file di salvataggio.",
+        "Lift Selected (+Y)": "Solleva selezionati (+Y)",
+        "Loading remembered save...": "Caricamento del salvataggio ricordato...",
+        "No editable cargo transform found in the selected rows.": "Nessuna trasformazione del carico modificabile trovata nelle righe selezionate.",
+        "No cargo selected.": "Nessun carico selezionato.",
+        "No matching missions found.": "Nessuna missione corrispondente trovata.",
+        "No new contests were modified.": "Nessuna nuova gara è stata modificata.",
+        "No upgradesGiverData found in file.": "Nessun upgradesGiverData trovato nel file.",
+        "No watchPointsData found in file.": "Nessun watchPointsData trovato nel file.",
+        "persistentProfileData not found in save file.": "persistentProfileData non trovato nel file di salvataggio.",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "Le esportazioni PS4 usano gli stessi nomi file ma senza .cfg/.dat (esempio: CompleteSave, CompleteSave1). Usa Sfoglia... per scegliere direttamente il file.",
+        "Remembered save not found: {path}": "Salvataggio ricordato non trovato: {path}",
+        "Saved cargo loading counts to file.": "Quantità di caricamento carico salvate nel file.",
+        "Select a cargo entry first.": "Seleziona prima una voce di carico.",
+        "Select a cargo type to add.": "Seleziona un tipo di carico da aggiungere.",
+        "Selected cargo does not have isolated world transforms to edit.": "Il carico selezionato non ha trasformazioni mondo isolate da modificare.",
+        "Selected missions marked complete.": "Missioni selezionate contrassegnate come completate.",
+        "SslValue block not found in save file.": "Blocco SslValue non trovato nel file di salvataggio.",
+        "State:": "Stato:",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "Questo carico esiste già nella zona selezionata. Usa Aggiorna quantità selezionata.",
+        "Unlimited": "Illimitato",
+        "Update Selected Count": "Aggiorna quantità selezionata",
+        "Wait for cargo loading to finish first.": "Attendi prima il completamento del caricamento del carico.",
+        "Water cannot be added to craft zones from the cargo tab.": "L'acqua non può essere aggiunta alle zone di produzione dalla scheda carico.",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "Le voci d'acqua sono memorizzate dal gioco come punti e non sono modificabili nella scheda carico.",
+    },
+    "japanese": {
+        "Add Cargo to Zone": "ゾーンに貨物を追加",
+        "Cargo Loading": "貨物積み込み",
+        "Cargo loading is already in progress.": "貨物積み込みはすでに進行中です。",
+        "Could not load remembered save: {error_text}": "記憶したセーブを読み込めませんでした: {error_text}",
+        "Count": "数量",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "ここでは数量を負の値にできません。無制限の項目は -1 のままです。",
+        "Count must be a whole number.": "数量は整数である必要があります。",
+        "Create Backup": "バックアップを作成",
+        "Failed to delete selected cargo entries.": "選択した貨物項目を削除できませんでした。",
+        "Hide unlimited": "無制限を非表示",
+        "'objectiveStates' not found in save file.": "セーブファイルに 'objectiveStates' が見つかりません。",
+        "Lift Selected (+Y)": "選択項目を持ち上げる (+Y)",
+        "Loading remembered save...": "記憶したセーブを読み込み中...",
+        "No editable cargo transform found in the selected rows.": "選択した行に編集可能な貨物トランスフォームが見つかりません。",
+        "No cargo selected.": "貨物が選択されていません。",
+        "No matching missions found.": "一致するミッションが見つかりません。",
+        "No new contests were modified.": "変更された新しいコンテストはありません。",
+        "No upgradesGiverData found in file.": "ファイルに upgradesGiverData が見つかりません。",
+        "No watchPointsData found in file.": "ファイルに watchPointsData が見つかりません。",
+        "persistentProfileData not found in save file.": "セーブファイルに persistentProfileData が見つかりません。",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "PS4 エクスポートは同じファイル名を使用しますが、.cfg/.dat は付きません（例: CompleteSave、CompleteSave1）。参照... でファイルを直接選択してください。",
+        "Remembered save not found: {path}": "記憶したセーブが見つかりません: {path}",
+        "Saved cargo loading counts to file.": "貨物積み込み数量をファイルに保存しました。",
+        "Select a cargo entry first.": "先に貨物項目を選択してください。",
+        "Select a cargo type to add.": "追加する貨物タイプを選択してください。",
+        "Selected cargo does not have isolated world transforms to edit.": "選択した貨物には編集可能な独立したワールドトランスフォームがありません。",
+        "Selected missions marked complete.": "選択したミッションを完了としてマークしました。",
+        "SslValue block not found in save file.": "セーブファイルに SslValue ブロックが見つかりません。",
+        "State:": "状態:",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "この貨物は選択したゾーンにすでに存在します。代わりに「選択した数量を更新」を使用してください。",
+        "Unlimited": "無制限",
+        "Update Selected Count": "選択した数量を更新",
+        "Wait for cargo loading to finish first.": "先に貨物積み込みの完了を待ってください。",
+        "Water cannot be added to craft zones from the cargo tab.": "貨物タブから製作ゾーンに水を追加することはできません。",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "水の項目はゲーム内でポイントとして保存されるため、貨物タブでは編集できません。",
+    },
+    "korean": {
+        "Add Cargo to Zone": "구역에 화물 추가",
+        "Cargo Loading": "화물 적재",
+        "Cargo loading is already in progress.": "화물 적재가 이미 진행 중입니다.",
+        "Could not load remembered save: {error_text}": "기억된 저장 파일을 불러올 수 없습니다: {error_text}",
+        "Count": "수량",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "여기서는 수량을 음수로 설정할 수 없습니다. 무제한 항목은 -1로 유지됩니다.",
+        "Count must be a whole number.": "수량은 정수여야 합니다.",
+        "Create Backup": "백업 만들기",
+        "Failed to delete selected cargo entries.": "선택한 화물 항목을 삭제하지 못했습니다.",
+        "Hide unlimited": "무제한 숨기기",
+        "'objectiveStates' not found in save file.": "저장 파일에서 'objectiveStates'를 찾을 수 없습니다.",
+        "Lift Selected (+Y)": "선택 항목 들어 올리기 (+Y)",
+        "Loading remembered save...": "기억된 저장 파일 불러오는 중...",
+        "No editable cargo transform found in the selected rows.": "선택한 행에서 편집 가능한 화물 변환을 찾을 수 없습니다.",
+        "No cargo selected.": "선택한 화물이 없습니다.",
+        "No matching missions found.": "일치하는 임무를 찾을 수 없습니다.",
+        "No new contests were modified.": "수정된 새 콘테스트가 없습니다.",
+        "No upgradesGiverData found in file.": "파일에서 upgradesGiverData를 찾을 수 없습니다.",
+        "No watchPointsData found in file.": "파일에서 watchPointsData를 찾을 수 없습니다.",
+        "persistentProfileData not found in save file.": "저장 파일에서 persistentProfileData를 찾을 수 없습니다.",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "PS4 내보내기는 같은 파일 이름을 사용하지만 .cfg/.dat 없이 사용합니다(예: CompleteSave, CompleteSave1). 찾아보기...를 사용해 파일을 직접 선택하세요.",
+        "Remembered save not found: {path}": "기억된 저장 파일을 찾을 수 없습니다: {path}",
+        "Saved cargo loading counts to file.": "화물 적재 수량을 파일에 저장했습니다.",
+        "Select a cargo entry first.": "먼저 화물 항목을 선택하세요.",
+        "Select a cargo type to add.": "추가할 화물 유형을 선택하세요.",
+        "Selected cargo does not have isolated world transforms to edit.": "선택한 화물에는 편집할 독립 월드 변환이 없습니다.",
+        "Selected missions marked complete.": "선택한 임무를 완료로 표시했습니다.",
+        "SslValue block not found in save file.": "저장 파일에서 SslValue 블록을 찾을 수 없습니다.",
+        "State:": "상태:",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "이 화물은 선택한 구역에 이미 있습니다. 대신 선택한 수량 업데이트를 사용하세요.",
+        "Unlimited": "무제한",
+        "Update Selected Count": "선택한 수량 업데이트",
+        "Wait for cargo loading to finish first.": "먼저 화물 적재가 끝날 때까지 기다리세요.",
+        "Water cannot be added to craft zones from the cargo tab.": "화물 탭에서는 제작 구역에 물을 추가할 수 없습니다.",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "물 항목은 게임에서 포인트로 저장되며 화물 탭에서 편집할 수 없습니다.",
+    },
+    "polish": {
+        "Add Cargo to Zone": "Dodaj ładunek do strefy",
+        "Cargo Loading": "Załadunek ładunku",
+        "Cargo loading is already in progress.": "Załadunek ładunku jest już w toku.",
+        "Could not load remembered save: {error_text}": "Nie można wczytać zapamiętanego zapisu: {error_text}",
+        "Count": "Ilość",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "Ilość nie może być tutaj ujemna. Pozycje bez limitu pozostają na -1.",
+        "Count must be a whole number.": "Ilość musi być liczbą całkowitą.",
+        "Create Backup": "Utwórz kopię zapasową",
+        "Failed to delete selected cargo entries.": "Nie udało się usunąć wybranych pozycji ładunku.",
+        "Hide unlimited": "Ukryj bez limitu",
+        "'objectiveStates' not found in save file.": "Nie znaleziono 'objectiveStates' w pliku zapisu.",
+        "Lift Selected (+Y)": "Podnieś wybrane (+Y)",
+        "Loading remembered save...": "Wczytywanie zapamiętanego zapisu...",
+        "No editable cargo transform found in the selected rows.": "Nie znaleziono edytowalnej transformacji ładunku w wybranych wierszach.",
+        "No cargo selected.": "Nie wybrano ładunku.",
+        "No matching missions found.": "Nie znaleziono pasujących misji.",
+        "No new contests were modified.": "Nie zmodyfikowano żadnych nowych konkursów.",
+        "No upgradesGiverData found in file.": "Nie znaleziono upgradesGiverData w pliku.",
+        "No watchPointsData found in file.": "Nie znaleziono watchPointsData w pliku.",
+        "persistentProfileData not found in save file.": "Nie znaleziono persistentProfileData w pliku zapisu.",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "Eksporty PS4 używają tych samych nazw plików, ale bez .cfg/.dat (przykład: CompleteSave, CompleteSave1). Użyj Przeglądaj..., aby wybrać plik bezpośrednio.",
+        "Remembered save not found: {path}": "Nie znaleziono zapamiętanego zapisu: {path}",
+        "Saved cargo loading counts to file.": "Ilości załadunku ładunku zapisano do pliku.",
+        "Select a cargo entry first.": "Najpierw wybierz pozycję ładunku.",
+        "Select a cargo type to add.": "Wybierz typ ładunku do dodania.",
+        "Selected cargo does not have isolated world transforms to edit.": "Wybrany ładunek nie ma oddzielnych transformacji świata do edycji.",
+        "Selected missions marked complete.": "Wybrane misje oznaczono jako ukończone.",
+        "SslValue block not found in save file.": "Nie znaleziono bloku SslValue w pliku zapisu.",
+        "State:": "Stan:",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "Ten ładunek już istnieje w wybranej strefie. Użyj opcji Aktualizuj wybraną ilość.",
+        "Unlimited": "Bez limitu",
+        "Update Selected Count": "Aktualizuj wybraną ilość",
+        "Wait for cargo loading to finish first.": "Najpierw poczekaj na zakończenie załadunku ładunku.",
+        "Water cannot be added to craft zones from the cargo tab.": "Nie można dodać wody do stref produkcji z karty ładunku.",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "Pozycje wody są przechowywane przez grę jako punkty i nie można ich edytować w karcie ładunku.",
+    },
+    "russian": {
+        "Add Cargo to Zone": "Добавить груз в зону",
+        "Cargo Loading": "Загрузка груза",
+        "Cargo loading is already in progress.": "Загрузка груза уже выполняется.",
+        "Could not load remembered save: {error_text}": "Не удалось загрузить сохранённый путь к сохранению: {error_text}",
+        "Count": "Количество",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "Количество здесь не может быть отрицательным. Неограниченные записи остаются равными -1.",
+        "Count must be a whole number.": "Количество должно быть целым числом.",
+        "Create Backup": "Создать резервную копию",
+        "Failed to delete selected cargo entries.": "Не удалось удалить выбранные записи груза.",
+        "Hide unlimited": "Скрыть неограниченные",
+        "'objectiveStates' not found in save file.": "'objectiveStates' не найден в файле сохранения.",
+        "Lift Selected (+Y)": "Поднять выбранное (+Y)",
+        "Loading remembered save...": "Загрузка запомненного сохранения...",
+        "No editable cargo transform found in the selected rows.": "В выбранных строках не найдена редактируемая трансформация груза.",
+        "No cargo selected.": "Груз не выбран.",
+        "No matching missions found.": "Подходящие миссии не найдены.",
+        "No new contests were modified.": "Новые соревнования не были изменены.",
+        "No upgradesGiverData found in file.": "upgradesGiverData не найден в файле.",
+        "No watchPointsData found in file.": "watchPointsData не найден в файле.",
+        "persistentProfileData not found in save file.": "persistentProfileData не найден в файле сохранения.",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "Экспорт PS4 использует те же имена файлов, но без .cfg/.dat (пример: CompleteSave, CompleteSave1). Используйте Обзор..., чтобы выбрать файл напрямую.",
+        "Remembered save not found: {path}": "Запомненное сохранение не найдено: {path}",
+        "Saved cargo loading counts to file.": "Количество загрузки груза сохранено в файл.",
+        "Select a cargo entry first.": "Сначала выберите запись груза.",
+        "Select a cargo type to add.": "Выберите тип груза для добавления.",
+        "Selected cargo does not have isolated world transforms to edit.": "У выбранного груза нет изолированных мировых трансформаций для редактирования.",
+        "Selected missions marked complete.": "Выбранные миссии отмечены как завершённые.",
+        "SslValue block not found in save file.": "Блок SslValue не найден в файле сохранения.",
+        "State:": "Состояние:",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "Этот груз уже есть в выбранной зоне. Используйте «Обновить выбранное количество».",
+        "Unlimited": "Неограниченно",
+        "Update Selected Count": "Обновить выбранное количество",
+        "Wait for cargo loading to finish first.": "Сначала дождитесь завершения загрузки груза.",
+        "Water cannot be added to craft zones from the cargo tab.": "Воду нельзя добавить в производственные зоны из вкладки груза.",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "Записи воды хранятся игрой как точки и не редактируются на вкладке груза.",
+    },
+    "spanish": {
+        "Add Cargo to Zone": "Agregar carga a la zona",
+        "Cargo Loading": "Carga de mercancía",
+        "Cargo loading is already in progress.": "La carga de mercancía ya está en curso.",
+        "Could not load remembered save: {error_text}": "No se pudo cargar la partida recordada: {error_text}",
+        "Count": "Cantidad",
+        "Count cannot be negative here. Unlimited entries stay at -1.": "La cantidad no puede ser negativa aquí. Las entradas ilimitadas permanecen en -1.",
+        "Count must be a whole number.": "La cantidad debe ser un número entero.",
+        "Create Backup": "Crear copia de seguridad",
+        "Failed to delete selected cargo entries.": "No se pudieron eliminar las entradas de carga seleccionadas.",
+        "Hide unlimited": "Ocultar ilimitadas",
+        "'objectiveStates' not found in save file.": "No se encontró 'objectiveStates' en el archivo de guardado.",
+        "Lift Selected (+Y)": "Elevar selección (+Y)",
+        "Loading remembered save...": "Cargando partida recordada...",
+        "No editable cargo transform found in the selected rows.": "No se encontró ninguna transformación de carga editable en las filas seleccionadas.",
+        "No cargo selected.": "No hay carga seleccionada.",
+        "No matching missions found.": "No se encontraron misiones coincidentes.",
+        "No new contests were modified.": "No se modificaron nuevos concursos.",
+        "No upgradesGiverData found in file.": "No se encontró upgradesGiverData en el archivo.",
+        "No watchPointsData found in file.": "No se encontró watchPointsData en el archivo.",
+        "persistentProfileData not found in save file.": "No se encontró persistentProfileData en el archivo de guardado.",
+        "PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.": "Las exportaciones de PS4 usan los mismos nombres de archivo, pero sin .cfg/.dat (ejemplo: CompleteSave, CompleteSave1). Usa Examinar... para elegir el archivo directamente.",
+        "Remembered save not found: {path}": "Partida recordada no encontrada: {path}",
+        "Saved cargo loading counts to file.": "Cantidades de carga de mercancía guardadas en el archivo.",
+        "Select a cargo entry first.": "Selecciona primero una entrada de carga.",
+        "Select a cargo type to add.": "Selecciona un tipo de carga para agregar.",
+        "Selected cargo does not have isolated world transforms to edit.": "La carga seleccionada no tiene transformaciones de mundo aisladas para editar.",
+        "Selected missions marked complete.": "Misiones seleccionadas marcadas como completadas.",
+        "SslValue block not found in save file.": "No se encontró el bloque SslValue en el archivo de guardado.",
+        "State:": "Estado:",
+        "This cargo already exists in the selected zone. Use Update Selected Count instead.": "Esta carga ya existe en la zona seleccionada. Usa Actualizar cantidad seleccionada.",
+        "Unlimited": "Ilimitado",
+        "Update Selected Count": "Actualizar cantidad seleccionada",
+        "Wait for cargo loading to finish first.": "Espera primero a que termine la carga de mercancía.",
+        "Water cannot be added to craft zones from the cargo tab.": "No se puede agregar agua a zonas de fabricación desde la pestaña de carga.",
+        "Water entries are stored as points by the game and are not editable in the cargo tab.": "Las entradas de agua se almacenan como puntos en el juego y no se pueden editar en la pestaña de carga.",
+    },
+}
+_EDITOR_TRANSLATION_SUPPLEMENT_MODS = {
+    "brazilian_portuguese": {
+        "Addon and trailer price multiplier": "Multiplicador de preço de acessórios e reboques",
+        "All tires ignore ice": "Todos os pneus ignoram gelo",
+        "Truck camera FOV multiplier": "Multiplicador de FOV da câmera do caminhão",
+        "Truck camera max zoom multiplier": "Multiplicador de zoom máximo da câmera do caminhão",
+        "Truck render distance multiplier": "Multiplicador de distância de renderização do caminhão",
+        "Truck shadow distance multiplier": "Multiplicador de distância de sombra do caminhão",
+        "Truck store everywhere": "Loja de caminhões em todos os lugares",
+        "Truck store price multiplier": "Multiplicador de preço na loja de caminhões",
+        "Truck unlock rank multiplier": "Multiplicador de nível de desbloqueio do caminhão",
+    },
+    "chinese_simplified": {
+        "Addon and trailer price multiplier": "配件和拖车价格倍率",
+        "All tires ignore ice": "所有轮胎忽略冰面",
+        "Truck camera FOV multiplier": "卡车摄像机视野倍率",
+        "Truck camera max zoom multiplier": "卡车摄像机最大缩放倍率",
+        "Truck render distance multiplier": "卡车渲染距离倍率",
+        "Truck shadow distance multiplier": "卡车阴影距离倍率",
+        "Truck store everywhere": "所有地区卡车商店",
+        "Truck store price multiplier": "卡车商店价格倍率",
+        "Truck unlock rank multiplier": "卡车解锁等级倍率",
+    },
+    "chinese_traditional": {
+        "Addon and trailer price multiplier": "配件與拖車價格倍率",
+        "All tires ignore ice": "所有輪胎忽略冰面",
+        "Truck camera FOV multiplier": "卡車攝影機視野倍率",
+        "Truck camera max zoom multiplier": "卡車攝影機最大縮放倍率",
+        "Truck render distance multiplier": "卡車渲染距離倍率",
+        "Truck shadow distance multiplier": "卡車陰影距離倍率",
+        "Truck store everywhere": "所有地區卡車商店",
+        "Truck store price multiplier": "卡車商店價格倍率",
+        "Truck unlock rank multiplier": "卡車解鎖等級倍率",
+    },
+    "czech": {
+        "Addon and trailer price multiplier": "Násobič ceny addonů a přívěsů",
+        "All tires ignore ice": "Všechny pneumatiky ignorují led",
+        "Truck camera FOV multiplier": "Násobič FOV kamery trucku",
+        "Truck camera max zoom multiplier": "Násobič maximálního zoomu kamery trucku",
+        "Truck render distance multiplier": "Násobič vykreslovací vzdálenosti trucku",
+        "Truck shadow distance multiplier": "Násobič vzdálenosti stínů trucku",
+        "Truck store everywhere": "Truck obchod všude",
+        "Truck store price multiplier": "Násobič ceny trucků v obchodě",
+        "Truck unlock rank multiplier": "Násobič úrovně odemčení trucků",
+    },
+    "french": {
+        "Addon and trailer price multiplier": "Multiplicateur de prix des équipements et remorques",
+        "All tires ignore ice": "Tous les pneus ignorent la glace",
+        "Truck camera FOV multiplier": "Multiplicateur de champ de vision caméra du camion",
+        "Truck camera max zoom multiplier": "Multiplicateur de zoom maximal caméra du camion",
+        "Truck render distance multiplier": "Multiplicateur de distance de rendu du camion",
+        "Truck shadow distance multiplier": "Multiplicateur de distance des ombres du camion",
+        "Truck store everywhere": "Magasin de camions partout",
+        "Truck store price multiplier": "Multiplicateur de prix des camions en magasin",
+        "Truck unlock rank multiplier": "Multiplicateur de rang de déverrouillage des camions",
+    },
+    "german": {
+        "Addon and trailer price multiplier": "Preis-Multiplikator für Anbauten und Anhänger",
+        "All tires ignore ice": "Alle Reifen ignorieren Eis",
+        "Truck camera FOV multiplier": "Lkw-Kamera-FOV-Multiplikator",
+        "Truck camera max zoom multiplier": "Multiplikator für maximalen Lkw-Kamera-Zoom",
+        "Truck render distance multiplier": "Lkw-Renderdistanz-Multiplikator",
+        "Truck shadow distance multiplier": "Lkw-Schattendistanz-Multiplikator",
+        "Truck store everywhere": "Lkw-Shop überall",
+        "Truck store price multiplier": "Lkw-Shoppreis-Multiplikator",
+        "Truck unlock rank multiplier": "Lkw-Freischaltrang-Multiplikator",
+    },
+    "italian": {
+        "Addon and trailer price multiplier": "Moltiplicatore prezzo di addon e rimorchi",
+        "All tires ignore ice": "Tutti gli pneumatici ignorano il ghiaccio",
+        "Truck camera FOV multiplier": "Moltiplicatore FOV camera camion",
+        "Truck camera max zoom multiplier": "Moltiplicatore zoom massimo camera camion",
+        "Truck render distance multiplier": "Moltiplicatore distanza rendering camion",
+        "Truck shadow distance multiplier": "Moltiplicatore distanza ombre camion",
+        "Truck store everywhere": "Negozio camion ovunque",
+        "Truck store price multiplier": "Moltiplicatore prezzo negozio camion",
+        "Truck unlock rank multiplier": "Moltiplicatore grado sblocco camion",
+    },
+    "japanese": {
+        "Addon and trailer price multiplier": "アドオンとトレーラー価格の倍率",
+        "All tires ignore ice": "すべてのタイヤが氷を無視",
+        "Truck camera FOV multiplier": "トラックカメラFOV倍率",
+        "Truck camera max zoom multiplier": "トラックカメラ最大ズーム倍率",
+        "Truck render distance multiplier": "トラック描画距離倍率",
+        "Truck shadow distance multiplier": "トラック影距離倍率",
+        "Truck store everywhere": "すべての地域でトラック販売",
+        "Truck store price multiplier": "トラック販売価格倍率",
+        "Truck unlock rank multiplier": "トラック解除ランク倍率",
+    },
+    "korean": {
+        "Addon and trailer price multiplier": "애드온 및 트레일러 가격 배율",
+        "All tires ignore ice": "모든 타이어가 얼음을 무시",
+        "Truck camera FOV multiplier": "트럭 카메라 FOV 배율",
+        "Truck camera max zoom multiplier": "트럭 카메라 최대 줌 배율",
+        "Truck render distance multiplier": "트럭 렌더링 거리 배율",
+        "Truck shadow distance multiplier": "트럭 그림자 거리 배율",
+        "Truck store everywhere": "모든 지역 트럭 상점",
+        "Truck store price multiplier": "트럭 상점 가격 배율",
+        "Truck unlock rank multiplier": "트럭 잠금 해제 랭크 배율",
+    },
+    "polish": {
+        "Addon and trailer price multiplier": "Mnożnik ceny dodatków i przyczep",
+        "All tires ignore ice": "Wszystkie opony ignorują lód",
+        "Truck camera FOV multiplier": "Mnożnik FOV kamery ciężarówki",
+        "Truck camera max zoom multiplier": "Mnożnik maksymalnego zoomu kamery ciężarówki",
+        "Truck render distance multiplier": "Mnożnik dystansu renderowania ciężarówki",
+        "Truck shadow distance multiplier": "Mnożnik dystansu cieni ciężarówki",
+        "Truck store everywhere": "Sklep ciężarówek wszędzie",
+        "Truck store price multiplier": "Mnożnik ceny ciężarówek w sklepie",
+        "Truck unlock rank multiplier": "Mnożnik rangi odblokowania ciężarówek",
+    },
+    "russian": {
+        "Addon and trailer price multiplier": "Множитель цены надстроек и прицепов",
+        "All tires ignore ice": "Все шины игнорируют лед",
+        "Truck camera FOV multiplier": "Множитель FOV камеры грузовика",
+        "Truck camera max zoom multiplier": "Множитель максимального зума камеры грузовика",
+        "Truck render distance multiplier": "Множитель дальности отрисовки грузовика",
+        "Truck shadow distance multiplier": "Множитель дальности теней грузовика",
+        "Truck store everywhere": "Магазин грузовиков везде",
+        "Truck store price multiplier": "Множитель цены грузовиков в магазине",
+        "Truck unlock rank multiplier": "Множитель ранга разблокировки грузовиков",
+    },
+    "spanish": {
+        "Addon and trailer price multiplier": "Multiplicador de precio de complementos y remolques",
+        "All tires ignore ice": "Todos los neumáticos ignoran el hielo",
+        "Truck camera FOV multiplier": "Multiplicador de FOV de cámara del camión",
+        "Truck camera max zoom multiplier": "Multiplicador de zoom máximo de cámara del camión",
+        "Truck render distance multiplier": "Multiplicador de distancia de renderizado del camión",
+        "Truck shadow distance multiplier": "Multiplicador de distancia de sombras del camión",
+        "Truck store everywhere": "Tienda de camiones en todas partes",
+        "Truck store price multiplier": "Multiplicador de precio de camiones en tienda",
+        "Truck unlock rank multiplier": "Multiplicador de rango de desbloqueo de camiones",
+    },
+}
+_EDITOR_TRANSLATION_SUPPLEMENT_RULES = {
+    "brazilian_portuguese": {
+        "Random rules": "Regras aleatórias",
+        "Custom rules": "Regras personalizadas",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "Regras personalizadas substituem predefinições de multiplicador por números exatos.\n\nSomente regras de multiplicador mudam; regras apenas com opções continuam como menus.\n\nO valor é aplicado como multiplicador ao valor padrão da regra. Exemplo: 50 significa valor padrão × 50.",
+    },
+    "chinese_simplified": {
+        "Random rules": "随机规则",
+        "Custom rules": "自定义规则",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "自定义规则会用精确数字替换倍率预设。\n\n只有倍率规则会改变；纯选项规则仍保持下拉菜单。\n\n该值会作为倍率应用到规则的默认值。示例：50 表示默认值 × 50。",
+    },
+    "chinese_traditional": {
+        "Random rules": "隨機規則",
+        "Custom rules": "自訂規則",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "自訂規則會用精確數字取代倍率預設。\n\n只有倍率規則會改變；純選項規則仍保持下拉選單。\n\n該值會作為倍率套用到規則的預設值。範例：50 表示預設值 × 50。",
+    },
+    "czech": {
+        "Random rules": "Náhodná pravidla",
+        "Custom rules": "Vlastní pravidla",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "Vlastní pravidla nahrazují předvolby násobičů přesnými čísly.\n\nMění se jen pravidla s násobičem; pravidla pouze s možnostmi zůstávají jako rozbalovací nabídky.\n\nHodnota se použije jako násobič výchozí hodnoty pravidla. Příklad: 50 znamená výchozí hodnota × 50.",
+    },
+    "french": {
+        "Random rules": "Règles aléatoires",
+        "Custom rules": "Règles personnalisées",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "Les règles personnalisées remplacent les préréglages de multiplicateur par des nombres exacts.\n\nSeules les règles à multiplicateur changent ; les règles à options restent des menus déroulants.\n\nLa valeur est appliquée comme multiplicateur à la valeur par défaut de la règle. Exemple : 50 signifie valeur par défaut × 50.",
+    },
+    "german": {
+        "Random rules": "Zufällige Regeln",
+        "Custom rules": "Benutzerdefinierte Regeln",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "Benutzerdefinierte Regeln ersetzen Multiplikator-Vorgaben durch genaue Zahlen.\n\nNur Multiplikator-Regeln ändern sich; reine Optionsregeln bleiben Dropdowns.\n\nDer Wert wird als Multiplikator auf den Standardwert der Regel angewendet. Beispiel: 50 bedeutet Standardwert × 50.",
+    },
+    "italian": {
+        "Random rules": "Regole casuali",
+        "Custom rules": "Regole personalizzate",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "Le regole personalizzate sostituiscono i preset dei moltiplicatori con numeri esatti.\n\nCambiano solo le regole con moltiplicatore; le regole solo a opzioni restano menu a discesa.\n\nIl valore viene applicato come moltiplicatore al valore predefinito della regola. Esempio: 50 significa valore predefinito × 50.",
+    },
+    "japanese": {
+        "Random rules": "ランダムルール",
+        "Custom rules": "カスタムルール",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "カスタムルールは倍率プリセットを正確な数値に置き換えます。\n\n変更されるのは倍率ルールだけです。選択式のみのルールはドロップダウンのままです。\n\n値はそのルールのデフォルト値に対する倍率として適用されます。例: 50 はデフォルト値 × 50 を意味します。",
+    },
+    "korean": {
+        "Random rules": "무작위 규칙",
+        "Custom rules": "사용자 지정 규칙",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "사용자 지정 규칙은 배율 프리셋을 정확한 숫자로 바꿉니다.\n\n배율 규칙만 변경되며, 선택지만 있는 규칙은 드롭다운으로 유지됩니다.\n\n이 값은 해당 규칙의 기본값에 대한 배율로 적용됩니다. 예: 50은 기본값 × 50을 의미합니다.",
+    },
+    "polish": {
+        "Random rules": "Losowe zasady",
+        "Custom rules": "Niestandardowe zasady",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "Niestandardowe zasady zastępują gotowe mnożniki dokładnymi liczbami.\n\nZmieniają się tylko zasady z mnożnikami; zasady tylko z opcjami pozostają listami rozwijanymi.\n\nWartość jest stosowana jako mnożnik wartości domyślnej zasady. Przykład: 50 oznacza wartość domyślna × 50.",
+    },
+    "russian": {
+        "Random rules": "Случайные правила",
+        "Custom rules": "Пользовательские правила",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "Пользовательские правила заменяют пресеты множителей точными числами.\n\nИзменяются только правила с множителями; правила только с вариантами остаются выпадающими списками.\n\nЗначение применяется как множитель к значению правила по умолчанию. Пример: 50 означает значение по умолчанию × 50.",
+    },
+    "spanish": {
+        "Random rules": "Reglas aleatorias",
+        "Custom rules": "Reglas personalizadas",
+        "Custom rules replace multiplier presets with exact numbers.\n\nOnly multiplier rules change; option-only rules stay as dropdowns.\n\nThe value is applied as a multiplier to the rule's default value. Example: 50 means default value × 50.": "Las reglas personalizadas sustituyen los ajustes de multiplicador por números exactos.\n\nSolo cambian las reglas con multiplicador; las reglas solo con opciones permanecen como listas desplegables.\n\nEl valor se aplica como multiplicador al valor predeterminado de la regla. Ejemplo: 50 significa valor predeterminado × 50.",
+    },
+}
 
 
 def _editor_normalize_language_code(value: Any) -> str:
@@ -10119,8 +14704,21 @@ def _editor_set_language_preference(code: Any) -> str:
     return lang
 
 
-def _editor_translation_local_dir() -> str:
-    return resource_path(os.path.join("translations", "upload"))
+def _editor_translation_local_paths(language: Any) -> List[str]:
+    file_name = _editor_translation_filename(language)
+    candidates = [
+        resource_path(os.path.join("translations", file_name)),
+        resource_path(os.path.join("translations", "upload", file_name)),
+    ]
+    out = []
+    seen = set()
+    for path in candidates:
+        clean = str(path or "").strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        out.append(clean)
+    return out
 
 
 def _editor_translation_cache_dir() -> str:
@@ -10180,7 +14778,21 @@ def _editor_translation_write_json(path: str, payload: Dict[str, Any]) -> None:
             pass
 
 
+def _editor_translation_parse_http_timestamp(value: Any) -> float:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return float(dt.timestamp())
+    except Exception:
+        return 0.0
+
+
 _EDITOR_TRANSLATION_TEMPLATE_TOKEN_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+_EDITOR_TRANSLATION_SERIAL_PLACEHOLDER_RE = re.compile(r"__SRXP(\d+)__")
 
 
 def _editor_compile_translation_template(template: str):
@@ -10204,12 +14816,56 @@ def _editor_compile_translation_template(template: str):
         return None
 
 
+def _editor_translation_rehydrate_placeholders(source_text: str, translated_text: str) -> str:
+    text = str(translated_text or "")
+    if "__SRXP" not in text:
+        return text
+
+    placeholder_names: List[str] = []
+    seen: Set[str] = set()
+    for match in _EDITOR_TRANSLATION_TEMPLATE_TOKEN_RE.finditer(str(source_text or "")):
+        name = str(match.group(1) or "")
+        if (not name) or (name in seen):
+            continue
+        seen.add(name)
+        placeholder_names.append(name)
+
+    if not placeholder_names:
+        return text
+
+    def _replace(match):
+        try:
+            index = int(match.group(1) or "0")
+        except Exception:
+            return match.group(0)
+        if 0 <= index < len(placeholder_names):
+            return "{" + placeholder_names[index] + "}"
+        return match.group(0)
+
+    return _EDITOR_TRANSLATION_SERIAL_PLACEHOLDER_RE.sub(_replace, text)
+
+
+def _editor_translation_builtin_supplement(language: Any) -> Dict[str, str]:
+    lang = _editor_normalize_language_code(language)
+    merged = {}
+    for supplement_source in (_EDITOR_TRANSLATION_SUPPLEMENT_COMMON, _EDITOR_TRANSLATION_SUPPLEMENT_MODS, _EDITOR_TRANSLATION_SUPPLEMENT_RULES):
+        payload = supplement_source.get(lang) if isinstance(supplement_source, dict) else None
+        if isinstance(payload, dict):
+            merged.update(payload)
+    return merged
+
+
 def _editor_translation_catalog_from_payload(language: str, payload: Any, source: str = "", error: str = "") -> Dict[str, Any]:
     strings_payload = {}
     if isinstance(payload, dict):
         raw_strings = payload.get("strings") if isinstance(payload.get("strings"), dict) else payload
         if isinstance(raw_strings, dict):
             strings_payload = raw_strings
+    supplement = _editor_translation_builtin_supplement(language)
+    if supplement:
+        merged_payload = dict(supplement)
+        merged_payload.update(strings_payload)
+        strings_payload = merged_payload
 
     exact = {}
     patterns = []
@@ -10218,6 +14874,7 @@ def _editor_translation_catalog_from_payload(language: str, payload: Any, source
         if not key:
             continue
         value = str(raw_value) if raw_value is not None else key
+        value = _editor_translation_rehydrate_placeholders(key, value)
         if _EDITOR_TRANSLATION_TEMPLATE_TOKEN_RE.search(key):
             compiled = _editor_compile_translation_template(key)
             if compiled is not None:
@@ -10233,6 +14890,51 @@ def _editor_translation_catalog_from_payload(language: str, payload: Any, source
         "source": str(source or "builtin"),
         "error": str(error or ""),
     }
+
+
+def _editor_translation_remote_cache_is_stale(cache_path: str, url: str, timeout: int = 5) -> bool:
+    if (not cache_path) or (not os.path.isfile(cache_path)):
+        return True
+    try:
+        local_mtime = float(os.path.getmtime(cache_path))
+    except Exception:
+        local_mtime = 0.0
+    if local_mtime <= 0:
+        return True
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "*/*",
+        "Accept-Encoding": "identity",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    req = urllib.request.Request(url, headers=headers, method="HEAD")
+
+    def _open_with_ctx(ctx=None):
+        if ctx is None:
+            return urllib.request.urlopen(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout, context=ctx)
+
+    try:
+        with _open_with_ctx() as resp:
+            resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+    except Exception as e:
+        if isinstance(e, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(e):
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                with _open_with_ctx(ctx) as resp:
+                    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+            except Exception:
+                return False
+        else:
+            return False
+
+    remote_mtime = _editor_translation_parse_http_timestamp(resp_headers.get("last-modified"))
+    if remote_mtime <= 0:
+        return False
+    return remote_mtime > (local_mtime + 1.0)
 
 
 def _editor_translation_load_catalog(
@@ -10256,23 +14958,31 @@ def _editor_translation_load_catalog(
             pass
 
     file_name = _editor_translation_filename(lang)
-    local_path = os.path.join(_editor_translation_local_dir(), file_name)
     cache_path = _editor_translation_cache_path(file_name)
 
-    candidates = [
-        (local_path, f"local:{local_path}"),
-        (cache_path, f"cache:{cache_path}"),
-    ]
-    for path, source in candidates:
+    local_paths = _editor_translation_local_paths(lang)
+    for path in local_paths:
         payload = _editor_translation_read_json(path)
         if payload:
-            catalog = _editor_translation_catalog_from_payload(lang, payload, source=source)
+            catalog = _editor_translation_catalog_from_payload(lang, payload, source=f"local:{path}")
+            with _EDITOR_TRANSLATION_LOCK:
+                _EDITOR_TRANSLATION_CACHE[cache_key] = dict(catalog)
+            return catalog
+
+    url = urljoin(_EDITOR_TRANSLATION_REMOTE_BASE_URL, file_name)
+    should_try_download = bool(allow_download)
+    if should_try_download and os.path.isfile(cache_path):
+        should_try_download = _editor_translation_remote_cache_is_stale(cache_path, url, timeout=5)
+
+    if os.path.isfile(cache_path) and not should_try_download:
+        payload = _editor_translation_read_json(cache_path)
+        if payload:
+            catalog = _editor_translation_catalog_from_payload(lang, payload, source=f"cache:{cache_path}")
             with _EDITOR_TRANSLATION_LOCK:
                 _EDITOR_TRANSLATION_CACHE[cache_key] = dict(catalog)
             return catalog
 
     if allow_download:
-        url = urljoin(_EDITOR_TRANSLATION_REMOTE_BASE_URL, file_name)
         try:
             data, _ = _http_get_bytes(url, timeout=15)
             payload = json.loads((data or b"").decode("utf-8", errors="replace"))
@@ -10288,6 +14998,13 @@ def _editor_translation_load_catalog(
             download_error = ""
     else:
         download_error = ""
+
+    payload = _editor_translation_read_json(cache_path)
+    if payload:
+        catalog = _editor_translation_catalog_from_payload(lang, payload, source=f"cache:{cache_path}")
+        with _EDITOR_TRANSLATION_LOCK:
+            _EDITOR_TRANSLATION_CACHE[cache_key] = dict(catalog)
+        return catalog
 
     catalog = _editor_translation_catalog_from_payload(
         lang,
@@ -10311,8 +15028,38 @@ def _editor_translation_get_state() -> Dict[str, Any]:
     return state
 
 
-def _editor_translate_display_text(value: Any) -> str:
+_EDITOR_DISPLAY_MOJIBAKE_MARKERS = (
+    "\u00e2\u0161",   # warning/info icon mojibake prefix
+    "\u00e2\u201e",   # info icon mojibake prefix
+    "\u00e2\u20ac",   # punctuation mojibake prefix
+)
+
+
+def _editor_repair_display_mojibake(value: Any) -> str:
     text = "" if value is None else str(value)
+    if (not text) or (not any(marker in text for marker in _EDITOR_DISPLAY_MOJIBAKE_MARKERS)):
+        return text
+
+    candidates = [text]
+    for encoding in ("cp1250", "cp1252"):
+        try:
+            repaired = text.encode(encoding).decode("utf-8")
+        except Exception:
+            continue
+        if repaired and (repaired not in candidates):
+            candidates.append(repaired)
+
+    def _score(candidate: str) -> tuple:
+        bad = candidate.count("\ufffd") * 8
+        for marker in _EDITOR_DISPLAY_MOJIBAKE_MARKERS:
+            bad += candidate.count(marker) * 3
+        return (bad, len(candidate))
+
+    return min(candidates, key=_score)
+
+
+def _editor_translate_display_text(value: Any) -> str:
+    text = _editor_repair_display_mojibake(value)
     if not text:
         return ""
     try:
@@ -10654,6 +15401,41 @@ def _editor_refresh_widget_textvariable(widget) -> None:
         _editor_register_stringvar(var)
 
 
+def _editor_store_notebook_tab_text(notebook, tab_ref, raw_text: Any) -> None:
+    if (not isinstance(notebook, ttk.Notebook)) or (tab_ref is None):
+        return
+    state = _editor_translation_widget_state(notebook)
+    tabs_state = state.setdefault("tabs", {})
+    try:
+        tabs_state[str(tab_ref)] = "" if raw_text is None else str(raw_text)
+    except Exception:
+        pass
+
+
+def _editor_get_notebook_tab_raw_text(notebook, tab_ref) -> str:
+    if (not isinstance(notebook, ttk.Notebook)) or (tab_ref is None):
+        return ""
+    state = _editor_translation_widget_state(notebook)
+    tabs_state = state.setdefault("tabs", {})
+    tab_key = str(tab_ref)
+    if tab_key in tabs_state:
+        return str(tabs_state.get(tab_key) or "")
+    try:
+        raw_text = str(notebook.tab(tab_ref, "text") or "")
+    except Exception:
+        raw_text = ""
+    tabs_state[tab_key] = raw_text
+    return raw_text
+
+
+def _editor_add_notebook_tab(notebook, tab_frame, raw_text: Any, **kwargs) -> None:
+    if not isinstance(notebook, ttk.Notebook):
+        return
+    text_value = "" if raw_text is None else str(raw_text)
+    notebook.add(tab_frame, text=_editor_translate_display_text(text_value), **kwargs)
+    _editor_store_notebook_tab_text(notebook, tab_frame, text_value)
+
+
 def _editor_refresh_notebook_texts(notebook) -> None:
     if not isinstance(notebook, ttk.Notebook):
         return
@@ -10811,6 +15593,48 @@ def _editor_apply_language(
         _EDITOR_TRANSLATION_STATE.update(catalog)
     _editor_apply_language_to_all_windows(root=root)
     return _editor_translation_get_state()
+
+
+def _editor_refresh_language_download_async(root=None, language: Any = None) -> None:
+    lang = _editor_normalize_language_code(language if language is not None else _editor_get_language_preference())
+    if lang == _EDITOR_TRANSLATION_DEFAULT_LANGUAGE:
+        return
+    if any(os.path.isfile(path) for path in _editor_translation_local_paths(lang)):
+        return
+
+    try:
+        current_source = str(_editor_translation_get_state().get("source") or "")
+    except Exception:
+        current_source = ""
+
+    def _worker():
+        try:
+            catalog = _editor_translation_load_catalog(lang, force_reload=True, allow_download=True)
+        except Exception:
+            return
+        refreshed_source = str(catalog.get("source") or "")
+        if (not refreshed_source) or (refreshed_source == current_source):
+            return
+        if root is None:
+            return
+
+        def _apply_refreshed_catalog():
+            try:
+                if _editor_normalize_language_code(_editor_get_language_preference()) != lang:
+                    return
+            except Exception:
+                return
+            _editor_apply_language(root=root, language=lang, allow_download=False, force_reload=True)
+
+        try:
+            root.after(0, _apply_refreshed_catalog)
+        except Exception:
+            pass
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        pass
 
 
 def _editor_translation_status_message() -> str:
@@ -11109,17 +15933,17 @@ def _normalize_text_artifacts(value: Any) -> str:
 
     def _polish(txt: str) -> str:
         t = str(txt or "")
-        t = t.replace("â€”", " - ")
-        t = t.replace("â€“", " - ")
-        t = t.replace("â", " - ")
-        t = t.replace("â", " - ")
-        t = t.replace("—", " - ")
-        t = t.replace("–", " - ")
-        t = t.replace("â€˜", "'").replace("â€™", "'")
-        t = t.replace("â€œ", '"').replace("â€�", '"')
-        t = t.replace("Ã—", "x")
-        t = re.sub(r"(?<=[A-Za-z0-9])\s+à\s+(?=[A-Za-z0-9])", " - ", t)
-        t = re.sub(r"(?<=[A-Za-z0-9])\?(?=[A-Za-z0-9])", " - ", t)
+        # These escaped literals are known mojibake patterns from imported text.
+        t = t.replace("\u0102\u02d8\u00e2\u201a\u00ac\u00e2\u20ac\u0165", " - ")
+        t = t.replace("\u0102\u02d8\u00e2\u201a\u00ac\u00e2\u20ac\u015b", " - ")
+        t = t.replace("\u0102\u02d8\u00c2\u20ac\u00c2\u201d", " - ")
+        t = t.replace("\u0102\u02d8\u00c2\u20ac\u00c2\u201c", " - ")
+        t = t.replace("\u00e2\u20ac\u201d", " - ")
+        t = t.replace("\u00e2\u20ac\u201c", " - ")
+        t = t.replace("\u0102\u02d8\u00e2\u201a\u00ac\u02cb\u015b", "'").replace("\u0102\u02d8\u00e2\u201a\u00ac\u00e2\u201e\u02d8", "'")
+        t = t.replace("\u0102\u02d8\u00e2\u201a\u00ac\u0139\u201c", '"').replace("\u0102\u02d8\u00e2\u201a\u00ac\u010f\u017c\u02dd", '"')
+        t = t.replace("\u0102\u0083\u00e2\u20ac\u201d", "x")
+        t = re.sub(r"(?<=[A-Za-z0-9])\s+\u0102\u00a0\s+(?=[A-Za-z0-9])", " - ", t)
         t = re.sub(r"\s+", " ", t).strip()
         return t
 
@@ -11129,12 +15953,12 @@ def _normalize_text_artifacts(value: Any) -> str:
 
     def _score(txt: str):
         bad = 0
-        bad += txt.count("�") * 8
+        bad += txt.count("\u010f\u017c\u02dd") * 8
         bad += txt.count("\\x") * 3
-        bad += txt.count("Ã") * 3
-        bad += txt.count("Â") * 3
-        bad += txt.count("â") * 2
-        if re.search(r"(?<=[A-Za-z0-9])\s+à\s+(?=[A-Za-z0-9])", txt):
+        bad += txt.count("\u0102\u0083") * 3
+        bad += txt.count("\u0102\u201a") * 3
+        bad += txt.count("\u0102\u02d8") * 2
+        if re.search(r"(?<=[A-Za-z0-9])\s+\u0102\u00a0\s+(?=[A-Za-z0-9])", txt):
             bad += 4
         return (bad, len(txt))
 
@@ -11363,9 +16187,18 @@ class VirtualObjectivesFast:
 
         # start watching save_var only after the object is fully initialized
         try:
+            _editor_register_stringvar(self.source_summary_var)
+        except Exception:
+            pass
+        try:
+            _editor_register_stringvar(self.status_var)
+        except Exception:
+            pass
+        try:
             self._watch_save_var()
         except Exception:
             pass
+
     def tk_var_get(self, var, default=None):
         """
         Thread-safe getter for tkinter Variable-like objects.
@@ -11788,10 +16621,22 @@ class VirtualObjectivesFast:
         _set_objectives_safe_fallback_mode(enabled)
         _update_config_values({"objectives_use_safe_fallback": bool(enabled)})
         try:
+            self._refresh_local_source_controls()
+        except Exception:
+            pass
+        try:
+            _objectives_invalidate_runtime_caches()
+        except Exception:
+            pass
+        try:
+            self.load_data_thread(allow_build=True, preserve_changes=True, keep_existing_items=False, show_loading=True)
+        except Exception:
+            pass
+        try:
             if enabled:
-                self._set_status_temp("Safe fallback enabled — legacy data will be used if local parsing fails", 4000)
+                self._set_status_temp("Forced fallback enabled — using GitHub fallback data.", 4000)
             else:
-                self._set_status_temp("Safe fallback disabled", 2500)
+                self._set_status_temp("Forced fallback disabled — trying initial.pak again.", 3000)
         except Exception:
             pass
 
@@ -11826,8 +16671,21 @@ class VirtualObjectivesFast:
 
         pak_path = str(probe.get("path") or "").strip()
         source_kind = str(probe.get("source") or "").strip()
-        language_summary = f"{_editor_translate_display_text('Language')}: {_objectives_language_label(current)}"
-        if pak_path:
+        forced_fallback = bool(_get_objectives_safe_fallback_mode())
+        active_info = {}
+        try:
+            active_info = _get_objectives_source_info()
+        except Exception:
+            active_info = {}
+
+        active_kind = str((active_info or {}).get("kind") or "").strip().lower()
+        active_lang = str((active_info or {}).get("language") or "").strip() or current
+        language_summary = f"Language: {_objectives_language_label(active_lang)}"
+        if forced_fallback:
+            summary = f"Forced fallback active | {language_summary}"
+        elif active_kind == "fallback":
+            summary = f"Fallback package active | {language_summary}"
+        elif pak_path:
             source_label = {
                 "config": "Saved path",
                 "env": "Environment",
@@ -11872,7 +16730,10 @@ class VirtualObjectivesFast:
         _objectives_invalidate_runtime_caches()
         self._refresh_local_source_controls()
         self.load_data_thread(allow_build=True, preserve_changes=True, keep_existing_items=False, show_loading=True)
-        self._set_status_temp(f"Using initial.pak from {saved}", 3500)
+        if _get_objectives_safe_fallback_mode():
+            self._set_status_temp(f"Saved initial.pak path: {saved}. Forced fallback is still active.", 4500)
+        else:
+            self._set_status_temp(f"Using initial.pak from {saved}", 3500)
 
     def _clear_initial_pak_override(self) -> None:
         _objectives_set_pak_override_path("")
@@ -11988,6 +16849,14 @@ class VirtualObjectivesFast:
             takefocus=0,
         )
         read_btn.pack(side="left", padx=(0, 8))
+
+        self.safe_fallback_cb = ttk.Checkbutton(
+            bottom,
+            text="If initial.pak isn't working check this to force a fallback",
+            variable=self.safe_fallback_var,
+            command=self._on_safe_fallback_toggle,
+        )
+        self.safe_fallback_cb.pack(side="left", padx=(0, 8))
 
         # Status centered between left warning and right action buttons
         self.status_label = ttk.Label(
@@ -13624,8 +18493,9 @@ def create_backups_tab(tab_backups, save_path_var):
         if not path:
             return None
         save_dir = os.path.dirname(path)
-        backup_dir = os.path.join(save_dir, "backup")
-        return backup_dir
+        if not save_dir or not os.path.isdir(save_dir):
+            return None
+        return _save_backup_dir_for_save_dir(save_dir)
 
     def _add_backups_filler_rows(real_count: int):
         """Paint remaining visible area with forced #f0f0f0 rows (theme fallback)."""
@@ -14001,6 +18871,1542 @@ def create_backups_tab(tab_backups, save_path_var):
 
 # ───────────────────────────────────
 
+# TAB: Mods (launch_gui -> tab_mods)
+def create_mods_tab(tab_mods, save_path_var):
+    del save_path_var  # Mods operate on initial.pak, not the loaded save file.
+
+    container = ttk.Frame(tab_mods)
+    container.pack(fill="both", expand=True, padx=8, pady=8)
+
+    source_summary_var = tk.StringVar(tab_mods, value="Checking initial.pak...")
+    winch_choice_var = tk.StringVar(tab_mods, value="Default")
+    winch_length_scale_var = tk.DoubleVar(tab_mods, value=1.0)
+    winch_length_entry_var = tk.StringVar(tab_mods, value="1")
+    winch_strength_scale_var = tk.DoubleVar(tab_mods, value=1.0)
+    winch_strength_entry_var = tk.StringVar(tab_mods, value="1")
+    engine_torque_scale_var = tk.DoubleVar(tab_mods, value=1.0)
+    engine_torque_entry_var = tk.StringVar(tab_mods, value="1")
+    engine_fuel_scale_var = tk.DoubleVar(tab_mods, value=1.0)
+    engine_fuel_entry_var = tk.StringVar(tab_mods, value="1")
+    wheel_radius_scale_var = tk.DoubleVar(tab_mods, value=1.0)
+    wheel_radius_entry_var = tk.StringVar(tab_mods, value="1")
+    wheel_width_scale_var = tk.DoubleVar(tab_mods, value=1.0)
+    wheel_width_entry_var = tk.StringVar(tab_mods, value="1")
+    suspension_height_scale_var = tk.DoubleVar(tab_mods, value=1.0)
+    suspension_height_entry_var = tk.StringVar(tab_mods, value="1")
+    theme_palette = _get_effective_theme()
+    length_multiplier_control = {"set": None}
+    strength_multiplier_control = {"set": None}
+    engine_torque_control = {"set": None}
+    engine_fuel_control = {"set": None}
+    wheel_radius_control = {"set": None}
+    wheel_width_control = {"set": None}
+    suspension_height_control = {"set": None}
+
+    def _attach_hover_tooltip(anchor_widget, tooltip_text):
+        tip_state = {"win": None, "job": None}
+
+        def _cancel_job():
+            job = tip_state.get("job")
+            if job is not None:
+                try:
+                    anchor_widget.after_cancel(job)
+                except Exception:
+                    pass
+                tip_state["job"] = None
+
+        def _hide(_event=None):
+            _cancel_job()
+            tip = tip_state.get("win")
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+                tip_state["win"] = None
+
+        def _show_now():
+            _hide()
+            try:
+                tip = tk.Toplevel(anchor_widget)
+                tip.wm_overrideredirect(True)
+                try:
+                    tip.withdraw()
+                except Exception:
+                    pass
+                try:
+                    tip.attributes("-topmost", True)
+                except Exception:
+                    pass
+                x = int(anchor_widget.winfo_rootx() + anchor_widget.winfo_width() + 8)
+                y = int(anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 6)
+                tip.geometry(f"+{x}+{y}")
+                tk.Label(
+                    tip,
+                    text=str(tooltip_text or ""),
+                    justify="left",
+                    wraplength=440,
+                    bg="#fffbe6",
+                    fg="black",
+                    relief="solid",
+                    bd=1,
+                    padx=8,
+                    pady=6,
+                ).pack()
+                tip_state["win"] = tip
+                try:
+                    tip.deiconify()
+                except Exception:
+                    pass
+            except Exception:
+                _hide()
+
+        def _schedule_show(_event=None):
+            _cancel_job()
+            try:
+                tip_state["job"] = anchor_widget.after(260, _show_now)
+            except Exception:
+                _show_now()
+
+        anchor_widget.bind("<Enter>", _schedule_show, add="+")
+        anchor_widget.bind("<Leave>", _hide, add="+")
+        anchor_widget.bind("<ButtonPress>", _hide, add="+")
+        anchor_widget.bind("<FocusOut>", _hide, add="+")
+
+    def _refresh_related_objectives_views():
+        try:
+            _objectives_invalidate_runtime_caches()
+        except Exception:
+            pass
+        try:
+            _objectives_refresh_active_view_for_shared_language()
+        except Exception:
+            pass
+
+    def _winch_choice_from_mode(mode: Any) -> str:
+        mode_text = str(mode or "").strip().lower()
+        if mode_text == "autonomous":
+            return "All winches are autonomous"
+        if mode_text == "engine":
+            return "All winches need engine"
+        return "Default"
+
+    def _set_status_message(message: str, timeout_ms: int = 5000):
+        set_app_status(f"Mods: {message}", timeout_ms=timeout_ms)
+
+    def _normalize_multiplier_value(raw_value: Any) -> float:
+        try:
+            value = float(raw_value)
+        except Exception:
+            value = 1.0
+        if not math.isfinite(value):
+            value = 1.0
+        value = max(-10.0, min(10.0, value))
+        return round(value, 3)
+
+    def _format_multiplier_value(raw_value: Any) -> str:
+        value = _normalize_multiplier_value(raw_value)
+        return f"{value:.3f}".rstrip("0").rstrip(".") or "0"
+
+    def _bind_multiplier_control(scale_widget, scale_var, entry_widget, entry_var):
+        state = {"busy": False}
+
+        def _set_value(raw_value: Any) -> float:
+            value = _normalize_multiplier_value(raw_value)
+            state["busy"] = True
+            try:
+                scale_var.set(value)
+                entry_var.set(_format_multiplier_value(value))
+            finally:
+                state["busy"] = False
+            return value
+
+        def _on_scale(value):
+            if state["busy"]:
+                return
+            _set_value(_slider_multiplier_value(value, slider_min=slider_min))
+
+        def _on_entry_change(*_args):
+            if state["busy"]:
+                return
+            raw = str(entry_var.get() or "").strip()
+            if raw in {"", "-", ".", "-.", "+", "+."}:
+                return
+            if raw.endswith("."):
+                try:
+                    preview = float(raw[:-1])
+                except Exception:
+                    return
+                state["busy"] = True
+                try:
+                    scale_var.set(_normalize_multiplier_value(preview))
+                finally:
+                    state["busy"] = False
+                return
+            try:
+                value = float(raw)
+            except Exception:
+                return
+            state["busy"] = True
+            try:
+                scale_var.set(_normalize_multiplier_value(value))
+            finally:
+                state["busy"] = False
+
+        def _commit_entry(_event=None):
+            raw = str(entry_var.get() or "").strip()
+            if raw in {"", "-", ".", "-.", "+", "+."}:
+                _set_value(scale_var.get())
+                return
+            try:
+                value = float(raw)
+            except Exception:
+                value = scale_var.get()
+            _set_value(value)
+
+        scale_widget.configure(command=_on_scale)
+        try:
+            entry_var.trace_add("write", _on_entry_change)
+        except Exception:
+            entry_var.trace("w", _on_entry_change)
+        entry_widget.bind("<FocusOut>", _commit_entry, add="+")
+        entry_widget.bind("<Return>", _commit_entry, add="+")
+        return _set_value
+
+    def _refresh_mods_state(sync_dropdowns=True):
+        probe = _initial_pak_probe()
+        pak_path = str(probe.get("path") or "").strip()
+        backup_info = probe.get("backup") if isinstance(probe.get("backup"), dict) else {}
+
+        if pak_path:
+            source_summary_var.set(f"Saved path: {pak_path}")
+        else:
+            source_summary_var.set("Saved path: initial.pak not found")
+
+        analysis = _initial_pak_analyze_winches(pak_path)
+        mode = str(analysis.get("mode") or "").strip().lower()
+        length_analysis = _initial_pak_analyze_winch_multiplier(pak_path, "Length")
+        strength_analysis = _initial_pak_analyze_winch_multiplier(pak_path, "StrengthMult")
+        engine_torque_analysis = _initial_pak_analyze_numeric_module(pak_path, "engine_torque")
+        engine_fuel_analysis = _initial_pak_analyze_numeric_module(pak_path, "engine_fuel_consumption")
+        wheel_radius_analysis = _initial_pak_analyze_numeric_module(pak_path, "wheel_radius")
+        wheel_width_analysis = _initial_pak_analyze_numeric_module(pak_path, "wheel_width")
+        suspension_height_analysis = _initial_pak_analyze_numeric_module(pak_path, "suspension_height")
+        if sync_dropdowns:
+            winch_choice_var.set(_winch_choice_from_mode(mode))
+            length_setter = length_multiplier_control.get("set")
+            strength_setter = strength_multiplier_control.get("set")
+            if callable(length_setter):
+                length_value = length_analysis.get("multiplier", 1.0) if length_analysis.get("state") == "uniform" else 1.0
+                length_setter(length_value)
+            if callable(strength_setter):
+                strength_value = strength_analysis.get("multiplier", 1.0) if strength_analysis.get("state") == "uniform" else 1.0
+                strength_setter(strength_value)
+            for control_store, module_analysis in (
+                (engine_torque_control, engine_torque_analysis),
+                (engine_fuel_control, engine_fuel_analysis),
+                (wheel_radius_control, wheel_radius_analysis),
+                (wheel_width_control, wheel_width_analysis),
+                (suspension_height_control, suspension_height_analysis),
+            ):
+                setter = control_store.get("set")
+                if callable(setter):
+                    slider_value = module_analysis.get("multiplier", 1.0) if module_analysis.get("state") == "uniform" else 1.0
+                    setter(slider_value)
+
+        path_ready = bool(pak_path)
+        backup_ready = bool(backup_info and str(backup_info.get("file_path") or "").strip())
+        create_backup_btn.config(state=("normal" if path_ready else "disabled"))
+        recall_backup_btn.config(state=("normal" if (path_ready and backup_ready) else "disabled"))
+        apply_all_btn.config(state=("normal" if path_ready else "disabled"))
+
+    def _choose_initial_pak():
+        try:
+            start_dir = ""
+            existing = _objectives_get_pak_override_path() or _initial_pak_probe().get("path", "")
+            if existing:
+                start_dir = os.path.dirname(existing)
+            path = filedialog.askopenfilename(
+                title="Select initial.pak",
+                initialdir=start_dir or None,
+                initialfile="initial.pak",
+                filetypes=[("initial.pak", "initial.pak"), ("PAK files", "*.pak")],
+            )
+        except Exception:
+            path = ""
+        if not path:
+            return
+        if os.path.basename(path).lower() != "initial.pak":
+            messagebox.showerror("Invalid file", "Only files named initial.pak can be selected.")
+            return
+        saved = _objectives_set_pak_override_path(path)
+        _refresh_related_objectives_views()
+        _refresh_mods_state(sync_dropdowns=True)
+        _set_status_message(f"Using initial.pak from {saved}", timeout_ms=4000)
+
+    def _create_manual_backup():
+        probe = _initial_pak_probe()
+        pak_path = str(probe.get("path") or "").strip()
+        if not pak_path:
+            _set_status_message("Select initial.pak first.", timeout_ms=6500)
+            return
+
+        existing = probe.get("backup") if isinstance(probe.get("backup"), dict) else {}
+        replace_existing = False
+        if existing and str(existing.get("file_path") or "").strip():
+            replace_existing = bool(
+                messagebox.askyesno(
+                    "Replace backup",
+                    "A Mods backup already exists.\n\n"
+                    "Create a new one and replace the current revert backup?",
+                )
+            )
+            if not replace_existing:
+                return
+
+        info = _initial_pak_create_backup(pak_path, replace_existing=replace_existing)
+        _refresh_mods_state(sync_dropdowns=False)
+        if info.get("created"):
+            _set_status_message(f"Created backup: {info.get('name', '')}")
+        else:
+            _set_status_message(f"Using existing backup: {info.get('name', '')}")
+
+    def _recall_backup():
+        probe = _initial_pak_probe()
+        pak_path = str(probe.get("path") or "").strip()
+        if not pak_path:
+            _set_status_message("Select initial.pak first.", timeout_ms=6500)
+            return
+
+        backup_info = probe.get("backup") if isinstance(probe.get("backup"), dict) else {}
+        backup_name = str(backup_info.get("name") or "").strip()
+        if not backup_name:
+            _set_status_message("No initial.pak backup is available yet.", timeout_ms=6500)
+            return
+        if not messagebox.askyesno(
+            "Recall initial.pak backup",
+            f"Restore the whole initial.pak from backup '{backup_name}'?\n\nThis overwrites the current file.",
+        ):
+            return
+
+        restored = _initial_pak_restore_backup(pak_path)
+        _refresh_related_objectives_views()
+        _refresh_mods_state(sync_dropdowns=True)
+        _set_status_message(f"Restored backup: {restored.get('name', '')}", timeout_ms=6500)
+
+    def _apply_winch_module(selected_label: str):
+        mode_map = {
+            "All winches are autonomous": "autonomous",
+            "All winches need engine": "engine",
+            "Default": "default",
+        }
+        mode = mode_map.get(selected_label, "default")
+
+        pak_path = _initial_pak_resolve_path()
+        if not pak_path:
+            raise FileNotFoundError("Select initial.pak first.")
+
+        probe = _initial_pak_probe()
+        backup_info = probe.get("backup") if isinstance(probe.get("backup"), dict) else {}
+        backup_ready = bool(str(backup_info.get("file_path") or "").strip())
+        current_analysis = _initial_pak_analyze_winches(pak_path)
+        current_mode = str(current_analysis.get("mode") or "").strip().lower()
+        if mode == current_mode:
+            return {"changed": False, "message": "Winches: no changes were needed."}
+        if mode == "default" and (not backup_ready) and current_mode not in {"autonomous", "engine"}:
+            return {"changed": False, "message": "Winches: no backup exists yet, so default values were left unchanged."}
+
+        backup_created = False
+        if mode in {"autonomous", "engine"}:
+            backup_info = _initial_pak_create_backup(pak_path, replace_existing=False)
+            backup_created = bool(backup_info.get("created"))
+
+        result = _initial_pak_apply_winch_mode(pak_path, mode)
+        changed_values = int(result.get("changed_values") or 0)
+        skipped_defaults = len(result.get("missing_defaults") or []) + len(result.get("unmatched_defaults") or [])
+        if changed_values <= 0:
+            if mode == "default" and skipped_defaults:
+                return {
+                    "changed": False,
+                    "message": f"Winches: no changes were needed. {skipped_defaults} default entries could not be matched.",
+                }
+            return {"changed": False, "message": "Winches: no changes were needed."}
+
+        if mode == "default":
+            suffix = f" {skipped_defaults} entries were skipped." if skipped_defaults else ""
+            return {
+                "changed": True,
+                "message": f"Winches: restored {changed_values} values from the saved initial.pak backup.{suffix}",
+            }
+
+        suffix = " Backup created first." if backup_created else ""
+        return {
+            "changed": True,
+            "message": f"Winches: updated {changed_values} values in {int(result.get('changed_files') or 0)} files.{suffix}",
+        }
+
+    def _apply_winch_multiplier_module(attr_name: str, multiplier_value: float, label: str):
+        pak_path = _initial_pak_resolve_path()
+        if not pak_path:
+            raise FileNotFoundError("Select initial.pak first.")
+
+        result = _initial_pak_apply_winch_multiplier(pak_path, attr_name, multiplier_value)
+        return _format_numeric_module_result(result, multiplier_value, label)
+
+    def _format_numeric_module_result(result: Dict[str, Any], requested_multiplier: float, label: str):
+        changed_values = int(result.get("changed_values") or 0)
+        changed_files = int(result.get("changed_files") or 0)
+        created_backup = bool(result.get("created_backup"))
+        current_state = str(result.get("state") or "").strip().lower()
+        requested_multiplier = float(result.get("requested_multiplier", requested_multiplier) or 0.0)
+
+        if changed_values <= 0:
+            if current_state == "no_backup" and abs(requested_multiplier - 1.0) <= 1e-9:
+                return {
+                    "changed": False,
+                    "message": f"{label}: no backup exists yet, so default values were left unchanged.",
+                }
+            return {"changed": False, "message": f"{label}: no changes were needed."}
+
+        if abs(requested_multiplier - 1.0) <= 1e-9:
+            return {
+                "changed": True,
+                "message": f"{label}: restored {changed_values} values from the saved initial.pak backup.",
+            }
+
+        suffix = " Backup created first." if created_backup else ""
+        return {
+            "changed": True,
+            "message": f"{label}: updated {changed_values} values in {changed_files} files.{suffix}",
+        }
+
+    def _apply_numeric_multiplier_module(module_id: str, multiplier_value: float, label: str):
+        pak_path = _initial_pak_resolve_path()
+        if not pak_path:
+            raise FileNotFoundError("Select initial.pak first.")
+
+        result = _initial_pak_apply_numeric_module(pak_path, module_id, multiplier_value)
+        return _format_numeric_module_result(result, multiplier_value, label)
+
+    def _apply_all_modules():
+        try:
+            selected_mode = str(winch_choice_var.get() or "").strip()
+            length_multiplier = _normalize_multiplier_value(winch_length_entry_var.get() or winch_length_scale_var.get())
+            strength_multiplier = _normalize_multiplier_value(winch_strength_entry_var.get() or winch_strength_scale_var.get())
+            engine_torque_multiplier = _normalize_multiplier_value(engine_torque_entry_var.get() or engine_torque_scale_var.get())
+            engine_fuel_multiplier = _normalize_multiplier_value(engine_fuel_entry_var.get() or engine_fuel_scale_var.get())
+            wheel_radius_multiplier = _normalize_multiplier_value(wheel_radius_entry_var.get() or wheel_radius_scale_var.get())
+            wheel_width_multiplier = _normalize_multiplier_value(wheel_width_entry_var.get() or wheel_width_scale_var.get())
+            suspension_height_multiplier = _normalize_multiplier_value(suspension_height_entry_var.get() or suspension_height_scale_var.get())
+            messages = []
+            changed_any = False
+
+            for result in (
+                _apply_winch_module(selected_mode),
+                _apply_winch_multiplier_module("Length", length_multiplier, "Winch length multiplier"),
+                _apply_winch_multiplier_module("StrengthMult", strength_multiplier, "Winch strength multiplier"),
+                _apply_numeric_multiplier_module("engine_torque", engine_torque_multiplier, "Engine torque multiplier"),
+                _apply_numeric_multiplier_module("engine_fuel_consumption", engine_fuel_multiplier, "Engine fuel consumption multiplier"),
+                _apply_numeric_multiplier_module("wheel_radius", wheel_radius_multiplier, "Wheel radius multiplier"),
+                _apply_numeric_multiplier_module("wheel_width", wheel_width_multiplier, "Wheel width multiplier"),
+                _apply_numeric_multiplier_module("suspension_height", suspension_height_multiplier, "Suspension height multiplier"),
+            ):
+                if not isinstance(result, dict):
+                    continue
+                changed_any = bool(result.get("changed")) or changed_any
+                message = str(result.get("message") or "").strip()
+                if message:
+                    messages.append(message)
+
+            if changed_any:
+                _refresh_related_objectives_views()
+            _refresh_mods_state(sync_dropdowns=True)
+            if messages:
+                _set_status_message(" | ".join(messages), timeout_ms=9000 if changed_any else 6500)
+        except FileNotFoundError as e:
+            _set_status_message(str(e), timeout_ms=7000)
+        except Exception as e:
+            messagebox.showerror("Mods", f"Failed to apply mods:\n{e}")
+
+    topbar = ttk.Frame(container)
+    topbar.pack(fill="x", pady=(0, 6))
+
+    ttk.Button(topbar, text="initial.pak", command=_choose_initial_pak).pack(side="left", padx=(0, 8))
+    ttk.Label(topbar, textvariable=source_summary_var, anchor="w", justify="left").pack(
+        side="left",
+        fill="x",
+        expand=True,
+    )
+
+    create_backup_btn = ttk.Button(topbar, text="Create Backup", command=_create_manual_backup)
+    create_backup_btn.pack(side="right", padx=(6, 0))
+
+    recall_backup_btn = ttk.Button(topbar, text="Recall Backup", command=_recall_backup)
+    recall_backup_btn.pack(side="right", padx=(6, 0))
+
+    warn_badge = tk.Label(
+        topbar,
+        text="i",
+        width=2,
+        relief="ridge",
+        bd=1,
+        highlightthickness=0,
+        cursor="question_arrow",
+        bg="#b3261e",
+        fg="white",
+    )
+    warn_badge.pack(side="right", padx=(6, 0))
+    _attach_hover_tooltip(
+        warn_badge,
+        "Mods edit initial.pak directly.\n\n"
+        "Game updates can replace or change these files. After a game update, it is safer to verify the game files first "
+        "so the game rewrites initial.pak, then re-apply only the modules you still want.",
+    )
+
+    modules_host = ttk.Frame(container)
+    modules_host.pack(fill="both", expand=True, pady=(6, 12))
+    for col in range(3):
+        modules_host.columnconfigure(col, weight=1, uniform="mods_col")
+
+    def _build_module_card(parent, row_idx, col_idx, title, variable, values):
+        card = tk.Frame(
+            parent,
+            bd=2,
+            relief="solid",
+            bg=theme_palette["bg"],
+            highlightthickness=0,
+        )
+        card.grid(row=row_idx, column=col_idx, padx=8, pady=8, sticky="nsew")
+        try:
+            card.configure(height=118)
+            card.grid_propagate(False)
+        except Exception:
+            pass
+
+        inner = ttk.Frame(card, padding=(10, 8))
+        inner.pack(fill="both", expand=True)
+
+        ttk.Label(inner, text=title, font=("TkDefaultFont", 10), wraplength=180, justify="left").pack(anchor="w", pady=(0, 10))
+        ttk.Combobox(
+            inner,
+            textvariable=variable,
+            values=list(values),
+            state="readonly",
+            width=26,
+        ).pack(fill="x")
+        return card
+
+    def _build_slider_module_card(parent, row_idx, col_idx, title, scale_var, entry_var, control_store):
+        card = tk.Frame(
+            parent,
+            bd=2,
+            relief="solid",
+            bg=theme_palette["bg"],
+            highlightthickness=0,
+        )
+        card.grid(row=row_idx, column=col_idx, padx=8, pady=8, sticky="nsew")
+        try:
+            card.configure(height=118)
+            card.grid_propagate(False)
+        except Exception:
+            pass
+
+        inner = ttk.Frame(card, padding=(10, 8))
+        inner.pack(fill="both", expand=True)
+
+        ttk.Label(inner, text=title, font=("TkDefaultFont", 10), wraplength=180, justify="left").pack(anchor="w", pady=(0, 10))
+        row = ttk.Frame(inner)
+        row.pack(fill="x")
+        scale = ttk.Scale(row, from_=-10.0, to=10.0, variable=scale_var, orient="horizontal", length=150)
+        scale.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        entry = ttk.Entry(row, textvariable=entry_var, width=6)
+        entry.pack(side="left")
+        control_store["set"] = _bind_multiplier_control(scale, scale_var, entry, entry_var)
+        return card
+
+    _build_module_card(
+        modules_host,
+        0,
+        0,
+        "Winches",
+        winch_choice_var,
+        ("All winches are autonomous", "All winches need engine", "Default"),
+    )
+    _build_slider_module_card(
+        modules_host,
+        0,
+        1,
+        "Winch length multiplier",
+        winch_length_scale_var,
+        winch_length_entry_var,
+        length_multiplier_control,
+    )
+    _build_slider_module_card(
+        modules_host,
+        0,
+        2,
+        "Winch strength multiplier",
+        winch_strength_scale_var,
+        winch_strength_entry_var,
+        strength_multiplier_control,
+    )
+    _build_slider_module_card(
+        modules_host,
+        1,
+        0,
+        "Engine torque multiplier",
+        engine_torque_scale_var,
+        engine_torque_entry_var,
+        engine_torque_control,
+    )
+    _build_slider_module_card(
+        modules_host,
+        1,
+        1,
+        "Engine fuel consumption multiplier",
+        engine_fuel_scale_var,
+        engine_fuel_entry_var,
+        engine_fuel_control,
+    )
+    _build_slider_module_card(
+        modules_host,
+        1,
+        2,
+        "Wheel radius multiplier",
+        wheel_radius_scale_var,
+        wheel_radius_entry_var,
+        wheel_radius_control,
+    )
+    _build_slider_module_card(
+        modules_host,
+        2,
+        0,
+        "Wheel width multiplier",
+        wheel_width_scale_var,
+        wheel_width_entry_var,
+        wheel_width_control,
+    )
+    _build_slider_module_card(
+        modules_host,
+        2,
+        1,
+        "Suspension height multiplier",
+        suspension_height_scale_var,
+        suspension_height_entry_var,
+        suspension_height_control,
+    )
+
+    bottom = ttk.Frame(container)
+    bottom.pack(fill="x", pady=(8, 0))
+    ttk.Frame(bottom).pack(side="left", expand=True)
+    apply_all_btn = ttk.Button(bottom, text="Apply", command=_apply_all_modules, width=18)
+    apply_all_btn.pack(side="left")
+    ttk.Frame(bottom).pack(side="left", expand=True)
+
+    _refresh_mods_state(sync_dropdowns=True)
+
+
+def create_mods_tab_expanded(tab_mods, save_path_var):
+    del save_path_var  # Mods operate on initial.pak, not the loaded save file.
+
+    container = ttk.Frame(tab_mods)
+    container.pack(fill="both", expand=True, padx=8, pady=8)
+
+    source_summary_var = tk.StringVar(tab_mods, value="Checking initial.pak...")
+    try:
+        _editor_register_stringvar(source_summary_var)
+    except Exception:
+        pass
+    theme_palette = _get_effective_theme()
+    winch_choices = ("All winches are autonomous", "All winches need engine", "Default")
+    toggle_choices = ("On", "Off", "Default")
+    module_vars = {}
+    module_controls = {}
+    module_last_values = {}
+    module_sync_state = {"request_id": 0, "loading": False}
+
+    def _attach_hover_tooltip(anchor_widget, tooltip_text):
+        tip_state = {"win": None, "job": None}
+
+        def _cancel_job():
+            job = tip_state.get("job")
+            if job is not None:
+                try:
+                    anchor_widget.after_cancel(job)
+                except Exception:
+                    pass
+                tip_state["job"] = None
+
+        def _hide(_event=None):
+            _cancel_job()
+            tip = tip_state.get("win")
+            if tip is not None:
+                try:
+                    tip.destroy()
+                except Exception:
+                    pass
+                tip_state["win"] = None
+
+        def _show_now():
+            _hide()
+            try:
+                tip = tk.Toplevel(anchor_widget)
+                tip.wm_overrideredirect(True)
+                try:
+                    tip.withdraw()
+                except Exception:
+                    pass
+                try:
+                    tip.attributes("-topmost", True)
+                except Exception:
+                    pass
+                x = int(anchor_widget.winfo_rootx() + anchor_widget.winfo_width() + 8)
+                y = int(anchor_widget.winfo_rooty() + anchor_widget.winfo_height() + 6)
+                tip.geometry(f"+{x}+{y}")
+                tk.Label(
+                    tip,
+                    text=str(tooltip_text or ""),
+                    justify="left",
+                    wraplength=440,
+                    bg="#fffbe6",
+                    fg="black",
+                    relief="solid",
+                    bd=1,
+                    padx=8,
+                    pady=6,
+                ).pack()
+                tip_state["win"] = tip
+                try:
+                    tip.deiconify()
+                except Exception:
+                    pass
+            except Exception:
+                _hide()
+
+        def _schedule_show(_event=None):
+            _cancel_job()
+            try:
+                tip_state["job"] = anchor_widget.after(260, _show_now)
+            except Exception:
+                _show_now()
+
+        anchor_widget.bind("<Enter>", _schedule_show, add="+")
+        anchor_widget.bind("<Leave>", _hide, add="+")
+        anchor_widget.bind("<ButtonPress>", _hide, add="+")
+        anchor_widget.bind("<FocusOut>", _hide, add="+")
+
+    def _refresh_related_objectives_views():
+        try:
+            _objectives_invalidate_runtime_caches()
+        except Exception:
+            pass
+        try:
+            _objectives_refresh_active_view_for_shared_language()
+        except Exception:
+            pass
+
+    def _winch_choice_from_mode(mode: Any) -> str:
+        mode_text = str(mode or "").strip().lower()
+        if mode_text == "autonomous":
+            return "All winches are autonomous"
+        if mode_text == "engine":
+            return "All winches need engine"
+        return "Default"
+
+    def _toggle_choice_from_state(state: Any) -> str:
+        return "On" if str(state or "").strip().lower() == "enabled" else "Default"
+
+    def _boolean_toggle_choice_from_state(state: Any) -> str:
+        state_text = str(state or "").strip().lower()
+        if state_text == "enabled":
+            return "On"
+        if state_text == "disabled":
+            return "Off"
+        return "Default"
+
+    def _camera_collisions_choice_from_state(state: Any) -> str:
+        state_text = str(state or "").strip().lower()
+        if state_text == "default":
+            return "On"
+        if state_text == "enabled":
+            return "Off"
+        return "Default"
+
+    def _set_status_message(message: str, timeout_ms: int = 5000):
+        set_app_status(f"Mods: {message}", timeout_ms=timeout_ms)
+
+    def _module_info(location="", example="", how="", notes="", ui_extra=""):
+        parts = []
+        if location:
+            parts.append(f"Location: {location}")
+        if example:
+            parts.append(f"Example: {example}")
+        if ui_extra:
+            parts.append(f"Extra: {ui_extra}")
+        if how:
+            parts.append(f"How: {how}")
+        if notes:
+            parts.append(f"Notes: {notes}")
+        parts.append("Default restores values from the saved Mods backup.")
+        return "\n\n".join(parts)
+
+    def _slider_def(module_id, title, *, info="", winch_attr=None, slider_min=-10.0):
+        return {
+            "kind": "slider",
+            "module_id": module_id,
+            "title": title,
+            "info": info,
+            "winch_attr": winch_attr,
+            "slider_min": slider_min,
+        }
+
+    def _choice_def(module_id, title, values, *, info=""):
+        return {"kind": "choice", "module_id": module_id, "title": title, "values": tuple(values or ()), "info": info}
+
+    def _toggle_def(module_id, title, *, info=""):
+        return {"kind": "toggle", "module_id": module_id, "title": title, "values": toggle_choices, "info": info}
+
+    module_defs = [
+        _choice_def("winch_mode", "Winches", winch_choices, info=_module_info(location="initial-media-classes-winches", example='IsEngineIgnitionRequired="true"', how="switch every winch between engine-only, autonomous, or the backed-up default state", notes="uses the same backup/restore flow as the other Mods tab actions")),
+        _slider_def("winch_length", "Winch length multiplier", winch_attr="Length", info=_module_info(location="initial-media-classes-winches", example='Length="14"', how="scale Winch Length values across base + DLC winch XMLs")),
+        _slider_def("winch_strength", "Winch strength multiplier", winch_attr="StrengthMult", info=_module_info(location="initial-media-classes-winches", example='StrengthMult="1.0"', how="scale Winch StrengthMult values across base + DLC winch XMLs")),
+        _slider_def("engine_torque", "Engine torque multiplier", info=_module_info(location="initial-media-classes-engines", example='Torque="135000"'), slider_min=0.1),
+        _slider_def("engine_fuel_consumption", "Engine fuel consumption multiplier", info=_module_info(location="initial-media-classes-engines", example='FuelConsumption="1.1"'), slider_min=0.1),
+        _slider_def("engine_damage_capacity", "Engine durability multiplier", info=_module_info(location="initial-media-classes-engines", example='DamageCapacity="200"'), slider_min=0.1),
+        _slider_def("engine_responsiveness", "Engine responsiveness multiplier", info=_module_info(location="initial-media-classes-engines", example='EngineResponsiveness="0.035"')),
+        _slider_def("gearbox_fuel_consumption", "Gearbox fuel consumption multiplier", info=_module_info(location="initial-media-classes-gearboxes", example='FuelConsumption="3.3"'), slider_min=0.1),
+        _slider_def("gearbox_idle_fuel_modifier", "Gearbox idle fuel modifier multiplier", info=_module_info(location="initial-media-classes-gearboxes", example='IdleFuelModifier="0.3"')),
+        _slider_def("gearbox_awd_fuel_penalty", "Gearbox AWD fuel penalty multiplier", info=_module_info(location="initial-media-classes-gearboxes", example='AWDConsumptionModifier="1.4"')),
+        _slider_def("soft_suspension", "Soft suspension multiplier", info=_module_info(location="initial-media-classes-trucks direct hinge motors", example='Damping="24000" Spring="240000"', ui_extra="lower than 1 softens, higher than 1 stiffens", how='scale the main truck hinge Motor Spring and Damping values that the soft-suspension mod touches, while leaving frame-angle limits to the separate Flexible frame slider', notes="closest clean slider version of the soft suspension part from the mod pack; filtered to the main truck hinge springs instead of every tiny helper motor")),
+        _slider_def("suspension_height", "Suspension height multiplier", info=_module_info(location="initial-media-classes-suspensions", example='Height="0.12"')),
+        _slider_def("suspension_damage_capacity", "Suspension durability multiplier", info=_module_info(location="initial-media-classes-suspensions", example='DamageCapacity="160"'), slider_min=0.1),
+        _slider_def("tire_asphalt_grip", "Tire asphalt grip multiplier", info=_module_info(location="initial-media-classes-wheels", example='BodyFrictionAsphalt="1.6"', how="edit BodyFrictionAsphalt on wheel files in base + DLC instead of hardcoding one preset value", notes="better slider-style version of tire friction booster for asphalt grip only")),
+        _slider_def("tire_offroad_grip", "Tire offroad grip multiplier", info=_module_info(location="initial-media-classes-wheels", example='BodyFriction="1.7"', how="edit BodyFriction on wheel files in base + DLC instead of replacing whole wheel XMLs", notes="better slider-style version of tire friction booster for offroad grip only")),
+        _slider_def("tire_mud_grip", "Tire mud grip multiplier", info=_module_info(location="initial-media-classes-wheels", example='SubstanceFriction="1.0"', how="edit SubstanceFriction on wheel files in base + DLC instead of replacing whole wheel XMLs", notes="better slider-style version of tire friction booster for mud grip only")),
+        _slider_def("wheel_radius", "Wheel radius multiplier", info=_module_info(location="initial-media-classes-wheels", example='Radius="1"'), slider_min=0.1),
+        _slider_def("wheel_width", "Wheel width multiplier", info=_module_info(location="initial-media-classes-wheels", example='Width="0.84"'), slider_min=0.1),
+        _slider_def("truck_fuel_capacity", "Truck fuel tank capacity multiplier", info=_module_info(location="initial-media-classes-trucks", example='FuelCapacity="285"', how="edit TruckData FuelCapacity across truck XMLs in base + DLC only", notes="better than the fixed 1000L fuel mod because it avoids unrelated truck edits")),
+        _slider_def("truck_body_durability", "Truck body durability multiplier", info=_module_info(location="initial-media-classes-trucks", example='DamageCapacity="50"')),
+        _slider_def("service_fuel_capacity", "Service fuel capacity multiplier", info=_module_info(location="initial-media-classes-trucks-addons-trailers", example='FuelCapacity="1400"')),
+        _slider_def("service_repairs_capacity", "Service repair points multiplier", info=_module_info(location="initial-media-classes-trucks-addons-trailers", example='RepairsCapacity="300"')),
+        _slider_def("service_wheel_repairs_capacity", "Service wheel repair points multiplier", info=_module_info(location="initial-media-classes-trucks-addons-trailers", example='WheelRepairsCapacity="5"')),
+        _slider_def("water_capacity", "Water tank capacity multiplier", info=_module_info(location="initial-media-classes-trucks-addons-trailers", example='WaterCapacity="2800"')),
+        _slider_def("wheel_softness", "Wheel softness multiplier", info=_module_info(location="initial-_templates-trucks + initial-media-classes-wheels", example='SoftForceScale="0.32"')),
+        _slider_def("cargo_load_mass", "Cargo load mass multiplier", info=_module_info(location="initial-media-classes-trucks-cargo", example='Mass="4000"', ui_extra="careful range", how="edit Mass on cargo physics bodies so loose cargo feels lighter or heavier", notes="can affect cargo stability")),
+        _slider_def("truck_steering_responsiveness", "Truck steering responsiveness multiplier", info=_module_info(location="initial-media-classes-trucks + DLC trucks", example='Responsiveness="0.25"', how="scale TruckData Responsiveness across truck XMLs", notes="inspired by the responsive steering mod, but cleaner because it only edits Responsiveness")),
+        _slider_def("flexible_frame", "Flexible frame multiplier", info=_module_info(location="initial-media-classes-trucks body twist blocks", example='MinLimit="-7" / MaxLimit="7"', ui_extra="physics risk", how='scale <Twist><Constraint Type="Hinge"> MinLimit/MaxLimit values on trucks that expose a body twist block', notes="current game data only exposes this on a small number of trucks, so this is a narrow frame-flex edit, not a blanket suspension edit")),
+        _slider_def("crane_motor_strength", "Crane motor strength multiplier", info=_module_info(location="initial-media-classes-trucks-addons + DLC crane addons", example='Force="800000"', ui_extra="physics risk", how="scale crane Motor Force values inside constraint blocks", notes="closest clean equivalent to crane lifting strength")),
+        _slider_def("crane_mass", "Crane mass multiplier", info=_module_info(location="initial-media-classes-trucks-addons + DLC crane addons", example='Mass="800"')),
+        _slider_def("addon_store_price", "Addon and trailer price multiplier", info=_module_info(location="initial-media-classes-trucks-addons-trailers", example='Price="3400"', how="scale GameData Price on addon and trailer XMLs without touching trucks"), slider_min=0.0),
+        _toggle_def("all_tires_ignore_ice", "All tires ignore ice", info=_module_info(location="initial-media-classes-wheels + initial-_templates-trucks", example='IsIgnoreIce="true"', ui_extra="On forces true, Off forces false, Default restores the backed-up attribute state", how="set or add IsIgnoreIce on every WheelFriction tag so normal tires can behave like ice-ignoring tires", notes="inspired by Vanilla++ tire balancing; extreme because SnowRunner treats this as a boolean flag")),
+        _toggle_def("camera_collisions", "Camera collisions", info=_module_info(location="initial-media-classes-models + DLC world/object models", example='ClipCamera="true" / ClipCamera="false"', ui_extra="On / Off / Default", how='On forces ClipCamera="true", Off forces ClipCamera="false", and Default restores the backed-up model values', notes="based on the no collision camera mod logic, without bundling its separate wheel-grip variants")),
+        _toggle_def("craneable_logs_everywhere", "Craneable logs", info=_module_info(location="initial-media-classes-models + DLC log cargo models", example='<LoadPoint Pos="(-2.0;0;0)" />', ui_extra="On / Off / Default", how="for log cargo models with LoadPoint but no CraneSocket, add crane sockets derived from load point positions", notes="improves the online craneable logs mod because it can cover base logs, DLC logs, and burnt logs instead of only some seasons")),
+        _toggle_def("winchable_cargo_everywhere", "Winchable cargo", info=_module_info(location="initial-media-classes-models + DLC cargo models", example='<CraneSocket Pos="(0.000; 0.988; 0.000)" />', ui_extra="On / Off / Default", how="add WinchSocket at existing CraneSocket positions for cargo models that are craneable but not winchable", notes="better than the cargo preset mod because it can auto-cover most craneable cargo; current pack has many crane-only cargo models")),
+        _slider_def("grass_draw_distance", "Grass and debris draw distance multiplier", info=_module_info(location="initial-media-classes-grass + DLC grass", example='FadeDistances="10, 20, 30"', how="scale each FadeDistances triple in grass and debris XMLs", notes="better than the LOD mod preset because it can be tuned instead of hardcoded")),
+        _slider_def("tire_sink_deflation", "Tire sink / deflation multiplier", info=_module_info(location="initial-_templates-trucks + initial-media-classes-wheels", example='RadiusOffset="0.025"', ui_extra="wheel softness templates", how="scale WheelSoftness RadiusOffset values without touching unrelated template content", notes="closest useful part of the tire pressure mod, but cleaner and safer")),
+        _slider_def("truck_camera_fov", "Truck camera FOV multiplier", info=_module_info(location="initial-media-classes-trucks direct truck XMLs", example='FOV="65"', how="scale CameraPos FOV values on direct truck files only"), slider_min=0.1),
+        _slider_def("truck_camera_max_zoom", "Truck camera max zoom multiplier", info=_module_info(location="initial-media-classes-trucks direct truck XMLs", example='MaxZoom="8"', how="scale CameraPos MaxZoom values on direct truck files only"), slider_min=0.1),
+        _slider_def("truck_render_distance", "Truck render distance multiplier", info=_module_info(location="initial-media-classes-trucks direct truck XMLs", example='HideDistance="120"', how="scale TruckData HideDistance values on direct truck files only"), slider_min=0.1),
+        _slider_def("truck_shadow_distance", "Truck shadow distance multiplier", info=_module_info(location="initial-media-classes-trucks direct truck XMLs", example='ShadowHideDistance="70"', how="scale TruckData ShadowHideDistance values on direct truck files only"), slider_min=0.1),
+        _toggle_def("truck_store_everywhere", "Truck store everywhere", info=_module_info(location="initial-media-classes-trucks direct truck XMLs", example='Country="US,RU,NE,CE,CAS,WA"', ui_extra="On makes truck store regions include every known game region; Off and Default restore backup values", how="replace each direct truck GameData Country list with the full region set so trucks can show in every regional truck store", notes="based on the Vanilla++ all-trucks-purchaseable-anywhere edit")),
+        _slider_def("truck_store_price", "Truck store price multiplier", info=_module_info(location="initial-media-classes-trucks direct truck XMLs", example='Price="26300"', how="scale direct truck GameData Price values without touching addons or trailers"), slider_min=0.0),
+        _slider_def("truck_unlock_rank", "Truck unlock rank multiplier", info=_module_info(location="initial-media-classes-trucks direct truck XMLs", example='UnlockByRank="8"', how="scale direct truck GameData UnlockByRank values; use 0 to remove rank requirements where the game accepts rank 0"), slider_min=0.0),
+    ]
+    module_defs.sort(key=lambda item: str(item.get("title") or "").casefold())
+
+    for module_def in module_defs:
+        module_id = str(module_def.get("module_id") or "").strip()
+        if str(module_def.get("kind") or "").strip().lower() == "slider":
+            module_vars[module_id] = {"scale_var": tk.DoubleVar(tab_mods, value=1.0), "entry_var": tk.StringVar(tab_mods, value="1")}
+            module_controls[module_id] = {"set": None, "get": None}
+            module_last_values[module_id] = 1.0
+        else:
+            module_vars[module_id] = {"value_var": tk.StringVar(tab_mods, value="Default")}
+            module_last_values[module_id] = "Default"
+
+    def _normalize_multiplier_value(raw_value: Any) -> float:
+        try:
+            value = float(raw_value)
+        except Exception:
+            value = 1.0
+        if not math.isfinite(value):
+            value = 1.0
+        return float(value)
+
+    def _slider_multiplier_value(raw_value: Any, slider_min: float = -10.0) -> float:
+        value = _normalize_multiplier_value(raw_value)
+        value = max(float(slider_min), min(10.0, value))
+        return round(value, 3)
+
+    def _format_multiplier_value(raw_value: Any) -> str:
+        value = _normalize_multiplier_value(raw_value)
+        if abs(value - round(value)) <= 1e-9:
+            return str(int(round(value)))
+        return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+
+    def _bind_multiplier_control(scale_widget, scale_var, entry_widget, entry_var, control_store, slider_min=-10.0):
+        state = {"busy": False, "last_value": 1.0}
+
+        def _set_value(raw_value: Any) -> float:
+            value = _normalize_multiplier_value(raw_value)
+            slider_value = _slider_multiplier_value(value, slider_min=slider_min)
+            state["busy"] = True
+            try:
+                scale_var.set(slider_value)
+                entry_var.set(_format_multiplier_value(value))
+            finally:
+                state["busy"] = False
+            state["last_value"] = value
+            return value
+
+        def _get_value() -> float:
+            raw = str(entry_var.get() or "").strip()
+            if raw in {"", "-", ".", "-.", "+", "+."}:
+                return _normalize_multiplier_value(state.get("last_value", 1.0))
+            try:
+                value = float(raw)
+            except Exception:
+                return _normalize_multiplier_value(state.get("last_value", 1.0))
+            if not math.isfinite(value):
+                return _normalize_multiplier_value(state.get("last_value", 1.0))
+            return float(value)
+
+        def _on_scale(value):
+            if state["busy"]:
+                return
+            _set_value(value)
+
+        def _on_entry_change(*_args):
+            if state["busy"]:
+                return
+            raw = str(entry_var.get() or "").strip()
+            if raw in {"", "-", ".", "-.", "+", "+."}:
+                return
+            if raw.endswith("."):
+                try:
+                    preview = float(raw[:-1])
+                except Exception:
+                    return
+                if math.isfinite(preview):
+                    state["last_value"] = float(preview)
+                state["busy"] = True
+                try:
+                    scale_var.set(_slider_multiplier_value(preview, slider_min=slider_min))
+                finally:
+                    state["busy"] = False
+                return
+            try:
+                value = float(raw)
+            except Exception:
+                return
+            if not math.isfinite(value):
+                return
+            state["last_value"] = float(value)
+            state["busy"] = True
+            try:
+                scale_var.set(_slider_multiplier_value(value, slider_min=slider_min))
+            finally:
+                state["busy"] = False
+
+        def _commit_entry(_event=None):
+            raw = str(entry_var.get() or "").strip()
+            if raw in {"", "-", ".", "-.", "+", "+."}:
+                _set_value(state.get("last_value", 1.0))
+                return
+            try:
+                value = float(raw)
+            except Exception:
+                value = state.get("last_value", 1.0)
+            if not math.isfinite(value):
+                value = state.get("last_value", 1.0)
+            _set_value(value)
+
+        scale_widget.configure(command=_on_scale)
+        try:
+            entry_var.trace_add("write", _on_entry_change)
+        except Exception:
+            entry_var.trace("w", _on_entry_change)
+        entry_widget.bind("<FocusOut>", _commit_entry, add="+")
+        entry_widget.bind("<Return>", _commit_entry, add="+")
+        control_store["get"] = _get_value
+        return _set_value
+
+    def _get_module_ui_value(module_id: str):
+        store = module_vars.get(module_id, {})
+        if "entry_var" in store:
+            getter = (module_controls.get(module_id) or {}).get("get")
+            if callable(getter):
+                return getter()
+            return _normalize_multiplier_value((store.get("entry_var") or tk.StringVar(value="1")).get())
+        return str((store.get("value_var") or tk.StringVar(value="Default")).get() or "").strip()
+
+    def _reset_module_inputs():
+        for module_def in module_defs:
+            module_id = str(module_def.get("module_id") or "").strip()
+            kind = str(module_def.get("kind") or "").strip().lower()
+            if kind == "slider":
+                setter = (module_controls.get(module_id) or {}).get("set")
+                if callable(setter):
+                    setter(1.0)
+            else:
+                value_var = (module_vars.get(module_id) or {}).get("value_var")
+                if value_var is not None:
+                    value_var.set("Default")
+
+    def _remember_module_inputs():
+        for module_def in module_defs:
+            module_id = str(module_def.get("module_id") or "").strip()
+            module_last_values[module_id] = _get_module_ui_value(module_id)
+
+    def _module_values_equal(left: Any, right: Any) -> bool:
+        try:
+            left_num = float(left)
+            right_num = float(right)
+        except Exception:
+            return str(left or "").strip() == str(right or "").strip()
+        if (not math.isfinite(left_num)) or (not math.isfinite(right_num)):
+            return str(left or "").strip() == str(right or "").strip()
+        tolerance = max(1e-9, abs(left_num) * 1e-9, abs(right_num) * 1e-9)
+        return abs(left_num - right_num) <= tolerance
+
+    def _set_module_ui_value(module_id: str, value: Any):
+        module_def = next((item for item in module_defs if str(item.get("module_id") or "").strip() == module_id), None)
+        if not isinstance(module_def, dict):
+            return
+        kind = str(module_def.get("kind") or "").strip().lower()
+        if kind == "slider":
+            setter = (module_controls.get(module_id) or {}).get("set")
+            if callable(setter):
+                setter(value)
+            return
+        value_var = (module_vars.get(module_id) or {}).get("value_var")
+        if value_var is not None:
+            value_var.set(str(value or "Default").strip() or "Default")
+
+    def _collect_module_state_snapshot(pak_path: str) -> Dict[str, Any]:
+        snapshot = {}
+        if not pak_path:
+            return snapshot
+
+        for module_def in module_defs:
+            module_id = str(module_def.get("module_id") or "").strip()
+            kind = str(module_def.get("kind") or "").strip().lower()
+            try:
+                if module_id == "winch_mode":
+                    analysis = _initial_pak_analyze_winches(pak_path)
+                    snapshot[module_id] = _winch_choice_from_mode(analysis.get("mode"))
+                    continue
+                if kind == "toggle":
+                    analysis = _initial_pak_analyze_toggle_module(pak_path, module_id)
+                    if module_id == "camera_collisions":
+                        snapshot[module_id] = _camera_collisions_choice_from_state(analysis.get("state"))
+                    elif module_id in _INITIAL_PAK_BOOLEAN_ATTR_MODULE_SPECS:
+                        snapshot[module_id] = _boolean_toggle_choice_from_state(analysis.get("state"))
+                    else:
+                        snapshot[module_id] = _toggle_choice_from_state(analysis.get("state"))
+                    continue
+
+                winch_attr = str(module_def.get("winch_attr") or "").strip()
+                if module_id == "flexible_frame":
+                    analysis = _initial_pak_analyze_flexible_frame_module(pak_path)
+                elif module_id == "soft_suspension":
+                    analysis = _initial_pak_analyze_soft_suspension_module(pak_path)
+                elif winch_attr:
+                    analysis = _initial_pak_analyze_winch_multiplier(pak_path, winch_attr)
+                else:
+                    analysis = _initial_pak_analyze_numeric_module(pak_path, module_id)
+
+                snapshot[module_id] = (
+                    analysis.get("multiplier", 1.0)
+                    if str(analysis.get("state") or "").strip().lower() == "uniform"
+                    else 1.0
+                )
+            except Exception:
+                snapshot[module_id] = 1.0 if kind == "slider" else "Default"
+
+        return snapshot
+
+    def _apply_module_state_snapshot(snapshot: Dict[str, Any]):
+        for module_def in module_defs:
+            module_id = str(module_def.get("module_id") or "").strip()
+            kind = str(module_def.get("kind") or "").strip().lower()
+            if module_id in snapshot:
+                _set_module_ui_value(module_id, snapshot.get(module_id))
+            elif kind == "slider":
+                _set_module_ui_value(module_id, 1.0)
+            else:
+                _set_module_ui_value(module_id, "Default")
+        _remember_module_inputs()
+
+    def _sync_module_inputs_from_current_state(pak_path: str):
+        if not pak_path:
+            module_sync_state["loading"] = False
+            _reset_module_inputs()
+            _remember_module_inputs()
+            return
+
+        module_sync_state["request_id"] += 1
+        request_id = int(module_sync_state["request_id"])
+        module_sync_state["loading"] = True
+
+        try:
+            _set_status_message("Loading current module values...", timeout_ms=0)
+        except Exception:
+            pass
+
+        def _finish_sync(snapshot: Dict[str, Any], error_text: str = ""):
+            if request_id != int(module_sync_state.get("request_id") or 0):
+                return
+            module_sync_state["loading"] = False
+            if error_text:
+                _reset_module_inputs()
+                _remember_module_inputs()
+                _set_status_message(f"Could not read current module values: {error_text}", timeout_ms=9000)
+            else:
+                _apply_module_state_snapshot(snapshot)
+                _set_status_message("Current module values loaded.", timeout_ms=2500)
+            _refresh_mods_state(sync_dropdowns=False)
+
+        def _worker(path: str, token: int):
+            snapshot = {}
+            error_text = ""
+            try:
+                snapshot = _collect_module_state_snapshot(path)
+            except Exception as e:
+                error_text = str(e)
+
+            def _dispatch():
+                if token != int(module_sync_state.get("request_id") or 0):
+                    return
+                _finish_sync(snapshot, error_text)
+
+            try:
+                tab_mods.after(0, _dispatch)
+            except Exception:
+                _dispatch()
+
+        try:
+            threading.Thread(target=_worker, args=(pak_path, request_id), daemon=True).start()
+        except Exception as e:
+            _finish_sync({}, str(e))
+
+    def _choose_initial_pak():
+        try:
+            start_dir = ""
+            existing = _objectives_get_pak_override_path() or _initial_pak_probe().get("path", "")
+            if existing:
+                start_dir = os.path.dirname(existing)
+            path = filedialog.askopenfilename(
+                title="Select initial.pak",
+                initialdir=start_dir or None,
+                initialfile="initial.pak",
+                filetypes=[("initial.pak", "initial.pak"), ("PAK files", "*.pak")],
+            )
+        except Exception:
+            path = ""
+        if not path:
+            return
+        if os.path.basename(path).lower() != "initial.pak":
+            messagebox.showerror("Invalid file", "Only files named initial.pak can be selected.")
+            return
+        saved = _objectives_set_pak_override_path(path)
+        _refresh_related_objectives_views()
+        _refresh_mods_state(sync_dropdowns=True)
+        _set_status_message(f"Using initial.pak from {saved}", timeout_ms=4000)
+
+    def _create_manual_backup():
+        probe = _initial_pak_probe()
+        pak_path = str(probe.get("path") or "").strip()
+        if not pak_path:
+            _set_status_message("Select initial.pak first.", timeout_ms=6500)
+            return
+
+        existing = probe.get("backup") if isinstance(probe.get("backup"), dict) else {}
+        replace_existing = False
+        if existing and str(existing.get("file_path") or "").strip():
+            replace_existing = bool(
+                messagebox.askyesno(
+                    "Replace backup",
+                    "A Mods backup already exists.\n\n"
+                    "Create a new one and replace the current revert backup?",
+                )
+            )
+            if not replace_existing:
+                return
+
+        info = _initial_pak_create_backup(pak_path, replace_existing=replace_existing)
+        _refresh_mods_state(sync_dropdowns=False)
+        if info.get("created"):
+            _set_status_message(f"Created backup: {info.get('name', '')}")
+        else:
+            _set_status_message(f"Using existing backup: {info.get('name', '')}")
+
+    def _recall_backup():
+        probe = _initial_pak_probe()
+        pak_path = str(probe.get("path") or "").strip()
+        if not pak_path:
+            _set_status_message("Select initial.pak first.", timeout_ms=6500)
+            return
+
+        backup_info = probe.get("backup") if isinstance(probe.get("backup"), dict) else {}
+        backup_name = str(backup_info.get("name") or "").strip()
+        if not backup_name:
+            _set_status_message("No initial.pak backup is available yet.", timeout_ms=6500)
+            return
+        if not messagebox.askyesno(
+            "Recall initial.pak backup",
+            f"Restore the whole initial.pak from backup '{backup_name}'?\n\nThis overwrites the current file.",
+        ):
+            return
+
+        restored = _initial_pak_restore_backup(pak_path)
+        _refresh_related_objectives_views()
+        _refresh_mods_state(sync_dropdowns=True)
+        _set_status_message(f"Restored backup: {restored.get('name', '')}", timeout_ms=6500)
+
+    def _format_numeric_module_result(result: Dict[str, Any], requested_multiplier: float, label: str):
+        changed_values = int(result.get("changed_values") or 0)
+        changed_files = int(result.get("changed_files") or 0)
+        created_backup = bool(result.get("created_backup"))
+        current_state = str(result.get("state") or "").strip().lower()
+        requested_multiplier = float(result.get("requested_multiplier", requested_multiplier) or 0.0)
+        if changed_values <= 0:
+            if current_state == "no_backup" and abs(requested_multiplier - 1.0) <= 1e-9:
+                return {"changed": False, "message": f"{label}: no backup exists yet, so default values were left unchanged."}
+            return {"changed": False, "message": f"{label}: no changes were needed."}
+        if abs(requested_multiplier - 1.0) <= 1e-9:
+            return {"changed": True, "message": f"{label}: restored {changed_values} values from the saved initial.pak backup."}
+        suffix = " Backup created first." if created_backup else ""
+        return {"changed": True, "message": f"{label}: updated {changed_values} values in {changed_files} files.{suffix}"}
+
+    def _format_toggle_module_result(result: Dict[str, Any], requested_mode: str, label: str, module_id: str = ""):
+        changed_values = int(result.get("changed_values") or 0)
+        changed_files = int(result.get("changed_files") or 0)
+        created_backup = bool(result.get("created_backup"))
+        no_backup = bool(result.get("no_backup"))
+        if changed_values <= 0:
+            if requested_mode in {"off", "default"} and no_backup:
+                return {"changed": False, "message": f"{label}: no backup exists yet, so default values were left unchanged."}
+            return {"changed": False, "message": f"{label}: no changes were needed."}
+        if requested_mode == "on":
+            suffix = " Backup created first." if created_backup else ""
+            if module_id == "camera_collisions":
+                return {"changed": True, "message": f"{label}: updated {changed_files} model files.{suffix}"}
+            if module_id in _INITIAL_PAK_BOOLEAN_ATTR_MODULE_SPECS or module_id == "truck_store_everywhere":
+                return {"changed": True, "message": f"{label}: updated {changed_values} values in {changed_files} files.{suffix}"}
+            return {"changed": True, "message": f"{label}: added {changed_values} sockets in {changed_files} files.{suffix}"}
+        skipped_defaults = len(result.get("missing_defaults") or [])
+        suffix = f" {skipped_defaults} files were skipped." if skipped_defaults else ""
+        return {"changed": True, "message": f"{label}: restored {changed_files} files from the saved initial.pak backup.{suffix}"}
+
+    def _apply_winch_module(selected_label: str):
+        mode_map = {
+            "All winches are autonomous": "autonomous",
+            "All winches need engine": "engine",
+            "Default": "default",
+        }
+        mode = mode_map.get(selected_label, "default")
+        pak_path = _initial_pak_resolve_path()
+        if not pak_path:
+            raise FileNotFoundError("Select initial.pak first.")
+
+        probe = _initial_pak_probe()
+        backup_info = probe.get("backup") if isinstance(probe.get("backup"), dict) else {}
+        backup_ready = bool(str(backup_info.get("file_path") or "").strip())
+        current_analysis = _initial_pak_analyze_winches(pak_path)
+        current_mode = str(current_analysis.get("mode") or "").strip().lower()
+        if mode == current_mode:
+            return {"changed": False, "message": "Winches: no changes were needed."}
+        if mode == "default" and (not backup_ready) and current_mode not in {"autonomous", "engine"}:
+            return {"changed": False, "message": "Winches: no backup exists yet, so default values were left unchanged."}
+
+        backup_created = False
+        if mode in {"autonomous", "engine"}:
+            backup_info = _initial_pak_create_backup(pak_path, replace_existing=False)
+            backup_created = bool(backup_info.get("created"))
+
+        result = _initial_pak_apply_winch_mode(pak_path, mode)
+        changed_values = int(result.get("changed_values") or 0)
+        skipped_defaults = len(result.get("missing_defaults") or []) + len(result.get("unmatched_defaults") or [])
+        if changed_values <= 0:
+            if mode == "default" and skipped_defaults:
+                return {"changed": False, "message": f"Winches: no changes were needed. {skipped_defaults} default entries could not be matched."}
+            return {"changed": False, "message": "Winches: no changes were needed."}
+        if mode == "default":
+            suffix = f" {skipped_defaults} entries were skipped." if skipped_defaults else ""
+            return {"changed": True, "message": f"Winches: restored {changed_values} values from the saved initial.pak backup.{suffix}"}
+        suffix = " Backup created first." if backup_created else ""
+        return {"changed": True, "message": f"Winches: updated {changed_values} values in {int(result.get('changed_files') or 0)} files.{suffix}"}
+
+    def _apply_winch_multiplier_module(attr_name: str, multiplier_value: float, label: str):
+        pak_path = _initial_pak_resolve_path()
+        if not pak_path:
+            raise FileNotFoundError("Select initial.pak first.")
+        result = _initial_pak_apply_winch_multiplier(pak_path, attr_name, multiplier_value)
+        return _format_numeric_module_result(result, multiplier_value, label)
+
+    def _apply_numeric_multiplier_module(module_id: str, multiplier_value: float, label: str):
+        pak_path = _initial_pak_resolve_path()
+        if not pak_path:
+            raise FileNotFoundError("Select initial.pak first.")
+        result = _initial_pak_apply_numeric_module(pak_path, module_id, multiplier_value)
+        return _format_numeric_module_result(result, multiplier_value, label)
+
+    def _apply_toggle_module(module_id: str, selected_label: str, label: str):
+        mode_map = {"On": "on", "Off": "off", "Default": "default"}
+        requested_mode = mode_map.get(str(selected_label or "").strip(), "default")
+        pak_path = _initial_pak_resolve_path()
+        if not pak_path:
+            raise FileNotFoundError("Select initial.pak first.")
+        result = _initial_pak_apply_toggle_module(pak_path, module_id, requested_mode)
+        return _format_toggle_module_result(result, requested_mode, label, module_id=module_id)
+
+    def _refresh_mods_state(sync_dropdowns=True):
+        probe = _initial_pak_probe()
+        pak_path = str(probe.get("path") or "").strip()
+        backup_info = probe.get("backup") if isinstance(probe.get("backup"), dict) else {}
+
+        if pak_path:
+            source_summary_var.set(f"Saved path: {pak_path}")
+        else:
+            source_summary_var.set("Saved path: initial.pak not found")
+
+        if sync_dropdowns:
+            _sync_module_inputs_from_current_state(pak_path)
+
+        path_ready = bool(pak_path)
+        backup_ready = bool(backup_info and str(backup_info.get("file_path") or "").strip())
+        controls_ready = path_ready and (not bool(module_sync_state.get("loading")))
+        recall_backup_btn.config(state=("normal" if (controls_ready and backup_ready) else "disabled"))
+        apply_all_btn.config(state=("normal" if controls_ready else "disabled"))
+
+    def _apply_all_modules():
+        try:
+            messages = []
+            changed_any = False
+            changed_defs = []
+            for module_def in module_defs:
+                module_id = str(module_def.get("module_id") or "").strip()
+                current_value = _get_module_ui_value(module_id)
+                if _module_values_equal(current_value, module_last_values.get(module_id)):
+                    continue
+                changed_defs.append((module_def, current_value))
+
+            if not changed_defs:
+                _set_status_message("No changes were needed.", timeout_ms=4000)
+                return
+
+            pak_path = _initial_pak_resolve_path()
+            if not pak_path:
+                raise FileNotFoundError("Select initial.pak first.")
+
+            backup_info = _initial_pak_get_backup_info(pak_path)
+            if not str(backup_info.get("file_path") or "").strip():
+                created_info = _initial_pak_create_backup(pak_path, replace_existing=False)
+                if bool(created_info.get("created")):
+                    messages.append(f"Backup created: {created_info.get('name', '')}")
+
+            for module_def, current_value in changed_defs:
+                module_id = str(module_def.get("module_id") or "").strip()
+                kind = str(module_def.get("kind") or "").strip().lower()
+                title = str(module_def.get("title") or module_id)
+                store = module_vars.get(module_id, {})
+                if module_id == "winch_mode":
+                    result = _apply_winch_module(str((store.get("value_var") or tk.StringVar()).get() or "").strip())
+                elif kind == "toggle":
+                    result = _apply_toggle_module(module_id, str((store.get("value_var") or tk.StringVar()).get() or "").strip(), title)
+                else:
+                    multiplier_value = float(current_value)
+                    winch_attr = str(module_def.get("winch_attr") or "").strip()
+                    if module_id == "flexible_frame":
+                        result = _format_numeric_module_result(_initial_pak_apply_flexible_frame_module(_initial_pak_resolve_path(), multiplier_value), multiplier_value, title)
+                    elif module_id == "soft_suspension":
+                        result = _format_numeric_module_result(_initial_pak_apply_soft_suspension_module(_initial_pak_resolve_path(), multiplier_value), multiplier_value, title)
+                    elif winch_attr:
+                        result = _apply_winch_multiplier_module(winch_attr, multiplier_value, title)
+                    else:
+                        result = _apply_numeric_multiplier_module(module_id, multiplier_value, title)
+                if not isinstance(result, dict):
+                    continue
+                changed_any = bool(result.get("changed")) or changed_any
+                message = str(result.get("message") or "").strip()
+                if message:
+                    messages.append(message)
+
+            if changed_any:
+                _refresh_related_objectives_views()
+            _remember_module_inputs()
+            _refresh_mods_state(sync_dropdowns=False)
+            if messages:
+                _set_status_message(" | ".join(messages), timeout_ms=9000 if changed_any else 6500)
+        except FileNotFoundError as e:
+            _set_status_message(str(e), timeout_ms=7000)
+        except Exception as e:
+            messagebox.showerror("Mods", f"Failed to apply mods:\n{e}")
+
+    topbar = ttk.Frame(container)
+    topbar.pack(fill="x", pady=(0, 6))
+
+    ttk.Button(topbar, text="initial.pak", command=_choose_initial_pak).pack(side="left", padx=(0, 8))
+    ttk.Label(topbar, textvariable=source_summary_var, anchor="w", justify="left").pack(side="left", fill="x", expand=True)
+
+    recall_backup_btn = ttk.Button(topbar, text="Recall Backup", command=_recall_backup)
+    recall_backup_btn.pack(side="right", padx=(6, 0))
+
+    warn_badge = tk.Label(
+        topbar,
+        text="i",
+        width=2,
+        relief="ridge",
+        bd=1,
+        highlightthickness=0,
+        cursor="question_arrow",
+        bg="#b3261e",
+        fg="white",
+    )
+    warn_badge.pack(side="right", padx=(6, 0))
+    _attach_hover_tooltip(
+        warn_badge,
+        "Mods edit initial.pak directly.\n\n"
+        "Game updates can replace or change these files. After a game update, it is safer to verify the game files first "
+        "so the game rewrites initial.pak, then re-apply only the modules you still want.\n\n"
+        "Extreme settings can and probably will break the game's physics engine, so experiment with backups ready.",
+    )
+
+    modules_wrap = ttk.Frame(container)
+    modules_wrap.pack(fill="both", expand=True, pady=(6, 12))
+    modules_canvas = tk.Canvas(modules_wrap, highlightthickness=0, bd=0, bg=theme_palette["bg"])
+    modules_scroll = ttk.Scrollbar(modules_wrap, orient="vertical", command=modules_canvas.yview)
+    modules_canvas.configure(yscrollcommand=modules_scroll.set)
+    modules_canvas.pack(side="left", fill="both", expand=True)
+    modules_scroll.pack(side="right", fill="y")
+
+    modules_host = ttk.Frame(modules_canvas)
+    modules_window_id = modules_canvas.create_window((0, 0), window=modules_host, anchor="nw")
+    for col in range(2):
+        modules_host.columnconfigure(col, weight=1, uniform="mods_col")
+
+    def _refresh_modules_scrollregion(_event=None):
+        try:
+            modules_canvas.configure(scrollregion=modules_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _resize_modules_canvas(event):
+        try:
+            modules_canvas.itemconfigure(modules_window_id, width=event.width)
+        except Exception:
+            pass
+
+    modules_host.bind("<Configure>", _refresh_modules_scrollregion)
+    modules_canvas.bind("<Configure>", _resize_modules_canvas)
+
+    def _mods_mousewheel(event):
+        event_num = getattr(event, "num", None)
+        if event_num == 4:
+            modules_canvas.yview_scroll(-1, "units")
+            return "break"
+        if event_num == 5:
+            modules_canvas.yview_scroll(1, "units")
+            return "break"
+        try:
+            delta = int(event.delta)
+        except Exception:
+            delta = 0
+        if delta == 0:
+            return None
+        step = int(-delta / 120)
+        if step == 0:
+            step = -1 if delta > 0 else 1
+        modules_canvas.yview_scroll(step, "units")
+        return "break"
+
+    def _bind_mods_mousewheel(widget):
+        if widget is None:
+            return
+        try:
+            widget.bind("<MouseWheel>", _mods_mousewheel, add="+")
+        except Exception:
+            pass
+        try:
+            widget.bind("<Button-4>", _mods_mousewheel, add="+")
+            widget.bind("<Button-5>", _mods_mousewheel, add="+")
+        except Exception:
+            pass
+        for child in widget.winfo_children():
+            _bind_mods_mousewheel(child)
+
+    def _build_card_shell(parent, row_idx, col_idx, title, info_text):
+        card = tk.Frame(parent, bd=2, relief="solid", bg=theme_palette["bg"], highlightthickness=0)
+        card.grid(row=row_idx, column=col_idx, padx=8, pady=8, sticky="nsew")
+        try:
+            card.configure(height=112)
+            card.grid_propagate(False)
+        except Exception:
+            pass
+        inner = ttk.Frame(card, padding=(10, 8))
+        inner.pack(fill="both", expand=True)
+        header = ttk.Frame(inner)
+        header.pack(fill="x", pady=(0, 8))
+        ttk.Label(header, text=title, font=("TkDefaultFont", 10), justify="left").pack(side="left", anchor="w", fill="x", expand=True)
+        return inner
+
+    def _build_choice_module_card(parent, row_idx, col_idx, title, variable, values, info_text):
+        inner = _build_card_shell(parent, row_idx, col_idx, title, info_text)
+        ttk.Combobox(inner, textvariable=variable, values=list(values), state="readonly", width=26).pack(fill="x")
+
+    def _build_slider_module_card(parent, row_idx, col_idx, title, scale_var, entry_var, control_store, info_text, slider_min=-10.0):
+        inner = _build_card_shell(parent, row_idx, col_idx, title, info_text)
+        row = ttk.Frame(inner)
+        row.pack(fill="x")
+        scale = ttk.Scale(row, from_=float(slider_min), to=10.0, variable=scale_var, orient="horizontal", length=150)
+        scale.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        entry = ttk.Entry(row, textvariable=entry_var, width=6)
+        entry.pack(side="left")
+        control_store["set"] = _bind_multiplier_control(scale, scale_var, entry, entry_var, control_store, slider_min=slider_min)
+
+    for index, module_def in enumerate(module_defs):
+        row_idx, col_idx = divmod(index, 2)
+        module_id = str(module_def.get("module_id") or "").strip()
+        kind = str(module_def.get("kind") or "").strip().lower()
+        title = str(module_def.get("title") or module_id)
+        info_text = str(module_def.get("info") or "")
+        store = module_vars.get(module_id, {})
+        if kind == "slider":
+            _build_slider_module_card(
+                modules_host,
+                row_idx,
+                col_idx,
+                title,
+                store.get("scale_var"),
+                store.get("entry_var"),
+                module_controls.get(module_id) or {"set": None},
+                info_text,
+                float(module_def.get("slider_min", -10.0) or -10.0),
+            )
+        else:
+            _build_choice_module_card(
+                modules_host,
+                row_idx,
+                col_idx,
+                title,
+                store.get("value_var"),
+                module_def.get("values") or (),
+                info_text,
+            )
+
+    _bind_mods_mousewheel(modules_canvas)
+    _bind_mods_mousewheel(modules_host)
+
+    bottom = ttk.Frame(container)
+    bottom.pack(fill="x", pady=(8, 0))
+    ttk.Frame(bottom).pack(side="left", expand=True)
+    apply_all_btn = ttk.Button(bottom, text="Apply", command=_apply_all_modules, width=18)
+    apply_all_btn.pack(side="left")
+    ttk.Frame(bottom).pack(side="left", expand=True)
+
+    _refresh_mods_state(sync_dropdowns=True)
+
 # TAB: Objectives+ (launch_gui -> tab_objectives)
 def create_objectives_tab(tab, save_path_var):
     """
@@ -14203,7 +20609,8 @@ def _attach_hover_tooltip(anchor_widget, tooltip_text, delay_ms=260, wraplength=
 
     def _show_now():
         _hide()
-        if not tooltip_text:
+        display_text = _editor_translate_display_text(str(tooltip_text or ""))
+        if not display_text:
             return
         try:
             tip = tk.Toplevel(anchor_widget)
@@ -14218,7 +20625,7 @@ def _attach_hover_tooltip(anchor_widget, tooltip_text, delay_ms=260, wraplength=
                 pass
             tk.Label(
                 tip,
-                text=str(tooltip_text or ""),
+                text=display_text,
                 justify="left",
                 wraplength=wraplength,
                 bg=_theme_color_literal("#fff0f0", role="bg"),
@@ -14261,7 +20668,7 @@ def _build_region_selector(
     seasons,
     base_maps,
     other_var=None,
-    other_label="Other Season number (e.g. 18, 19, 20)",
+    other_label="Other Season number (e.g. 19, 20, 21)",
     base_maps_label="Base Maps:",
     base_maps_label_font=None,
     season_pady=(0, 10),
@@ -14359,9 +20766,15 @@ def _save_common_ssl_path_to_config(path):
 def _find_common_ssl_save_in_folder(folder, allow_json=True):
     if not folder or not os.path.isdir(folder):
         return None
-    exts = (".cfg", ".dat", ".json") if allow_json else (".cfg", ".dat")
     # prefer exact commonsslsave filenames
-    preferred = ("commonsslsave.cfg", "commonsslsave.dat", "common_ssl_save.cfg", "common_ssl_save.dat")
+    preferred = (
+        "commonsslsave",
+        "commonsslsave.cfg",
+        "commonsslsave.dat",
+        "common_ssl_save",
+        "common_ssl_save.cfg",
+        "common_ssl_save.dat",
+    )
     candidates = []
     try:
         for fname in os.listdir(folder):
@@ -14371,7 +20784,7 @@ def _find_common_ssl_save_in_folder(folder, allow_json=True):
         if not candidates:
             for fname in os.listdir(folder):
                 low = fname.lower()
-                if "common" in low and "ssl" in low and low.endswith(exts):
+                if "common" in low and "ssl" in low and _is_probable_snowrunner_save_filename(low, allow_json=allow_json):
                     candidates.append(os.path.join(folder, fname))
     except Exception:
         return None
@@ -14486,12 +20899,52 @@ def find_and_modify_upgrades(save_path, selected_region_codes, notify=True, make
         new_block = json.dumps(upgrades_data, separators=(",", ":"))
         content = content[:block_start] + new_block + content[block_end:]
 
+        discovered_added = 0
+        discovered_updated = 0
+        pp_match = re.search(r'"persistentProfileData"\s*:\s*{', content)
+        if pp_match:
+            pp_block, pp_start, pp_end = extract_brace_block(content, pp_match.end() - 1)
+            du_match = re.search(r'"discoveredUpgrades"\s*:\s*{', pp_block)
+            if du_match:
+                du_block, du_start, du_end = extract_brace_block(pp_block, du_match.end() - 1)
+                try:
+                    du_data = json.loads(du_block)
+                except Exception:
+                    du_data = {}
+            else:
+                du_data = {}
+                du_start = du_end = None
+
+            discovered_added, du_data = _ensure_discovered_upgrades_defaults(du_data, selected_region_codes)
+            if isinstance(du_data, dict):
+                for map_key, entry in du_data.items():
+                    if not _level_key_matches_regions(map_key, selected_region_codes):
+                        continue
+                    if not isinstance(entry, dict):
+                        entry = {"current": 0, "all": 0}
+                        du_data[map_key] = entry
+                    before_current = entry.get("current")
+                    _set_current_to_all(entry)
+                    if entry.get("current") != before_current:
+                        discovered_updated += 1
+
+            new_du_block = json.dumps(du_data, separators=(",", ":"))
+            if du_start is not None and du_end is not None:
+                pp_block = pp_block[:du_start] + new_du_block + pp_block[du_end:]
+            else:
+                pp_block = _set_key_in_text(pp_block, "discoveredUpgrades", new_du_block)
+            content = content[:pp_start] + pp_block + content[pp_end:]
+
         with open(save_path, "w", encoding="utf-8") as f:
             f.write(content)
 
         msg = f"Updated {updated} upgrades."
         if added:
             msg += f" Added {added} missing entries."
+        if discovered_added:
+            msg += f" Added {discovered_added} missing discovered upgrade counters."
+        if discovered_updated:
+            msg += f" Updated {discovered_updated} discovered upgrade counters."
         return _action_result("Success", msg, notify=notify)
     except Exception as e:
         return _action_error(str(e), notify=notify)
@@ -15755,7 +22208,7 @@ def create_upgrades_tab(tab, save_path_var):
 
     ttk.Label(tab, text="At least one upgrade must be marked or collected in-game for this to work.",
               style="Warning.TLabel").pack(pady=(0, 2))
-    ttk.Label(tab, text="If a new season is added, you may need to mark or collect one new upgrade.",
+    ttk.Label(tab, text="If a future season is added, you may need to mark or collect one new upgrade.",
               style="Warning.TLabel").pack()
 
 
@@ -15944,7 +22397,7 @@ def create_game_stats_tab(tab, save_path_var, plugin_loaders):
         if not os.path.exists(path):
             return messagebox.showerror("Error", "Save file not found.")
 
-        # 🔹 Make a backup first (use the central, existing function)
+        # Make a backup first (use the central, existing function)
         try:
             # If the function exists in globals, call it; otherwise, attempt direct name
             if "make_backup_if_enabled" in globals():
@@ -16032,6 +22485,7 @@ def create_watchtowers_tab(tab, save_path_var):
 
 # TAB: Discoveries (launch_gui -> tab_discoveries)
 def create_discoveries_tab(tab, save_path_var):
+    unlock_mission_trucks_var = tk.IntVar(value=0)
     seasons = [(label, code) for _, (code, label) in SEASON_ENTRIES]
     maps = [(name, code) for code, name in BASE_MAPS]
     selector = _build_region_selector(tab, seasons, maps)
@@ -16047,11 +22501,20 @@ def create_discoveries_tab(tab, save_path_var):
         selected_regions = _collect_selected_regions(season_vars, map_vars, other_season_var)
         if not selected_regions:
             return show_info("Info", "No seasons or maps selected.")
-        unlock_discoveries(path, selected_regions)
+        unlock_discoveries(
+            path,
+            selected_regions,
+            include_mission_trucks=bool(unlock_mission_trucks_var.get()),
+        )
 
     ttk.Button(tab, text="Unlock Discoveries", command=on_apply).pack(pady=(10, 5))
     _add_check_all_checkbox(tab, all_check_vars)
-    ttk.Label(tab, text="Sets discovered trucks to their max for selected regions but won't add them to garage.",
+    ttk.Checkbutton(
+        tab,
+        text="Also unlock mission/reward trucks in shop",
+        variable=unlock_mission_trucks_var,
+    ).pack(anchor="center", pady=(4, 0))
+    ttk.Label(tab, text="Sets discovered trucks to their max and unlocks matching found-truck shop entries, but won't add them to garage.",
               style="Warning.TLabel").pack()
 
 # TAB: Levels (launch_gui -> tab_levels)
@@ -16130,10 +22593,13 @@ def create_region_tools_tab(tab, save_path_var, enable_legacy_tabs_var=None):
     )
     upgrades_info = (
         "At least one upgrade must already be marked or collected in-game for this to work.\n\n"
-        "If a new season is added, you may need to collect or mark one new upgrade first."
+        "If a future season is added, you may need to collect or mark one new upgrade first."
     )
     watchtowers_info = "This marks watchtowers as found, but it will not reveal the map. Use Fog Tool for that."
-    discoveries_info = "Sets discovered trucks to their max for selected regions but won't add them to the garage."
+    discoveries_info = (
+        "Sets discovered trucks to their max and unlocks matching found-truck shop entries, but won't add them to the garage.\n\n"
+        "The optional mission/reward checkbox also unlocks regional trucks that are normally tied to tasks or contracts."
+    )
     levels_info = "Lets you view regions you haven't visited yet."
     garages_info = (
         "Garages will be unlocked but may still be hidden under fog of war.\n\n"
@@ -16189,6 +22655,7 @@ def create_region_tools_tab(tab, save_path_var, enable_legacy_tabs_var=None):
     ]
 
     garage_upgrade_all_var = tk.IntVar(value=0)
+    discoveries_mission_trucks_var = tk.IntVar(value=0)
     feature_vars = {}
     feature_check_vars = []
     feature_rows = {}
@@ -16205,13 +22672,9 @@ def create_region_tools_tab(tab, save_path_var, enable_legacy_tabs_var=None):
 
         row_widgets = []
 
-        main_cb = ttk.Checkbutton(rows_box, variable=var)
-        main_cb.grid(row=row_index, column=1, sticky="w", pady=3)
+        main_cb = ttk.Checkbutton(rows_box, text=spec["label"], variable=var)
+        main_cb.grid(row=row_index, column=1, columnspan=2, sticky="w", padx=(0, 26), pady=3)
         row_widgets.append(main_cb)
-
-        label = ttk.Label(rows_box, text=spec["label"])
-        label.grid(row=row_index, column=2, sticky="w", padx=(6, 26), pady=3)
-        row_widgets.append(label)
 
         info_badge = tk.Label(
             rows_box,
@@ -16227,6 +22690,15 @@ def create_region_tools_tab(tab, save_path_var, enable_legacy_tabs_var=None):
         info_badge.grid(row=row_index, column=3, sticky="w", pady=3)
         _attach_hover_tooltip(info_badge, spec.get("info", ""))
         row_widgets.append(info_badge)
+
+        if spec["key"] == "discoveries":
+            discoveries_extra = ttk.Checkbutton(
+                rows_box,
+                text="Also mission/reward trucks",
+                variable=discoveries_mission_trucks_var,
+            )
+            discoveries_extra.grid(row=row_index, column=4, sticky="w", padx=(18, 0), pady=3)
+            row_widgets.append(discoveries_extra)
 
         if spec["key"] == "garages":
             garages_extra = ttk.Checkbutton(
@@ -16380,7 +22852,13 @@ def create_region_tools_tab(tab, save_path_var, enable_legacy_tabs_var=None):
             elif key == "watchtowers":
                 result = unlock_watchtowers(path, selected_regions, notify=False, make_backup=False)
             elif key == "discoveries":
-                result = unlock_discoveries(path, selected_regions, notify=False, make_backup=False)
+                result = unlock_discoveries(
+                    path,
+                    selected_regions,
+                    notify=False,
+                    make_backup=False,
+                    include_mission_trucks=bool(discoveries_mission_trucks_var.get()),
+                )
             elif key == "levels":
                 result = unlock_levels(path, selected_regions, notify=False, make_backup=False)
             elif key == "garages":
@@ -16408,6 +22886,3362 @@ def create_region_tools_tab(tab, save_path_var, enable_legacy_tabs_var=None):
         show_info("Success", "Selected region features applied:\n\n" + "\n".join(results))
 
     ttk.Button(features_center, text="Apply Selected Features", command=on_apply).pack(anchor="center", pady=(10, 0))
+
+# =============================================================================
+# SECTION: Cargo Tab
+# Used In: launch_gui -> Cargo
+# =============================================================================
+def _cargo_editor_normalize_id(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _cargo_editor_is_probable_cargo_type(type_id: Any, object_id: Any = "") -> bool:
+    values = [
+        _cargo_editor_normalize_id(type_id).lower(),
+        _cargo_editor_normalize_id(object_id).lower(),
+    ]
+    for value in values:
+        if not value:
+            continue
+        if value.startswith(("cargo_", "cargo_unit_", "cargo_cabin_", "metal_cargo_", "rus_packed_cargo_")):
+            return True
+        if "lost_cargo" in value:
+            return True
+    return False
+
+
+def _cargo_editor_is_probable_nested_cargo_type(type_id: Any, object_id: Any = "") -> bool:
+    values = [
+        _cargo_editor_normalize_id(type_id).lower(),
+        _cargo_editor_normalize_id(object_id).lower(),
+    ]
+    for value in values:
+        if not value:
+            continue
+        if value.startswith("frame_addon_log_"):
+            return True
+    return False
+
+
+def _cargo_editor_is_scene_only_entry(type_id: Any, object_id: Any = "") -> bool:
+    type_key = _cargo_editor_normalize_id(type_id).lower()
+    object_key = _cargo_editor_normalize_id(object_id).lower().replace("\\", "/")
+    object_leaf = os.path.basename(object_key) if object_key else ""
+    if type_key.startswith(("cargo_platform_", "cargo_helper_")):
+        return True
+    if object_leaf.startswith(("cargo_platform_", "cargo_helper_")):
+        return True
+    return False
+
+
+def _cargo_editor_is_static_cargo_fixture(type_id: Any, object_id: Any = "") -> bool:
+    del object_id
+    type_key = _cargo_editor_normalize_id(type_id).lower()
+    return type_key.startswith(("cargo_platform_", "cargo_helper_"))
+
+
+def _cargo_editor_is_landmark_cargo(type_id: Any, object_id: Any = "") -> bool:
+    object_key = _cargo_editor_normalize_id(object_id).lower().replace("\\", "/")
+    if not object_key.startswith("landmarks/"):
+        return False
+    if _cargo_editor_is_static_cargo_fixture(type_id, object_id):
+        return True
+    if _cargo_editor_is_cargo_like_record(type_id, object_id):
+        return False
+    if _cargo_editor_is_objective_cargo(type_id, object_id):
+        return False
+    return True
+
+
+def _cargo_editor_is_objective_cargo(type_id: Any, object_id: Any = "") -> bool:
+    type_key = _cargo_editor_normalize_id(type_id).lower()
+    object_key = _cargo_editor_normalize_id(object_id).lower()
+    if type_key.startswith("cargo_cabin_"):
+        return True
+    if object_key.startswith("cabin_"):
+        return True
+    return False
+
+
+def _cargo_editor_is_bone_attached_cargo(object_id: Any) -> bool:
+    object_key = _cargo_editor_normalize_id(object_id)
+    if not object_key:
+        return False
+    lowered = object_key.lower()
+    return lowered.startswith("bone") and lowered.endswith("_cdt")
+
+
+def _cargo_editor_is_safe_delete_candidate(
+    *,
+    state_label: Any,
+    type_id: Any,
+    object_id: Any,
+    allow_world_edit: Any,
+    container: Any,
+) -> bool:
+    state_key = _cargo_editor_normalize_id(state_label).lower()
+    if state_key and state_key != "loose":
+        return False
+    if not bool(allow_world_edit):
+        return False
+    if container is not None:
+        return False
+    if _cargo_editor_is_scene_only_entry(type_id, object_id):
+        return False
+    if _cargo_editor_is_static_cargo_fixture(type_id, object_id):
+        return False
+    if _cargo_editor_is_landmark_cargo(type_id, object_id):
+        return False
+    if _cargo_editor_is_objective_cargo(type_id, object_id):
+        return False
+    if _cargo_editor_is_bone_attached_cargo(object_id):
+        return False
+    return _cargo_editor_is_cargo_like_record(type_id, object_id)
+
+
+def _cargo_editor_is_cargo_like_record(type_id: Any, object_id: Any = "") -> bool:
+    return _cargo_editor_is_probable_cargo_type(type_id, object_id) or _cargo_editor_is_probable_nested_cargo_type(
+        type_id,
+        object_id,
+    )
+
+
+def _cargo_editor_expand_delete_records(obj: Dict[str, Any]) -> List[Dict[str, Any]]:
+    raw = obj.get("delete_records") if isinstance(obj, dict) else None
+    source = raw if isinstance(raw, list) and raw else [obj]
+
+    out: List[Dict[str, Any]] = []
+    seen_starts: Set[int] = set()
+    for item in source:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start_off = int(item.get("start_off", -1))
+        except Exception:
+            start_off = -1
+        if start_off < 0 or start_off in seen_starts:
+            continue
+        seen_starts.add(start_off)
+        out.append(item)
+    out.sort(key=lambda item: int(item.get("start_off", -1)))
+    return out
+
+
+def _cargo_editor_display_name(type_id: Any, object_id: Any = "") -> str:
+    def _finalize_label(value: Any) -> str:
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if text.lower().startswith("cargo "):
+            text = text[6:].strip()
+        if text and text == text.lower():
+            text = text.title()
+        return text
+
+    raw = _cargo_editor_normalize_id(type_id) or _cargo_editor_normalize_id(object_id)
+    if not raw:
+        return ""
+
+    raw = raw.replace("\\", "/")
+    if raw.lower().startswith("landmarks/"):
+        raw = os.path.basename(raw)
+    if raw.lower().endswith("_lmk"):
+        raw = raw[:-4]
+
+    lowered = raw.lower()
+    display_seed = raw
+
+    if lowered.startswith("cargo_unit_"):
+        cargo_seed = "cargo_" + raw[len("cargo_unit_") :]
+        try:
+            label = _cargo_loading_display_cargo_name(cargo_seed, localization=None)
+        except Exception:
+            label = ""
+        if label:
+            return _finalize_label(label)
+        display_seed = raw[len("cargo_unit_") :]
+    elif lowered.startswith("cargo_"):
+        try:
+            label = _cargo_loading_display_cargo_name(raw, localization=None)
+        except Exception:
+            label = ""
+        if label:
+            return _finalize_label(label)
+        display_seed = raw[len("cargo_") :]
+    elif lowered.startswith("frame_addon_log_"):
+        log_size = raw[len("frame_addon_log_") :].strip("_")
+        cargo_seed = {
+            "short": "CargoLogsShort",
+            "medium": "CargoLogsMedium",
+            "long": "CargoLogsLong",
+        }.get(log_size.lower(), "")
+        if cargo_seed:
+            try:
+                label = _cargo_loading_display_cargo_name(cargo_seed, localization=None)
+            except Exception:
+                label = ""
+            if label:
+                return _finalize_label(label)
+        display_seed = f"log_{log_size}" if log_size else raw
+    elif lowered.startswith("metal_cargo_"):
+        display_seed = "metal_" + raw[len("metal_cargo_") :]
+    elif lowered.startswith("rus_packed_cargo_"):
+        display_seed = "packed_" + raw[len("rus_packed_cargo_") :]
+
+    human = _objectives_local_humanize_identifier(display_seed)
+    return _finalize_label(human or raw)
+
+
+def _cargo_editor_is_ascii_nul_string(raw: bytes) -> bool:
+    return bool(raw) and raw[-1] == 0 and all(32 <= b <= 126 for b in raw[:-1])
+
+
+def _cargo_editor_collect_string_records(data: bytes) -> List[Dict[str, Any]]:
+    payload = bytes(data or b"")
+    size = len(payload)
+    out: List[Dict[str, Any]] = []
+    i = 0
+
+    while i + 8 < size:
+        parsed = None
+        for len_size in (2, 4):
+            try:
+                str_len = struct.unpack_from("<H" if len_size == 2 else "<I", payload, i)[0]
+            except Exception:
+                continue
+            if str_len < 1 or str_len > 128:
+                continue
+
+            type_beg = i + len_size
+            type_end = type_beg + str_len
+            if type_end + len_size + 1 > size:
+                continue
+
+            type_raw = payload[type_beg:type_end]
+            if not _cargo_editor_is_ascii_nul_string(type_raw):
+                continue
+            type_id = type_raw[:-1].decode("ascii", errors="ignore").strip()
+            if not type_id or type_id.lower().startswith("deleted_"):
+                continue
+
+            try:
+                obj_len = struct.unpack_from("<H" if len_size == 2 else "<I", payload, type_end)[0]
+            except Exception:
+                continue
+            if obj_len < 1 or obj_len > 196:
+                continue
+
+            obj_beg = type_end + len_size
+            obj_end = obj_beg + obj_len
+            if obj_end > size:
+                continue
+
+            obj_raw = payload[obj_beg:obj_end]
+            if not _cargo_editor_is_ascii_nul_string(obj_raw):
+                continue
+            object_id = obj_raw[:-1].decode("ascii", errors="ignore").strip()
+
+            guid_len_off = -1
+            guid_len_size = 0
+            guid_beg = -1
+            guid_end = -1
+            guid_value = ""
+            after_guid_off = int(obj_end)
+
+            try:
+                guid_len = struct.unpack_from("<H" if len_size == 2 else "<I", payload, obj_end)[0]
+            except Exception:
+                guid_len = 0
+            if 3 <= int(guid_len) <= 80:
+                gb = obj_end + len_size
+                ge = gb + int(guid_len)
+                if ge <= size:
+                    guid_raw = payload[gb:ge]
+                    if _cargo_editor_is_ascii_nul_string(guid_raw):
+                        guid_text = guid_raw[:-1].decode("ascii", errors="ignore").strip()
+                        if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", guid_text):
+                            guid_len_off = int(obj_end)
+                            guid_len_size = int(len_size)
+                            guid_beg = int(gb)
+                            guid_end = int(ge)
+                            guid_value = guid_text
+                            after_guid_off = int(ge)
+
+            parsed = {
+                "start_off": int(i),
+                "len_size": int(len_size),
+                "type_id": type_id,
+                "object_id": object_id,
+                "type_len_off": int(i),
+                "type_len_size": int(len_size),
+                "type_beg": int(type_beg),
+                "type_end": int(type_end),
+                "obj_len_off": int(type_end),
+                "obj_len_size": int(len_size),
+                "obj_beg": int(obj_beg),
+                "obj_end": int(obj_end),
+                "guid": guid_value,
+                "guid_len_off": int(guid_len_off),
+                "guid_len_size": int(guid_len_size),
+                "guid_beg": int(guid_beg),
+                "guid_end": int(guid_end),
+                "after_guid_off": int(after_guid_off),
+            }
+            break
+
+        if parsed is None:
+            i += 1
+            continue
+
+        out.append(parsed)
+        i = max(i + 1, int(parsed.get("obj_end", i + 1)))
+
+    return out
+
+
+def _cargo_editor_collect_world_transform_offsets_in_range(
+    payload: bytes,
+    scan_start: int,
+    scan_end: int,
+    limit: int = 256,
+) -> List[int]:
+    data = bytes(payload or b"")
+    size = len(data)
+    beg = max(32, int(scan_start))
+    end = min(int(scan_end), size - 12)
+    if end <= beg:
+        return []
+
+    out: List[int] = []
+    seen: Set[int] = set()
+    for coord_off in range(beg, end):
+        try:
+            x, y, z = struct.unpack_from("<fff", data, coord_off)
+        except Exception:
+            continue
+        if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
+            continue
+        if max(abs(x), abs(y), abs(z)) > 5_000_000:
+            continue
+        if _sts_is_denorm_float(x) or _sts_is_denorm_float(y) or _sts_is_denorm_float(z):
+            continue
+        if max(abs(x), abs(y), abs(z)) < 20.0:
+            continue
+        if not _sts_has_valid_transform_at(data, coord_off):
+            continue
+        if coord_off < 4 or (coord_off + 16) > size:
+            continue
+        try:
+            prev_w = float(struct.unpack_from("<f", data, coord_off - 4)[0])
+            row_w = float(struct.unpack_from("<f", data, coord_off + 12)[0])
+        except Exception:
+            continue
+        if (not math.isfinite(prev_w)) or (not math.isfinite(row_w)):
+            continue
+        if abs(prev_w) > 0.25:
+            continue
+        if abs(row_w - 1.0) > 0.25:
+            continue
+        if coord_off in seen:
+            continue
+        seen.add(int(coord_off))
+        out.append(int(coord_off))
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def _cargo_editor_choose_anchor_offset(payload: bytes, offsets: List[int]) -> int:
+    data = bytes(payload or b"")
+    buckets: Dict[Tuple[float, float, float], List[int]] = {}
+    for off in offsets or []:
+        try:
+            x, y, z = struct.unpack_from("<fff", data, int(off))
+        except Exception:
+            continue
+        key = (round(float(x), 1), round(float(y), 1), round(float(z), 1))
+        buckets.setdefault(key, []).append(int(off))
+    if not buckets:
+        return -1
+
+    best_key = max(
+        buckets.keys(),
+        key=lambda key: (
+            len(buckets.get(key, [])),
+            -min(buckets.get(key, [0])),
+        ),
+    )
+    bucket = sorted(buckets.get(best_key, []))
+    return int(bucket[0]) if bucket else -1
+
+
+def _cargo_editor_write_span_string(buf: bytearray, beg: int, end: int, seed_text: str, keep_guid_shape: bool = False) -> bool:
+    if beg < 0 or end <= beg:
+        return False
+    if beg >= len(buf):
+        return False
+    end2 = min(int(end), len(buf))
+    if end2 <= beg:
+        return False
+    span_len = int(end2 - beg)
+    if span_len <= 0:
+        return False
+    if span_len == 1:
+        try:
+            buf[beg] = 0
+            return True
+        except Exception:
+            return False
+
+    text_len = span_len - 1
+    if keep_guid_shape and text_len == 38:
+        seed = "{00000000-0000-0000-0000-000000000000}"
+    else:
+        seed = str(seed_text or "deleted")
+    raw = bytearray(seed.encode("ascii", errors="ignore"))
+    if not raw:
+        raw = bytearray(b"deleted")
+
+    try:
+        fill = bytearray(b"_" * text_len)
+        lim = min(text_len, len(raw))
+        fill[:lim] = raw[:lim]
+        buf[beg:beg + text_len] = bytes(fill)
+        buf[beg + text_len] = 0
+        return True
+    except Exception:
+        return False
+
+
+def _cargo_editor_int_value(value: Any, default: int = -1) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _cargo_editor_unique_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen_starts: Set[int] = set()
+    for rec in records or []:
+        if not isinstance(rec, dict):
+            continue
+        start_off = _cargo_editor_int_value(rec.get("start_off", -1), -1)
+        if start_off < 0 or start_off in seen_starts:
+            continue
+        seen_starts.add(start_off)
+        out.append(rec)
+    out.sort(key=lambda rec: _cargo_editor_int_value(rec.get("start_off", -1), -1))
+    return out
+
+
+def _cargo_editor_normalize_spans(
+    spans: List[Tuple[int, int]],
+    region_start: int,
+    region_end: int,
+) -> List[Tuple[int, int]]:
+    if region_end <= region_start:
+        return []
+
+    out: List[Tuple[int, int]] = []
+    for start_off, end_off in spans or []:
+        beg = max(int(region_start), _cargo_editor_int_value(start_off, -1))
+        end = min(int(region_end), _cargo_editor_int_value(end_off, -1))
+        if end <= beg:
+            continue
+        out.append((beg, end))
+
+    out.sort()
+    merged: List[Tuple[int, int]] = []
+    for beg, end in out:
+        if merged and beg <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((beg, end))
+    return merged
+
+
+def _cargo_editor_compact_region(
+    payload: bytearray,
+    region_start: int,
+    region_end: int,
+    remove_spans: List[Tuple[int, int]],
+) -> int:
+    if not isinstance(payload, bytearray):
+        return 0
+
+    spans = _cargo_editor_normalize_spans(remove_spans, region_start, region_end)
+    if not spans:
+        return 0
+
+    try:
+        chunk = bytes(payload[int(region_start):int(region_end)])
+    except Exception:
+        return 0
+    if not chunk:
+        return 0
+
+    keep = bytearray()
+    cursor = 0
+    for beg, end in spans:
+        rel_beg = int(beg - region_start)
+        rel_end = int(end - region_start)
+        if rel_beg > cursor:
+            keep.extend(chunk[cursor:rel_beg])
+        cursor = max(cursor, rel_end)
+    if cursor < len(chunk):
+        keep.extend(chunk[cursor:])
+
+    removed = int(len(chunk) - len(keep))
+    if removed <= 0:
+        return 0
+
+    keep_len = int(len(keep))
+    payload[int(region_start):int(region_start) + keep_len] = keep
+    payload[int(region_start) + keep_len:int(region_end)] = b"\x00" * removed
+    return removed
+
+
+def _cargo_editor_next_generic_start(
+    generic_records: List[Dict[str, Any]],
+    start_to_index: Dict[int, int],
+    start_off: int,
+    scope_end: int,
+) -> int:
+    idx = start_to_index.get(int(start_off))
+    if idx is None or idx < 0:
+        return int(scope_end)
+    if idx + 1 >= len(generic_records):
+        return int(scope_end)
+    next_start = _cargo_editor_int_value(generic_records[idx + 1].get("start_off", scope_end), scope_end)
+    if next_start <= int(start_off):
+        return int(scope_end)
+    return int(next_start)
+
+
+def _cargo_editor_min_coord_boundary(objects: List[Dict[str, Any]], region_start: int, hard_end: int) -> int:
+    candidates = [int(hard_end)]
+    for obj in objects or []:
+        if not isinstance(obj, dict):
+            continue
+        coord_off = _cargo_editor_int_value(obj.get("coord_off", -1), -1)
+        if int(region_start) < coord_off <= int(hard_end):
+            candidates.append(int(coord_off))
+        raw_offsets = obj.get("coord_offs")
+        if not isinstance(raw_offsets, list):
+            continue
+        for raw in raw_offsets:
+            coord_off = _cargo_editor_int_value(raw, -1)
+            if int(region_start) < coord_off <= int(hard_end):
+                candidates.append(int(coord_off))
+    return min(candidates) if candidates else int(hard_end)
+
+
+def _cargo_editor_trailer_region_end(obj: Dict[str, Any], region_start: int, hard_end: int) -> int:
+    coord_off = _cargo_editor_int_value(obj.get("carrier_coord_off", -1), -1)
+    if coord_off > 0:
+        guess = int(coord_off - 500)
+        if guess > int(region_start):
+            return min(int(hard_end), guess)
+    return int(hard_end)
+
+
+def _cargo_editor_invalidate_record(payload: bytearray, obj: Dict[str, Any]) -> bool:
+    if not isinstance(payload, bytearray):
+        return False
+
+    changed = False
+
+    def _ival(key: str, default: int = -1) -> int:
+        try:
+            return int(obj.get(key, default))
+        except Exception:
+            return default
+
+    type_beg = _ival("type_beg", -1)
+    type_end = _ival("type_end", -1)
+    obj_beg = _ival("obj_beg", -1)
+    obj_end = _ival("obj_end", -1)
+    start_off = _ival("start_off", -1)
+    end_off = _ival("end_off", -1)
+    guid_beg = _ival("guid_beg", -1)
+    guid_end = _ival("guid_end", -1)
+
+    def _zero_guid_literals_in_range(buf: bytearray, beg: int, end: int) -> int:
+        if beg < 0 or end <= beg or beg >= len(buf):
+            return 0
+        end2 = min(int(end), len(buf))
+        if end2 <= beg:
+            return 0
+        try:
+            chunk = bytes(buf[beg:end2])
+        except Exception:
+            return 0
+        pat = re.compile(rb"\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}")
+        repl = b"{00000000-0000-0000-0000-000000000000}"
+        count = 0
+        for match in pat.finditer(chunk):
+            s = beg + int(match.start())
+            e = s + 38
+            if s < 0 or e > len(buf):
+                continue
+            try:
+                if bytes(buf[s:e]) != repl:
+                    buf[s:e] = repl
+                    count += 1
+            except Exception:
+                pass
+        return count
+
+    if _cargo_editor_write_span_string(payload, type_beg, type_end, "deleted_cargo_type"):
+        changed = True
+    if _cargo_editor_write_span_string(payload, obj_beg, obj_end, "deleted_cargo_anchor"):
+        changed = True
+    if _cargo_editor_write_span_string(payload, guid_beg, guid_end, "deleted_cargo_guid", keep_guid_shape=True):
+        changed = True
+
+    if start_off >= 0 and end_off > start_off:
+        if _zero_guid_literals_in_range(payload, start_off, end_off):
+            changed = True
+
+    return changed
+
+
+def _sts_parse_cargo_objects(payload: bytes, source_file: str) -> List[Dict[str, Any]]:
+    data = bytes(payload or b"")
+    if len(data) < 64:
+        return []
+
+    map_info = _map_display_info(_map_id_from_sts_filename(source_file))
+    generic_records = _cargo_editor_collect_string_records(data)
+    try:
+        carriers = _sts_parse_movable_objects(data, source_file)
+    except Exception:
+        carriers = []
+
+    out: List[Dict[str, Any]] = []
+    seen_keys: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+
+    for index, rec in enumerate(generic_records):
+        type_id = str(rec.get("type_id", "") or "").strip()
+        object_id = str(rec.get("object_id", "") or "").strip()
+
+        next_start = len(data)
+        if index + 1 < len(generic_records):
+            try:
+                next_start = int(generic_records[index + 1].get("start_off", len(data)))
+            except Exception:
+                next_start = len(data)
+
+        container = None
+        container_span = None
+        record_start = int(rec.get("start_off", -1))
+        for carrier in carriers or []:
+            try:
+                start_off = int(carrier.get("start_off", -1))
+                end_off = int(carrier.get("end_off", -1))
+            except Exception:
+                continue
+            if start_off <= record_start < end_off:
+                span = max(0, end_off - start_off)
+                if (container is None) or (container_span is None) or (span < container_span):
+                    container = carrier
+                    container_span = span
+
+        carrier_self = False
+        if isinstance(container, dict):
+            try:
+                carrier_self = int(container.get("start_off", -1)) == int(record_start)
+            except Exception:
+                carrier_self = False
+
+        looks_like_cargo = _cargo_editor_is_probable_cargo_type(type_id, object_id)
+        if (not looks_like_cargo) and (not carrier_self):
+            looks_like_cargo = _cargo_editor_is_probable_nested_cargo_type(type_id, object_id)
+        if not looks_like_cargo:
+            continue
+        if (not container) and _cargo_editor_is_static_cargo_fixture(type_id, object_id):
+            continue
+
+        scan_start = max(32, int(rec.get("after_guid_off", rec.get("obj_end", record_start))))
+        minimal_end = max(int(rec.get("obj_end", record_start)), int(next_start) if next_start > record_start else int(rec.get("obj_end", record_start)))
+        world_offsets: List[int] = []
+        anchor_off = -1
+
+        x = y = z = 0.0
+        allow_world_edit = False
+        state_label = "Loose"
+        carrier_kind = ""
+        carrier_name = ""
+
+        if isinstance(container, dict):
+            carrier_kind = str(container.get("kind", "") or "").strip()
+            carrier_name = str(container.get("display_name", "") or container.get("name", "") or "").strip()
+            state_label = "On Trailer" if carrier_kind.lower() == "trailer" else "On Vehicle"
+            try:
+                x = float(container.get("x", 0.0))
+                y = float(container.get("y", 0.0))
+                z = float(container.get("z", 0.0))
+            except Exception:
+                x = y = z = 0.0
+        else:
+            primary_end = min(int(next_start), int(scan_start + 4096))
+            if primary_end <= scan_start:
+                primary_end = min(len(data), int(scan_start + 4096))
+            world_offsets = _cargo_editor_collect_world_transform_offsets_in_range(data, scan_start, primary_end, limit=256)
+            if (not world_offsets) and (0 <= (int(next_start) - int(scan_start)) < 256):
+                retry_end = min(len(data), int(scan_start + 4096))
+                if retry_end > primary_end:
+                    world_offsets = _cargo_editor_collect_world_transform_offsets_in_range(
+                        data,
+                        scan_start,
+                        retry_end,
+                        limit=256,
+                    )
+            anchor_off = _cargo_editor_choose_anchor_offset(data, world_offsets)
+            if anchor_off < 0:
+                if _cargo_editor_is_scene_only_entry(type_id, object_id):
+                    continue
+                continue
+            try:
+                x, y, z = struct.unpack_from("<fff", data, int(anchor_off))
+            except Exception:
+                continue
+            if _cargo_editor_is_landmark_cargo(type_id, object_id) or _cargo_editor_is_scene_only_entry(type_id, object_id):
+                allow_world_edit = False
+                state_label = "Landmark"
+            elif _cargo_editor_is_objective_cargo(type_id, object_id) or object_id.upper().startswith("CABIN_"):
+                allow_world_edit = True
+                state_label = "Objective"
+            else:
+                allow_world_edit = True
+                state_label = "Loose"
+
+        if _cargo_editor_is_scene_only_entry(type_id, object_id) and (not allow_world_edit) and (container is None):
+            continue
+
+        display_name = _cargo_editor_display_name(type_id, object_id)
+        if not display_name:
+            continue
+
+        record_ref = {
+            "file": os.path.basename(source_file),
+            "type_id": type_id,
+            "object_id": object_id,
+            "guid": str(rec.get("guid", "") or ""),
+            "start_off": int(rec.get("start_off", -1)),
+            "end_off": max(int(minimal_end), int(rec.get("obj_end", -1))),
+            "type_len_off": int(rec.get("type_len_off", -1)),
+            "type_len_size": int(rec.get("type_len_size", 0)),
+            "type_beg": int(rec.get("type_beg", -1)),
+            "type_end": int(rec.get("type_end", -1)),
+            "obj_len_off": int(rec.get("obj_len_off", -1)),
+            "obj_len_size": int(rec.get("obj_len_size", 0)),
+            "obj_beg": int(rec.get("obj_beg", -1)),
+            "obj_end": int(rec.get("obj_end", -1)),
+            "guid_len_off": int(rec.get("guid_len_off", -1)),
+            "guid_len_size": int(rec.get("guid_len_size", 0)),
+            "guid_beg": int(rec.get("guid_beg", -1)),
+            "guid_end": int(rec.get("guid_end", -1)),
+        }
+
+        dedupe_key = (
+            (
+                "carrier",
+                int(record_start),
+                type_id.lower(),
+                object_id.lower(),
+                str(container.get("guid", "") or container.get("object_id", "") or "").strip().lower(),
+            )
+            if isinstance(container, dict)
+            else (
+                "world",
+                int(record_start),
+                type_id.lower(),
+                object_id.lower(),
+                round(float(x), 2),
+                round(float(y), 2),
+                round(float(z), 2),
+            )
+        )
+        existing_entry = seen_keys.get(dedupe_key)
+        if isinstance(existing_entry, dict):
+            linked = existing_entry.get("delete_records")
+            if not isinstance(linked, list):
+                linked = []
+                existing_entry["delete_records"] = linked
+            already_linked = False
+            for linked_obj in linked:
+                if not isinstance(linked_obj, dict):
+                    continue
+                try:
+                    if int(linked_obj.get("start_off", -1)) == int(record_ref.get("start_off", -1)):
+                        already_linked = True
+                        break
+                except Exception:
+                    continue
+            if not already_linked:
+                linked.append(record_ref)
+            continue
+
+        safe_delete = _cargo_editor_is_safe_delete_candidate(
+            state_label=state_label,
+            type_id=type_id,
+            object_id=object_id,
+            allow_world_edit=allow_world_edit,
+            container=container,
+        )
+
+        entry_obj = {
+            "file": os.path.basename(source_file),
+            "map_id": map_info.get("map_id", ""),
+            "map_name": map_info.get("map_name", ""),
+            "region_code": map_info.get("region_code", ""),
+            "region_name": map_info.get("region_name", ""),
+            "state": state_label,
+            "type_id": type_id,
+            "name": display_name,
+            "object_id": object_id,
+            "guid": str(rec.get("guid", "") or ""),
+            "start_off": int(rec.get("start_off", -1)),
+            "end_off": max(int(minimal_end), int(rec.get("obj_end", -1))),
+            "type_len_off": int(rec.get("type_len_off", -1)),
+            "type_len_size": int(rec.get("type_len_size", 0)),
+            "type_beg": int(rec.get("type_beg", -1)),
+            "type_end": int(rec.get("type_end", -1)),
+            "obj_len_off": int(rec.get("obj_len_off", -1)),
+            "obj_len_size": int(rec.get("obj_len_size", 0)),
+            "obj_beg": int(rec.get("obj_beg", -1)),
+            "obj_end": int(rec.get("obj_end", -1)),
+            "guid_len_off": int(rec.get("guid_len_off", -1)),
+            "guid_len_size": int(rec.get("guid_len_size", 0)),
+            "guid_beg": int(rec.get("guid_beg", -1)),
+            "guid_end": int(rec.get("guid_end", -1)),
+            "coord_off": int(anchor_off),
+            "coord_offs": list(world_offsets),
+            "allow_world_edit": bool(allow_world_edit),
+            "allow_delete": bool(safe_delete),
+            "carrier_kind": carrier_kind,
+            "carrier_name": carrier_name,
+            "carrier_start_off": int(container.get("start_off", -1)) if isinstance(container, dict) else None,
+            "carrier_end_off": int(container.get("end_off", -1)) if isinstance(container, dict) else None,
+            "carrier_coord_off": int(container.get("coord_off", -1)) if isinstance(container, dict) else None,
+            "x": float(x),
+            "y": float(y),
+            "z": float(z),
+            "delete_records": [record_ref],
+        }
+        seen_keys[dedupe_key] = entry_obj
+        out.append(entry_obj)
+
+    out.sort(
+        key=lambda obj: (
+            str(obj.get("region_name", "")),
+            str(obj.get("map_name", "")),
+            str(obj.get("state", "")),
+            str(obj.get("name", "")),
+            float(obj.get("x", 0.0)),
+            float(obj.get("z", 0.0)),
+        )
+    )
+    return out
+
+
+def create_cargo_tab(tab, save_path_var):
+    sts_state = {
+        "files": {},
+        "objects": [],
+        "row_to_obj": {},
+        "backed_up_files": set(),
+        "load_token": 0,
+        "is_loading": False,
+        "loaded_save_path": "",
+        "loaded_save_mtime": None,
+    }
+
+    top = ttk.Frame(tab)
+    top.pack(fill="x", padx=10, pady=(10, 6))
+
+    ttk.Label(top, text="State:").pack(side="left")
+    state_filter_var = tk.StringVar(value="All")
+    state_filter_cb = ttk.Combobox(top, textvariable=state_filter_var, state="readonly", width=14, values=["All"])
+    state_filter_cb.pack(side="left", padx=(4, 8))
+
+    ttk.Label(top, text="Region:").pack(side="left")
+    region_filter_var = tk.StringVar(value="All")
+    region_filter_cb = ttk.Combobox(top, textvariable=region_filter_var, state="readonly", width=20, values=["All"])
+    region_filter_cb.pack(side="left", padx=(4, 8))
+
+    ttk.Label(top, text="Map:").pack(side="left")
+    map_filter_var = tk.StringVar(value="All")
+    map_filter_cb = ttk.Combobox(top, textvariable=map_filter_var, state="readonly", width=24, values=["All"])
+    map_filter_cb.pack(side="left", padx=(4, 8))
+
+    tree_wrap = tk.Frame(tab, bg="#f0f0f0", bd=0, highlightthickness=0)
+    tree_wrap.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+    cols = ("state", "name", "region", "map", "x", "y", "z")
+    try:
+        _cpalette = _get_effective_theme(_is_dark_mode_active())
+    except Exception:
+        _cpalette = {}
+    _tree_fg = str((_cpalette.get("fg") if isinstance(_cpalette, dict) else "") or "#000000")
+    _tree_empty_bg = str((_cpalette.get("field_bg") if isinstance(_cpalette, dict) else "") or "#f0f0f0")
+    _tree_sel_bg = str((_cpalette.get("accent") if isinstance(_cpalette, dict) else "") or "#4A90E2")
+    _tree_sel_fg = str((_cpalette.get("accent_fg") if isinstance(_cpalette, dict) else "") or "#FFFFFF")
+    _head_bg = str((_cpalette.get("button_bg") if isinstance(_cpalette, dict) else "") or STRIPE_B)
+    _head_active_bg = str((_cpalette.get("button_active_bg") if isinstance(_cpalette, dict) else "") or _head_bg)
+    try:
+        tree_wrap.configure(bg=_tree_empty_bg)
+    except Exception:
+        pass
+    try:
+        _cstyle = ttk.Style()
+        _cstyle.configure(
+            "Cargo.Treeview",
+            rowheight=30,
+            background=_tree_empty_bg,
+            fieldbackground=_tree_empty_bg,
+            foreground=_tree_fg,
+        )
+        _cstyle.map(
+            "Cargo.Treeview",
+            background=[("selected", _tree_sel_bg)],
+            foreground=[("selected", _tree_sel_fg)],
+        )
+        _cstyle.configure("Cargo.Treeview.Heading", background=_head_bg, foreground=_tree_fg)
+        _cstyle.map("Cargo.Treeview.Heading", background=[("active", _head_active_bg)])
+    except Exception:
+        pass
+
+    tree = ttk.Treeview(tree_wrap, columns=cols, show="headings", selectmode="extended", style="Cargo.Treeview")
+    headings = {
+        "state": "State",
+        "name": "Cargo",
+        "region": "Region",
+        "map": "Map",
+        "x": "X",
+        "y": "Y",
+        "z": "Z",
+    }
+    widths = {
+        "state": 80,
+        "name": 180,
+        "region": 150,
+        "map": 180,
+        "x": 78,
+        "y": 78,
+        "z": 78,
+    }
+    for c in cols:
+        tree.heading(c, text=headings[c])
+        tree.column(c, width=widths[c], anchor="w")
+    try:
+        tree.tag_configure("even", background=STRIPE_B)
+        tree.tag_configure("odd", background=STRIPE_A)
+        tree.tag_configure("filler", background="#f0f0f0")
+    except Exception:
+        pass
+
+    yscroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=tree.yview)
+    xscroll = ttk.Scrollbar(tree_wrap, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    yscroll.grid(row=0, column=1, sticky="ns")
+    xscroll.grid(row=1, column=0, sticky="ew")
+    tree_wrap.grid_rowconfigure(0, weight=1)
+    tree_wrap.grid_columnconfigure(0, weight=1)
+    try:
+        tree.configure(takefocus=0)
+    except Exception:
+        pass
+
+    edit_row = ttk.Frame(tab)
+    edit_row.pack(fill="x", padx=10, pady=(0, 8))
+
+    ttk.Label(edit_row, text="Lift Y by:").pack(side="left")
+    lift_var = tk.StringVar(value="2.0")
+    ttk.Entry(edit_row, textvariable=lift_var, width=8).pack(side="left", padx=(6, 12))
+
+    ttk.Label(edit_row, text="X:").pack(side="left")
+    x_var = tk.StringVar()
+    ttk.Entry(edit_row, textvariable=x_var, width=12).pack(side="left", padx=(4, 8))
+
+    ttk.Label(edit_row, text="Y:").pack(side="left")
+    y_var = tk.StringVar()
+    ttk.Entry(edit_row, textvariable=y_var, width=12).pack(side="left", padx=(4, 8))
+
+    ttk.Label(edit_row, text="Z:").pack(side="left")
+    z_var = tk.StringVar()
+    ttk.Entry(edit_row, textvariable=z_var, width=12).pack(side="left", padx=(4, 12))
+
+    _tree_refresh_guard = {"busy": False}
+    _tree_resize_job = {"id": None}
+
+    def _row_values(obj: Dict[str, Any]):
+        return (
+            obj.get("state", ""),
+            obj.get("name", ""),
+            obj.get("region_name", ""),
+            obj.get("map_name", "") or obj.get("map_id", ""),
+            f"{float(obj.get('x', 0.0)):.3f}",
+            f"{float(obj.get('y', 0.0)):.3f}",
+            f"{float(obj.get('z', 0.0)):.3f}",
+        )
+
+    def _set_combo_values(cb: ttk.Combobox, var: tk.StringVar, values: List[str]):
+        vals = values if values else ["All"]
+        cb["values"] = vals
+        current = str(var.get() or "").strip()
+        if current not in vals:
+            var.set(vals[0])
+
+    def _iter_filtered_objects(apply_map_filter: bool = True):
+        selected_state = str(state_filter_var.get() or "All").strip().lower()
+        selected_region = str(region_filter_var.get() or "All").strip().lower()
+        selected_map = str(map_filter_var.get() or "All").strip().lower()
+
+        for obj in sts_state.get("objects", []) or []:
+            if not isinstance(obj, dict):
+                continue
+            state = str(obj.get("state", "") or "").strip().lower()
+            region = str(obj.get("region_name", "") or "").strip().lower()
+            map_name = str(obj.get("map_name", "") or obj.get("map_id", "") or "").strip().lower()
+
+            if selected_state != "all" and state != selected_state:
+                continue
+            if selected_region != "all" and region != selected_region:
+                continue
+            if apply_map_filter and selected_map != "all" and map_name != selected_map:
+                continue
+            yield obj
+
+    def _refresh_filter_values():
+        objs = sts_state.get("objects", []) if isinstance(sts_state.get("objects"), list) else []
+        state_values = ["All"] + sorted({str(o.get("state", "") or "").strip() for o in objs if str(o.get("state", "") or "").strip()})
+        region_values = ["All"] + sorted({str(o.get("region_name", "") or "").strip() for o in objs if str(o.get("region_name", "") or "").strip()})
+        _set_combo_values(state_filter_cb, state_filter_var, state_values)
+        _set_combo_values(region_filter_cb, region_filter_var, region_values)
+
+        filtered = list(_iter_filtered_objects(apply_map_filter=False))
+        map_values = ["All"] + sorted(
+            {
+                str(o.get("map_name", "") or o.get("map_id", "") or "").strip()
+                for o in filtered
+                if str(o.get("map_name", "") or o.get("map_id", "") or "").strip()
+            }
+        )
+        _set_combo_values(map_filter_cb, map_filter_var, map_values)
+
+    def _refresh_tree():
+        if _tree_refresh_guard.get("busy"):
+            return
+        _tree_refresh_guard["busy"] = True
+        try:
+            for iid in tree.get_children():
+                tree.delete(iid)
+            sts_state["row_to_obj"] = {}
+
+            real_count = 0
+            for row_idx, obj in enumerate(_iter_filtered_objects(apply_map_filter=True)):
+                iid = f"row_{row_idx}"
+                tag = "even" if (row_idx % 2 == 0) else "odd"
+                tree.insert("", "end", iid=iid, values=_row_values(obj), tags=(tag,))
+                sts_state["row_to_obj"][iid] = obj
+                real_count += 1
+
+            try:
+                row_h = 30
+                view_h = int(tree.winfo_height() or 0)
+                visible_rows = max(0, int(view_h / row_h) + 1)
+                filler_needed = max(0, visible_rows - real_count)
+                for i in range(filler_needed):
+                    tree.insert(
+                        "",
+                        "end",
+                        iid=f"filler_{i}",
+                        values=("", "", "", "", "", "", ""),
+                        tags=("filler",),
+                    )
+            except Exception:
+                pass
+        finally:
+            _tree_refresh_guard["busy"] = False
+
+    def _schedule_tree_resize_refresh(_event=None):
+        try:
+            if _tree_resize_job.get("id") is not None:
+                tab.after_cancel(_tree_resize_job["id"])
+        except Exception:
+            pass
+        try:
+            _tree_resize_job["id"] = tab.after(70, lambda: (_tree_resize_job.__setitem__("id", None), _refresh_tree()))
+        except Exception:
+            _refresh_tree()
+
+    def _clear_sts_view(message: str):
+        sts_state["load_token"] = int(sts_state.get("load_token", 0)) + 1
+        sts_state["is_loading"] = False
+        sts_state["loaded_save_path"] = ""
+        sts_state["loaded_save_mtime"] = None
+        sts_state["files"] = {}
+        sts_state["objects"] = []
+        sts_state["row_to_obj"] = {}
+        _refresh_filter_values()
+        _refresh_tree()
+        set_app_status(message, timeout_ms=3500)
+
+    def _load_sts_objects(manual: bool = True):
+        if sts_state.get("is_loading"):
+            if manual:
+                return show_info("Cargo", "Cargo loading is already in progress.")
+            return
+
+        save_path = save_path_var.get()
+        if not save_path or not os.path.exists(save_path):
+            if manual:
+                return messagebox.showerror("Error", "CompleteSave file not found.")
+            set_app_status("Select a valid save file to load cargo entries.", timeout_ms=3500)
+            return
+
+        try:
+            save_mtime = float(os.path.getmtime(save_path))
+        except Exception:
+            save_mtime = None
+
+        if (
+            (not manual)
+            and str(sts_state.get("loaded_save_path", "") or "") == str(save_path)
+            and sts_state.get("loaded_save_mtime", None) == save_mtime
+        ):
+            _refresh_filter_values()
+            _refresh_tree()
+            return
+
+        folder = os.path.dirname(save_path)
+        slot_n = _detect_complete_save_slot_from_path(save_path)
+        sts_files = _list_sts_files_for_slot_region(folder, slot_n, "ALL")
+        if not sts_files:
+            _clear_sts_view(f"No STS files found for save slot {slot_n}.")
+            sts_state["loaded_save_path"] = save_path
+            sts_state["loaded_save_mtime"] = save_mtime
+            return
+
+        token = int(sts_state.get("load_token", 0)) + 1
+        sts_state["load_token"] = token
+        sts_state["is_loading"] = True
+        sts_state["files"] = {}
+        sts_state["objects"] = []
+        sts_state["row_to_obj"] = {}
+        _refresh_filter_values()
+        _refresh_tree()
+        set_app_status(f"Loading cargo... 0/{len(sts_files)} files (slot {slot_n})", timeout_ms=0)
+
+        progress = {
+            "loaded_files": 0,
+            "loaded_objects": 0,
+            "errors": 0,
+        }
+
+        def _is_current() -> bool:
+            return token == int(sts_state.get("load_token", -1))
+
+        def _apply_chunk(fpath: str, fdata: Dict[str, Any], objs: List[Dict[str, Any]], err_text: str = ""):
+            if not _is_current():
+                return
+            if err_text:
+                progress["errors"] += 1
+            else:
+                sts_state["files"][fpath] = fdata
+                for obj in objs:
+                    obj["file_path"] = fpath
+                sts_state["objects"].extend(objs)
+                progress["loaded_files"] = int(progress.get("loaded_files", 0)) + 1
+                progress["loaded_objects"] = len(sts_state.get("objects", []))
+
+            _refresh_filter_values()
+            _refresh_tree()
+            processed = int(progress.get("loaded_files", 0)) + int(progress.get("errors", 0))
+            set_app_status(
+                f"Loading cargo... {processed}/{len(sts_files)} files | entries: {progress.get('loaded_objects', 0)}"
+                + (f" | failed: {progress.get('errors', 0)}" if progress.get("errors", 0) else ""),
+                timeout_ms=0,
+            )
+
+        def _finish_loading():
+            if not _is_current():
+                return
+            sts_state["is_loading"] = False
+            sts_state["loaded_save_path"] = save_path
+            sts_state["loaded_save_mtime"] = save_mtime
+            try:
+                sts_state["objects"].sort(
+                    key=lambda o: (
+                        str(o.get("region_name", "")),
+                        str(o.get("map_name", "")),
+                        str(o.get("state", "")),
+                        str(o.get("name", "")),
+                        float(o.get("x", 0.0)),
+                        float(o.get("z", 0.0)),
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                _refresh_filter_values()
+                _refresh_tree()
+            except Exception:
+                pass
+            msg = (
+                f"Loaded {len(sts_state.get('objects', []))} cargo entries from "
+                f"{progress.get('loaded_files', 0)} STS files (slot {slot_n})."
+            )
+            if progress.get("errors", 0):
+                msg += f" ({progress.get('errors', 0)} failed)"
+            set_app_status(msg, timeout_ms=5000)
+
+        def _run_loader():
+            try:
+                for fpath in sts_files:
+                    if not _is_current():
+                        return
+                    try:
+                        fdata = _sts_load_file(fpath)
+                        objs = _sts_parse_cargo_objects(fdata.get("payload", b""), fpath)
+                        try:
+                            tab.after(0, lambda p=fpath, d=fdata, o=objs: _apply_chunk(p, d, o, ""))
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        try:
+                            tab.after(0, lambda p=fpath, err=str(e): _apply_chunk(p, {}, [], err))
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    tab.after(0, _finish_loading)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_run_loader, daemon=True).start()
+
+    def _selected_rows():
+        out = []
+        for iid in tree.selection():
+            obj = sts_state["row_to_obj"].get(iid)
+            if isinstance(obj, dict):
+                out.append((iid, obj))
+        return out
+
+    def _selected_edit_entries():
+        out = []
+        seen_ids = set()
+        for _iid, obj in _selected_rows():
+            oid = id(obj)
+            if oid in seen_ids:
+                continue
+            seen_ids.add(oid)
+            out.append(obj)
+        return out
+
+    def _select_filtered_rows():
+        rows = [iid for iid in tree.get_children() if iid in sts_state.get("row_to_obj", {})]
+        if not rows:
+            return
+        try:
+            tree.selection_set(rows)
+            tree.focus(rows[0])
+            tree.see(rows[0])
+        except Exception:
+            pass
+
+    def _unselect_filtered_rows():
+        try:
+            tree.selection_remove(tree.selection())
+        except Exception:
+            pass
+
+    def _on_tree_select(_event=None):
+        current = list(tree.selection())
+        if current:
+            real = [iid for iid in current if iid in sts_state.get("row_to_obj", {})]
+            if len(real) != len(current):
+                try:
+                    if real:
+                        tree.selection_set(real)
+                    else:
+                        tree.selection_remove(current)
+                except Exception:
+                    pass
+
+        rows = _selected_rows()
+        if len(rows) != 1:
+            return
+        _, obj = rows[0]
+        x_var.set(f"{float(obj.get('x', 0.0)):.3f}")
+        y_var.set(f"{float(obj.get('y', 0.0)):.3f}")
+        z_var.set(f"{float(obj.get('z', 0.0)):.3f}")
+
+    def _on_tree_click(event):
+        try:
+            region = str(tree.identify("region", event.x, event.y) or "")
+        except Exception:
+            region = ""
+        if region not in {"cell", "tree"}:
+            return
+        iid = str(tree.identify_row(event.y) or "")
+        if iid and iid in sts_state.get("row_to_obj", {}):
+            return
+        try:
+            tree.selection_remove(tree.selection())
+        except Exception:
+            pass
+        try:
+            tree.focus("")
+        except Exception:
+            pass
+        return "break"
+
+    tree.bind("<Button-1>", _on_tree_click, add="+")
+    tree.bind("<<TreeviewSelect>>", _on_tree_select)
+    tree.bind("<Configure>", _schedule_tree_resize_refresh)
+
+    def _save_touched_files(touched_paths: Set[str]):
+        saved = 0
+        for path in sorted(set(touched_paths or [])):
+            entry = sts_state["files"].get(path)
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get("payload", b"")
+            if not isinstance(payload, (bytes, bytearray)):
+                continue
+            trailer = entry.get("trailer", b"")
+            try:
+                if path not in sts_state["backed_up_files"]:
+                    try:
+                        make_backup_if_enabled(path)
+                    except Exception:
+                        pass
+                    sts_state["backed_up_files"].add(path)
+                _sts_write_file(path, payload, trailer=trailer)
+                saved += 1
+            except Exception as e:
+                raise RuntimeError(f"Failed to save {os.path.basename(path)}: {e}")
+        return saved
+
+    def _coord_offsets_for_obj(obj: Dict[str, Any], payload: bytearray) -> List[int]:
+        offs = []
+        raw = obj.get("coord_offs")
+        if isinstance(raw, list):
+            for value in raw:
+                try:
+                    offs.append(int(value))
+                except Exception:
+                    continue
+        if not offs:
+            try:
+                offs.append(int(obj.get("coord_off", -1)))
+            except Exception:
+                pass
+        out = []
+        seen = set()
+        max_off = max(0, len(payload) - 12)
+        for value in offs:
+            if value < 0 or value > max_off:
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+        if len(out) > 128:
+            out = out[:128]
+        return out
+
+    def _all_transform_offsets_for_obj(obj: Dict[str, Any], payload: bytearray) -> List[int]:
+        if not isinstance(payload, bytearray):
+            return []
+
+        size = len(payload)
+        base_offs = _coord_offsets_for_obj(obj, payload)
+        off_set = set(base_offs)
+
+        def _ival(key: str, default: int = -1) -> int:
+            try:
+                return int(obj.get(key, default))
+            except Exception:
+                return default
+
+        start_off = _ival("start_off", -1)
+        end_off = _ival("end_off", -1)
+        if start_off >= 0 and end_off > start_off:
+            try:
+                off_set.update(
+                    _cargo_editor_collect_world_transform_offsets_in_range(
+                        payload,
+                        max(0, start_off),
+                        min(size, end_off),
+                        limit=4096,
+                    )
+                )
+            except Exception:
+                pass
+
+        anchor_xyz = None
+        if base_offs:
+            try:
+                anchor_xyz = struct.unpack_from("<fff", payload, int(base_offs[0]))
+            except Exception:
+                anchor_xyz = None
+
+        for base in base_offs[:16]:
+            win_beg = max(32, int(base) - 4096)
+            win_end = min(size, int(base) + 4096)
+            try:
+                nearby = _cargo_editor_collect_world_transform_offsets_in_range(payload, win_beg, win_end, limit=4096)
+            except Exception:
+                nearby = []
+            if not nearby:
+                continue
+            if anchor_xyz is None:
+                off_set.update(nearby)
+                continue
+            ax, ay, az = anchor_xyz
+            for off in nearby:
+                try:
+                    x, y, z = struct.unpack_from("<fff", payload, int(off))
+                except Exception:
+                    continue
+                if (x - ax) * (x - ax) + (y - ay) * (y - ay) + (z - az) * (z - az) <= 80.0 * 80.0:
+                    off_set.add(int(off))
+
+        out = sorted(v for v in off_set if 0 <= int(v) <= max(0, size - 12))
+        if len(out) > 4096:
+            out = out[:4096]
+        return out
+
+    def _lift_selected():
+        if sts_state.get("is_loading"):
+            return show_info("Cargo", "Wait for cargo loading to finish first.")
+        entries = _selected_edit_entries()
+        if not entries:
+            return show_info("Cargo", "No cargo selected.")
+
+        try:
+            lift = float(str(lift_var.get() or "0").strip())
+        except Exception:
+            return messagebox.showerror("Error", "Lift Y value is invalid.")
+        if abs(lift) < 1e-9:
+            return show_info("Cargo", "Lift value is 0, nothing to apply.")
+
+        editable_entries = [obj for obj in entries if bool(obj.get("allow_world_edit"))]
+        skipped_count = len(entries) - len(editable_entries)
+        if not editable_entries:
+            return show_info("Cargo", "Selected cargo does not have isolated world transforms to edit.")
+
+        touched = set()
+        moved = 0
+        for obj in editable_entries:
+            path = obj.get("file_path")
+            entry = sts_state["files"].get(path)
+            payload = entry.get("payload") if isinstance(entry, dict) else None
+            if not isinstance(payload, bytearray):
+                continue
+            coord_offs = _all_transform_offsets_for_obj(obj, payload)
+            if not coord_offs:
+                skipped_count += 1
+                continue
+            for off in coord_offs:
+                try:
+                    cx, cy, cz = struct.unpack_from("<fff", payload, off)
+                    struct.pack_into("<fff", payload, off, float(cx), float(cy + lift), float(cz))
+                except Exception:
+                    continue
+            obj["y"] = float(obj.get("y", 0.0)) + lift
+            touched.add(path)
+            moved += 1
+
+        if not touched:
+            return show_info("Cargo", "No editable cargo transform found in the selected rows.")
+        try:
+            saved = _save_touched_files(touched)
+        except Exception as e:
+            return messagebox.showerror("Error", str(e))
+        _refresh_tree()
+        set_app_status(
+            f"Lifted {moved} cargo entries. Saved {saved} STS files."
+            + (f" Skipped {skipped_count} attached/static entries." if skipped_count else ""),
+            timeout_ms=5000,
+        )
+
+    def _apply_xyz_selected():
+        if sts_state.get("is_loading"):
+            return show_info("Cargo", "Wait for cargo loading to finish first.")
+        entries = _selected_edit_entries()
+        if not entries:
+            return show_info("Cargo", "No cargo selected.")
+
+        sx = str(x_var.get() or "").strip()
+        sy = str(y_var.get() or "").strip()
+        sz = str(z_var.get() or "").strip()
+        if not sx and not sy and not sz:
+            return show_info("Cargo", "X/Y/Z fields are empty.")
+
+        try:
+            vx = float(sx) if sx else None
+            vy = float(sy) if sy else None
+            vz = float(sz) if sz else None
+        except Exception:
+            return messagebox.showerror("Error", "X/Y/Z values are invalid.")
+
+        editable_entries = [obj for obj in entries if bool(obj.get("allow_world_edit"))]
+        skipped_count = len(entries) - len(editable_entries)
+        if not editable_entries:
+            return show_info("Cargo", "Selected cargo does not have isolated world transforms to edit.")
+
+        touched = set()
+        moved = 0
+        for obj in editable_entries:
+            path = obj.get("file_path")
+            entry = sts_state["files"].get(path)
+            payload = entry.get("payload") if isinstance(entry, dict) else None
+            if not isinstance(payload, bytearray):
+                continue
+            coord_offs = _all_transform_offsets_for_obj(obj, payload)
+            if not coord_offs:
+                skipped_count += 1
+                continue
+
+            ox = float(obj.get("x", 0.0))
+            oy = float(obj.get("y", 0.0))
+            oz = float(obj.get("z", 0.0))
+            tx = ox if vx is None else float(vx)
+            ty = oy if vy is None else float(vy)
+            tz = oz if vz is None else float(vz)
+            dx = tx - ox
+            dy = ty - oy
+            dz = tz - oz
+
+            for off in coord_offs:
+                try:
+                    cx, cy, cz = struct.unpack_from("<fff", payload, off)
+                    struct.pack_into("<fff", payload, off, float(cx + dx), float(cy + dy), float(cz + dz))
+                except Exception:
+                    continue
+
+            obj["x"] = float(obj.get("x", 0.0)) + dx
+            obj["y"] = float(obj.get("y", 0.0)) + dy
+            obj["z"] = float(obj.get("z", 0.0)) + dz
+            touched.add(path)
+            moved += 1
+
+        if not touched:
+            return show_info("Cargo", "No editable cargo transform found in the selected rows.")
+        try:
+            saved = _save_touched_files(touched)
+        except Exception as e:
+            return messagebox.showerror("Error", str(e))
+        _refresh_tree()
+        set_app_status(
+            f"Applied XYZ to {moved} cargo entries. Saved {saved} STS files."
+            + (f" Skipped {skipped_count} attached/static entries." if skipped_count else ""),
+            timeout_ms=5000,
+        )
+
+    def _delete_selected_entries():
+        if sts_state.get("is_loading"):
+            return show_info("Cargo", "Wait for cargo loading to finish first.")
+        entries = _selected_edit_entries()
+        if not entries:
+            return show_info("Cargo", "No cargo selected.")
+
+        try:
+            ok = messagebox.askyesno(
+                "Delete selected cargo?",
+                f"Delete {len(entries)} selected cargo entr{'y' if len(entries) == 1 else 'ies'} from STS files?\n\nThis cannot be undone without backup.",
+            )
+        except Exception:
+            ok = True
+        if not ok:
+            return
+
+        by_file: Dict[str, List[Dict[str, Any]]] = {}
+        for obj in entries:
+            path = str(obj.get("file_path", "") or "").strip()
+            if not path:
+                continue
+            by_file.setdefault(path, []).append(obj)
+
+        touched = set()
+        deleted_count = 0
+        skipped_count = 0
+
+        for path, objs in by_file.items():
+            entry = sts_state["files"].get(path)
+            payload = entry.get("payload") if isinstance(entry, dict) else None
+            if not isinstance(payload, bytearray):
+                skipped_count += len(objs)
+                continue
+
+            current_objects = _sts_parse_cargo_objects(bytes(payload), path)
+            generic_records = _cargo_editor_collect_string_records(bytes(payload))
+            if not current_objects or not generic_records:
+                skipped_count += len(objs)
+                continue
+
+            current_by_start = {
+                _cargo_editor_int_value(obj.get("start_off", -1), -1): obj
+                for obj in current_objects
+                if isinstance(obj, dict)
+            }
+            selected_current: List[Dict[str, Any]] = []
+            selected_seen: Set[int] = set()
+            for obj in objs:
+                start_off = _cargo_editor_int_value(obj.get("start_off", -1), -1)
+                cur = current_by_start.get(start_off)
+                if not isinstance(cur, dict):
+                    skipped_count += 1
+                    continue
+                if start_off in selected_seen:
+                    continue
+                selected_seen.add(start_off)
+                selected_current.append(cur)
+
+            if not selected_current:
+                continue
+
+            generic_index = {
+                _cargo_editor_int_value(rec.get("start_off", -1), -1): idx
+                for idx, rec in enumerate(generic_records)
+                if isinstance(rec, dict)
+            }
+
+            changed_file = False
+            carrier_groups: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+            loose_entries: List[Dict[str, Any]] = []
+            for obj in selected_current:
+                carrier_start = _cargo_editor_int_value(obj.get("carrier_start_off", -1), -1)
+                carrier_end = _cargo_editor_int_value(obj.get("carrier_end_off", -1), -1)
+                if carrier_start >= 0 and carrier_end > carrier_start:
+                    carrier_groups.setdefault((carrier_start, carrier_end), []).append(obj)
+                else:
+                    loose_entries.append(obj)
+
+            for (carrier_start, carrier_end), group in carrier_groups.items():
+                sample = group[0]
+                selected_records = _cargo_editor_unique_records(
+                    [rec for obj in group for rec in _cargo_editor_expand_delete_records(obj)]
+                )
+                if not selected_records:
+                    skipped_count += len(group)
+                    continue
+
+                carrier_kind = str(sample.get("carrier_kind", "") or "").strip().lower()
+                if carrier_kind == "trailer":
+                    carrier_objects = [
+                        obj
+                        for obj in current_objects
+                        if _cargo_editor_int_value(obj.get("carrier_start_off", -1), -1) == carrier_start
+                        and _cargo_editor_int_value(obj.get("carrier_end_off", -1), -1) == carrier_end
+                    ]
+                    all_records = _cargo_editor_unique_records(
+                        [rec for obj in carrier_objects for rec in _cargo_editor_expand_delete_records(obj)]
+                    )
+                    if not all_records:
+                        skipped_count += len(group)
+                        continue
+
+                    region_start = min(
+                        _cargo_editor_int_value(rec.get("start_off", -1), -1)
+                        for rec in all_records
+                    )
+                    region_end = _cargo_editor_trailer_region_end(sample, region_start, carrier_end)
+                    if region_end <= region_start:
+                        skipped_count += len(group)
+                        continue
+
+                    spans: List[Tuple[int, int]] = []
+                    for rec in selected_records:
+                        start_off = _cargo_editor_int_value(rec.get("start_off", -1), -1)
+                        if start_off < 0:
+                            continue
+                        end_off = _cargo_editor_next_generic_start(generic_records, generic_index, start_off, region_end)
+                        if end_off >= region_end:
+                            end_off = int(region_end)
+                        spans.append((int(start_off), int(end_off)))
+
+                    removed = _cargo_editor_compact_region(payload, region_start, region_end, spans)
+                    if removed <= 0:
+                        skipped_count += len(group)
+                        continue
+
+                    count_off = int(region_start - 4)
+                    try:
+                        old_count = struct.unpack_from("<I", payload, count_off)[0]
+                    except Exception:
+                        old_count = None
+                    if old_count == len(all_records):
+                        try:
+                            struct.pack_into(
+                                "<I",
+                                payload,
+                                count_off,
+                                max(0, int(old_count) - len(selected_records)),
+                            )
+                        except Exception:
+                            pass
+
+                    changed_file = True
+                    deleted_count += len(group)
+                    continue
+
+                region_end = int(carrier_end)
+                region_start = min(
+                    _cargo_editor_int_value(rec.get("start_off", -1), -1)
+                    for rec in selected_records
+                )
+                if region_end <= region_start:
+                    skipped_count += len(group)
+                    continue
+
+                spans = []
+                for rec in selected_records:
+                    start_off = _cargo_editor_int_value(rec.get("start_off", -1), -1)
+                    if start_off < 0:
+                        continue
+                    end_off = _cargo_editor_next_generic_start(generic_records, generic_index, start_off, region_end)
+                    if end_off >= region_end:
+                        end_off = int(region_end)
+                    spans.append((int(start_off), int(end_off)))
+
+                removed = _cargo_editor_compact_region(payload, region_start, region_end, spans)
+                if removed <= 0:
+                    skipped_count += len(group)
+                    continue
+
+                changed_file = True
+                deleted_count += len(group)
+
+            handled_loose: Set[int] = set()
+            for obj in loose_entries:
+                obj_start = _cargo_editor_int_value(obj.get("start_off", -1), -1)
+                if obj_start in handled_loose:
+                    continue
+
+                record_starts = [
+                    _cargo_editor_int_value(rec.get("start_off", -1), -1)
+                    for rec in _cargo_editor_expand_delete_records(obj)
+                ]
+                cluster_indexes = [generic_index.get(start_off) for start_off in record_starts if start_off in generic_index]
+                cluster_indexes = [idx for idx in cluster_indexes if isinstance(idx, int)]
+                if not cluster_indexes:
+                    skipped_count += 1
+                    continue
+
+                lo = min(cluster_indexes)
+                hi = max(cluster_indexes)
+                while lo > 0 and _cargo_editor_is_cargo_like_record(
+                    generic_records[lo - 1].get("type_id", ""),
+                    generic_records[lo - 1].get("object_id", ""),
+                ):
+                    lo -= 1
+                while (hi + 1) < len(generic_records) and _cargo_editor_is_cargo_like_record(
+                    generic_records[hi + 1].get("type_id", ""),
+                    generic_records[hi + 1].get("object_id", ""),
+                ):
+                    hi += 1
+
+                cluster_start = _cargo_editor_int_value(generic_records[lo].get("start_off", -1), -1)
+                hard_end = (
+                    _cargo_editor_int_value(generic_records[hi + 1].get("start_off", len(payload)), len(payload))
+                    if (hi + 1) < len(generic_records)
+                    else len(payload)
+                )
+                if cluster_start < 0 or hard_end <= cluster_start:
+                    skipped_count += 1
+                    continue
+
+                cluster_objects = [
+                    current
+                    for current in current_objects
+                    if _cargo_editor_int_value(current.get("carrier_start_off", -1), -1) < 0
+                    and cluster_start <= _cargo_editor_int_value(current.get("start_off", -1), -1) < hard_end
+                ]
+                group = []
+                for candidate in loose_entries:
+                    candidate_start = _cargo_editor_int_value(candidate.get("start_off", -1), -1)
+                    if candidate_start in handled_loose:
+                        continue
+                    if cluster_start <= candidate_start < hard_end:
+                        group.append(candidate)
+                        handled_loose.add(candidate_start)
+
+                selected_records = _cargo_editor_unique_records(
+                    [rec for item in group for rec in _cargo_editor_expand_delete_records(item)]
+                )
+                if not selected_records:
+                    skipped_count += len(group) if group else 1
+                    continue
+
+                cluster_visible_starts = {
+                    _cargo_editor_int_value(current.get("start_off", -1), -1)
+                    for current in cluster_objects
+                    if isinstance(current, dict)
+                }
+                cluster_visible_starts.discard(-1)
+                cluster_record_starts = {
+                    _cargo_editor_int_value(generic_records[idx].get("start_off", -1), -1)
+                    for idx in range(lo, hi + 1)
+                    if _cargo_editor_is_cargo_like_record(
+                        generic_records[idx].get("type_id", ""),
+                        generic_records[idx].get("object_id", ""),
+                    )
+                }
+                cluster_record_starts.discard(-1)
+                selected_visible_starts = {
+                    _cargo_editor_int_value(item.get("start_off", -1), -1)
+                    for item in group
+                    if isinstance(item, dict)
+                }
+                selected_visible_starts.discard(-1)
+
+                region_end = _cargo_editor_min_coord_boundary(cluster_objects, cluster_start, hard_end)
+                if region_end <= cluster_start:
+                    region_end = int(hard_end)
+
+                spans = []
+                delete_full_cluster = (
+                    bool(cluster_visible_starts)
+                    and cluster_record_starts == cluster_visible_starts
+                    and selected_visible_starts == cluster_visible_starts
+                    and (int(hard_end) - int(cluster_start)) <= 8192
+                )
+                if delete_full_cluster:
+                    spans.append((int(cluster_start), int(hard_end)))
+                    region_end = int(hard_end)
+                else:
+                    for rec in selected_records:
+                        start_off = _cargo_editor_int_value(rec.get("start_off", -1), -1)
+                        if start_off < 0:
+                            continue
+                        end_off = _cargo_editor_next_generic_start(generic_records, generic_index, start_off, region_end)
+                        if end_off >= region_end:
+                            end_off = int(region_end)
+                        spans.append((int(start_off), int(end_off)))
+
+                removed = _cargo_editor_compact_region(payload, cluster_start, region_end, spans)
+                if removed <= 0:
+                    skipped_count += len(group) if group else 1
+                    continue
+
+                changed_file = True
+                deleted_count += len(group)
+
+            if changed_file:
+                touched.add(path)
+
+        if not touched:
+            return show_info("Cargo", "Failed to delete selected cargo entries.")
+        try:
+            saved = _save_touched_files(touched)
+        except Exception as e:
+            return messagebox.showerror("Error", str(e))
+
+        sts_state["loaded_save_mtime"] = None
+        set_app_status(
+            f"Deleted {deleted_count} cargo entr{'y' if deleted_count == 1 else 'ies'}. Saved {saved} STS files. Reloading cargo list..."
+            + (f" Skipped {skipped_count} entr{'y' if skipped_count == 1 else 'ies'}." if skipped_count else ""),
+            timeout_ms=0,
+        )
+        _load_sts_objects(manual=False)
+
+    def _on_state_or_region_filter_change(_event=None):
+        _refresh_filter_values()
+        _refresh_tree()
+
+    def _on_map_filter_change(_event=None):
+        _refresh_tree()
+
+    state_filter_cb.bind("<<ComboboxSelected>>", _on_state_or_region_filter_change)
+    region_filter_cb.bind("<<ComboboxSelected>>", _on_state_or_region_filter_change)
+    map_filter_cb.bind("<<ComboboxSelected>>", _on_map_filter_change)
+
+    ttk.Button(edit_row, text="Select Filtered", command=_select_filtered_rows).pack(side="left", padx=(0, 8))
+    ttk.Button(edit_row, text="Unselect Filtered", command=_unselect_filtered_rows).pack(side="left", padx=(0, 8))
+    ttk.Button(edit_row, text="Delete Selected", command=_delete_selected_entries).pack(side="left", padx=(0, 12))
+    ttk.Button(edit_row, text="Lift Selected (+Y)", command=_lift_selected).pack(side="left", padx=(0, 8))
+    ttk.Button(edit_row, text="Apply", command=_apply_xyz_selected).pack(side="left")
+
+    def _on_save_path_changed():
+        path = save_path_var.get()
+        if path and os.path.exists(path):
+            _clear_sts_view("Loading cargo in background...")
+            _load_sts_objects(manual=False)
+        else:
+            _clear_sts_view("Select a valid save file to load cargo entries.")
+
+    def _on_tab_visible(_event=None):
+        path = save_path_var.get()
+        if not path or not os.path.exists(path):
+            return
+        if sts_state.get("is_loading"):
+            return
+        _load_sts_objects(manual=False)
+
+    _on_save_path_changed()
+    tab.bind("<Visibility>", _on_tab_visible)
+    _trace_var_write(save_path_var, _on_save_path_changed)
+
+
+
+# =============================================================================
+# SECTION: Cargo Loading Counts Tab
+# Used In: launch_gui -> Cargo Loading
+# =============================================================================
+_CARGO_LOADING_ALL_CARGO_CACHE = None
+_CARGO_LOADING_CRAFT_ZONE_CACHE = None
+_CARGO_LOADING_LOCALIZATION_CACHE = None
+_CARGO_LOADING_BUILTIN_CARGO_NAMES = {
+    "CargoBags",
+    "CargoBags2",
+    "CargoBarrels",
+    "CargoBarrelsChemicals",
+    "CargoBarrelsOil",
+    "CargoBricks",
+    "CargoCellulose",
+    "CargoConcreteSlab",
+    "CargoContainerLarge",
+    "CargoContainerSmall",
+    "CargoCrateLarge",
+    "CargoFertilizer",
+    "CargoForcklift",
+    "CargoForkliftCaravanContainer2",
+    "CargoLogsLong",
+    "CargoLogsMedium",
+    "CargoLogsShort",
+    "CargoMetalJunkOpen",
+    "CargoMetalPlanks",
+    "CargoMetalRoll",
+    "CargoPipeLarge",
+    "CargoPipesMedium",
+    "CargoPipesSmall",
+    "CargoServiceSpareParts",
+    "CargoSolarPanel",
+    "CargoTetrapod",
+    "CargoVehiclesSpareParts",
+}
+_CARGO_LOADING_BUILTIN_CRAFT_ZONES = set()
+_CARGO_LOADING_PROTECTED_CARGO_NAMES = {
+    "CargoWater",
+}
+
+
+def _cargo_loading_is_protected_cargo(cargo_name: Any) -> bool:
+    return str(cargo_name or "").strip() in _CARGO_LOADING_PROTECTED_CARGO_NAMES
+
+
+def _cargo_loading_reference_dir() -> str:
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        base_dir = os.getcwd()
+    return os.path.join(base_dir, "cargoloadingcounts")
+
+
+def _cargo_loading_reference_path(filename: str) -> str:
+    return os.path.join(_cargo_loading_reference_dir(), str(filename or "").strip())
+
+
+def _cargo_loading_read_reference_text(filename: str) -> str:
+    path = _cargo_loading_reference_path(filename)
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+
+def _cargo_loading_known_cargo_names(force_reload: bool = False) -> List[str]:
+    global _CARGO_LOADING_ALL_CARGO_CACHE
+    if (not force_reload) and isinstance(_CARGO_LOADING_ALL_CARGO_CACHE, list):
+        return list(_CARGO_LOADING_ALL_CARGO_CACHE)
+
+    names: Set[str] = set(_CARGO_LOADING_BUILTIN_CARGO_NAMES)
+    for filename in (
+        "all cargo up to season 18.txt",
+        "all cargo up to season 17.txt",
+        "stuff for unlimited ,limited and craft cargo.txt",
+        "all craft cargo zones info.txt",
+    ):
+        text = _cargo_loading_read_reference_text(filename)
+        for match in re.finditer(r'"(Cargo[^"]+)"\s*:', text):
+            cargo_name = str(match.group(1) or "").strip()
+            if cargo_name and not _cargo_loading_is_protected_cargo(cargo_name):
+                names.add(cargo_name)
+
+    _CARGO_LOADING_ALL_CARGO_CACHE = sorted(names, key=lambda value: str(value).lower())
+    return list(_CARGO_LOADING_ALL_CARGO_CACHE)
+
+
+def _cargo_loading_craft_zones(force_reload: bool = False) -> Set[str]:
+    global _CARGO_LOADING_CRAFT_ZONE_CACHE
+    if (not force_reload) and isinstance(_CARGO_LOADING_CRAFT_ZONE_CACHE, set):
+        return set(_CARGO_LOADING_CRAFT_ZONE_CACHE)
+
+    zones: Set[str] = set(_CARGO_LOADING_BUILTIN_CRAFT_ZONES)
+    text = _cargo_loading_read_reference_text("all craft cargo zones info.txt")
+    for match in re.finditer(r'"([^"\r\n]*\|\|[^"\r\n]*)"\s*:', text):
+        zone_key = str(match.group(1) or "").strip()
+        if zone_key:
+            zones.add(zone_key)
+
+    _CARGO_LOADING_CRAFT_ZONE_CACHE = zones
+    return set(_CARGO_LOADING_CRAFT_ZONE_CACHE)
+
+
+def _cargo_loading_get_localization(force_reload: bool = False) -> Dict[str, str]:
+    global _CARGO_LOADING_LOCALIZATION_CACHE
+    if (not force_reload) and isinstance(_CARGO_LOADING_LOCALIZATION_CACHE, dict):
+        return dict(_CARGO_LOADING_LOCALIZATION_CACHE)
+
+    localization: Dict[str, str] = {}
+    try:
+        source_info = _objectives_get_preferred_source(
+            force_reload=bool(force_reload),
+            language=_objectives_get_language_preference(),
+            allow_download=False,
+        )
+        payload = source_info.get("localization") if isinstance(source_info, dict) else {}
+        if isinstance(payload, dict):
+            localization = payload
+    except Exception:
+        localization = {}
+
+    _CARGO_LOADING_LOCALIZATION_CACHE = dict(localization)
+    return dict(_CARGO_LOADING_LOCALIZATION_CACHE)
+
+
+def _cargo_loading_invalidate_runtime_caches() -> None:
+    global _CARGO_LOADING_LOCALIZATION_CACHE
+    _CARGO_LOADING_LOCALIZATION_CACHE = None
+
+
+def _cargo_loading_editor_translate_exact(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    translated = _editor_translate_display_text(text)
+    if translated != text:
+        return translated
+
+    try:
+        state = _editor_translation_get_state()
+        strings = state.get("strings") if isinstance(state, dict) else {}
+    except Exception:
+        strings = {}
+    if not isinstance(strings, dict):
+        return text
+
+    for candidate in (text.lower(), text.upper(), text.title()):
+        val = strings.get(candidate)
+        if isinstance(val, str) and val and (val != candidate):
+            return val
+    return text
+
+
+def _cargo_loading_editor_translate_phrase(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+
+    direct = _cargo_loading_editor_translate_exact(text)
+    if direct != text:
+        return direct
+
+    numeric_suffix = re.match(r"^(.*\S)(\s+\d+(?:\s+\d+)*)$", text)
+    if numeric_suffix:
+        prefix = str(numeric_suffix.group(1) or "").strip()
+        suffix = str(numeric_suffix.group(2) or "")
+        if prefix:
+            translated_prefix = _cargo_loading_editor_translate_exact(prefix)
+            if translated_prefix != prefix:
+                return translated_prefix + suffix
+
+    tokens = [token for token in text.split() if token]
+    if not tokens:
+        return text
+
+    translated_parts: List[str] = []
+    changed = False
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if re.fullmatch(r"\d+", token):
+            translated_parts.append(token)
+            idx += 1
+            continue
+
+        translated_phrase = ""
+        for span in range(min(4, len(tokens) - idx), 1, -1):
+            phrase_tokens = tokens[idx : idx + span]
+            if any(re.fullmatch(r"\d+", phrase_token) for phrase_token in phrase_tokens):
+                continue
+            candidate = " ".join(phrase_tokens)
+            translated_candidate = _cargo_loading_editor_translate_exact(candidate)
+            if translated_candidate != candidate:
+                translated_phrase = translated_candidate
+                idx += span
+                break
+
+        if translated_phrase:
+            translated_parts.append(translated_phrase)
+            changed = True
+            continue
+
+        translated_token = _cargo_loading_editor_translate_exact(token)
+        if translated_token != token:
+            changed = True
+        translated_parts.append(translated_token)
+        idx += 1
+
+    return " ".join(translated_parts) if changed else text
+
+
+def _cargo_loading_localize_token(localization: Optional[Dict[str, str]], *tokens: Any) -> str:
+    loc = localization if isinstance(localization, dict) else {}
+    if not loc:
+        return ""
+    seen: Set[str] = set()
+    for token in tokens:
+        raw = str(token or "").strip()
+        if (not raw) or (raw in seen):
+            continue
+        seen.add(raw)
+        translated = _objectives_local_clean_text(_objectives_local_translate(raw, loc))
+        if translated and (translated != raw) and (not _objectives_local_is_probably_token(translated)):
+            return translated
+    return ""
+
+
+def _cargo_loading_split_zone_key(zone_key: Any) -> Tuple[str, str]:
+    raw = str(zone_key or "").strip()
+    if not raw:
+        return "", ""
+    if "||" not in raw:
+        return "", raw
+    map_id, zone_id = raw.split("||", 1)
+    return map_id.strip(), zone_id.strip()
+
+
+def _cargo_loading_display_cargo_name(cargo_name: Any, localization: Optional[Dict[str, str]] = None) -> str:
+    raw = str(cargo_name or "").strip()
+    if not raw:
+        return ""
+    loc = localization if isinstance(localization, dict) else {}
+    translated = _objectives_local_clean_text(_objectives_local_translate(raw, loc))
+
+    def _has_ascii_letters(value: Any) -> bool:
+        return bool(re.search(r"[A-Za-z]", str(value or "")))
+
+    def _has_non_ascii(value: Any) -> bool:
+        return any(ord(ch) > 127 for ch in str(value or ""))
+
+    def _is_mixed_script(value: Any) -> bool:
+        return _has_ascii_letters(value) and _has_non_ascii(value)
+
+    def _strip_cargo_prefix(value: Any) -> str:
+        return re.sub(r"^(?:Cargo\s*|カーゴ|貨物|货物)\s*", "", str(value or "")).strip()
+
+    def _looks_compact_identifier(value: Any) -> bool:
+        text = str(value or "").strip()
+        if (not text) or any(ch.isspace() for ch in text):
+            return False
+        return bool(
+            ("_" in text)
+            or re.search(r"[a-z][A-Z]", text)
+            or re.search(r"[A-Za-z]\d", text)
+            or re.search(r"\d[A-Za-z]", text)
+        )
+
+    cargo_overrides = {
+        "CargoBA20": "BA-20",
+        "CargoBA20Add": "BA-20 Add",
+        "CargoBigbar": "Big Bar",
+        "CargoForcklift": "Forklift",
+        "CargoLogsLong": "Long Logs",
+        "CargoLogsMedium": "Medium Logs",
+        "CargoLogsMedium_Burnt": "Burnt Medium Logs",
+        "CargoLogsShort": "Short Logs",
+        "CargoNPPPump": "NPP Pump",
+    }
+    override_label = cargo_overrides.get(raw)
+    humanized = override_label or _objectives_local_humanize_identifier(raw)
+    parts = [part for part in humanized.split() if part]
+    movable_suffixes = {"Big", "Large", "Long", "Medium", "Short", "Small"}
+    if len(parts) >= 2 and parts[-1] in movable_suffixes:
+        parts = [parts[-1]] + parts[:-1]
+    display = " ".join(parts) or humanized
+    translated_display = _cargo_loading_editor_translate_phrase(display) or display
+
+    editor_translated = _cargo_loading_editor_translate_exact(raw)
+    stripped_translated = _strip_cargo_prefix(translated)
+    stripped_editor_translated = _strip_cargo_prefix(editor_translated)
+
+    for candidate in (
+        stripped_translated,
+        stripped_editor_translated,
+    ):
+        if candidate and translated_display and (candidate != translated_display) and (not any(ch.isspace() for ch in candidate)):
+            continue
+        if candidate and (candidate != raw) and (not _is_mixed_script(candidate)) and (not _looks_compact_identifier(candidate)):
+            return candidate
+    if translated_display and (translated_display != raw) and (not _looks_compact_identifier(translated_display)):
+        return translated_display
+
+    if translated and (translated != raw) and (not _objectives_local_is_probably_token(translated)) and (not _looks_compact_identifier(translated)):
+        return translated
+    if editor_translated and (editor_translated != raw) and (not _looks_compact_identifier(editor_translated)):
+        return editor_translated
+    if translated_display and (translated_display != display):
+        return translated_display
+    return translated_display or display
+
+
+def _cargo_loading_display_region_name(
+    region_name: Any,
+    *,
+    region_code: Any = "",
+    localization: Optional[Dict[str, str]] = None,
+) -> str:
+    base = str(region_name or "").strip() or _map_region_name_from_code(region_code)
+    if not base:
+        return ""
+    localized = _cargo_loading_localize_token(localization, base)
+    if localized:
+        return localized
+    return _cargo_loading_editor_translate_phrase(base) or base
+
+
+def _cargo_loading_display_map_name(
+    map_id: Any,
+    *,
+    localization: Optional[Dict[str, str]] = None,
+    map_info: Optional[Dict[str, str]] = None,
+) -> str:
+    mid = _map_normalize_id(map_id)
+    info = map_info if isinstance(map_info, dict) else _map_display_info(mid)
+    base = str(info.get("map_name", "") or "").strip() or _map_humanize_slug(mid) or mid
+    if base == mid:
+        map_name_fallbacks = {
+            "US_03_02": "Grainwoods River",
+        }
+        base = map_name_fallbacks.get(mid, base)
+    localized = _cargo_loading_localize_token(
+        localization,
+        *[
+            candidate
+            for lookup in _map_lookup_candidates(mid)
+            for candidate in (f"{lookup}_NAME", lookup)
+        ],
+    )
+    if localized:
+        return localized
+    return _cargo_loading_editor_translate_phrase(base) or base
+
+
+_CARGO_LOADING_ZONE_TOKEN_LABELS = {
+    "A": "A",
+    "B": "B",
+    "C": "C",
+    "CR": "Craft",
+    "LC": "LC",
+    "LM": "LM",
+    "MT": "Metal",
+    "MET": "Metal",
+    "WD": "Wood",
+    "BR": "Bricks",
+    "BRICK": "Brick",
+    "WH": "Warehouse",
+    "WARE": "Warehouse",
+    "WAREHOUSE": "Warehouse",
+    "MINIWAREHOUSE": "Mini Warehouse",
+    "LOG": "Log",
+    "LOGS": "Logs",
+    "LOG_STATION": "Log Station",
+    "LOGSTATION": "Log Station",
+    "STATION": "Station",
+    "METALC": "Metal",
+    "WOODC": "Wood",
+    "BRICKC": "Bricks",
+    "LUMBER": "Lumber",
+    "LONG": "Long",
+    "MEDIUM": "Medium",
+    "SHORT": "Short",
+    "BURNT": "Burnt",
+    "SPECIAL": "Special",
+    "CONTAINER": "Container",
+    "OIL": "Oil",
+    "CHEMICALS": "Chemicals",
+    "CHEMICAL": "Chemical",
+    "SLAB": "Slab",
+    "BLOCK": "Block",
+    "PIPE": "Pipe",
+    "PLANKS": "Planks",
+    "ROLL": "Roll",
+    "SPARE": "Spare",
+    "PARTS": "Parts",
+    "ROCKET": "Rocket",
+    "GMO": "GMO",
+    "PICKUP": "Pickup",
+    "FUEL": "Fuel",
+    "AIRPORT": "Airport",
+    "GAS": "Gas",
+    "HELICOPTER": "Helicopter",
+    "FELLING": "Felling",
+    "SHALE": "Shale",
+    "SILVER": "Silver",
+    "SHARES": "Shares",
+    "TOWER": "Tower",
+    "CENTER": "Center",
+    "WATER": "Water",
+    "SERVICE": "Service",
+    "VEHICLES": "Vehicles",
+    "BARRELS": "Barrels",
+    "IRON": "Iron",
+    "PLANE": "Plane",
+    "PLATFORM": "Platform",
+    "SOLAR": "Solar",
+    "LOGGING": "Logging",
+    "RECYCLING": "Recycling",
+    "DRILLING": "Drilling",
+    "PAPER": "Paper",
+    "HANGAR": "Hangar",
+    "GARAGE": "Garage",
+    "STUFF": "Stuff",
+    "QUARRY": "Quarry",
+    "FLOODED": "Flooded",
+    "BURNED": "Burned",
+    "SAW": "Saw",
+    "SOY": "Soy",
+    "UNLOCK": "Unlock",
+    "LOST": "Lost",
+    "SHIP": "Ship",
+    "ABANDONED": "Abandoned",
+    "PIER": "Pier",
+    "PICK": "Pickup",
+    "PUP": "Pickup",
+    "PL": "Pickup",
+    "STEEL": "Steel",
+    "RAILWAY": "Railway",
+    "RAIL": "Rail",
+    "POTATO": "Potato",
+    "CITY": "City",
+    "FARM": "Farm",
+    "TOWN": "Town",
+    "MINE": "Mine",
+    "SAND": "Sand",
+    "PARKING": "Parking",
+    "FACTORY": "Factory",
+    "STORAGE": "Storage",
+    "LOADING": "Loading",
+    "LIMITED": "Limited",
+    "CARGO": "Cargo",
+    "SMALL": "Small",
+    "BIG": "Big",
+    "MIDDLE": "Middle",
+    "PORT": "Port",
+    "SAWMILL": "Sawmill",
+    "SERVHUB": "Service Hub",
+    "WTS": "Water Treatment Station",
+    "FORREST": "Forest",
+    "AERODROM": "Aerodrome",
+    "LOGHOUSE": "Log House",
+    "DEMOLITION": "Demolition",
+    "CAMP": "Camp",
+    "REPAIR": "Repair",
+    "WEST": "West",
+    "EAST": "East",
+    "NORTH": "North",
+    "SOUTH": "South",
+    "CABINS": "Cabins",
+    "SCOUT": "Scout",
+    "WINTER": "Winter",
+    "SUPPLIES": "Supplies",
+    "CONTRACTOR": "Contractor",
+    "OLD": "Old",
+    "HOUSE": "House",
+    "HELP": "Help",
+    "MAGAZINES": "Magazines",
+    "JUNK": "Junk",
+    "OUT": "Out",
+    "SEISMO": "Seismo",
+    "TANK": "Tank",
+    "UPDATE": "Update",
+    "HEAVY": "Heavy",
+    "FOR": "For",
+    "THE": "The",
+    "TASK": "Task",
+    "TSK": "Task",
+    "OBJ": "Objective",
+    "NEED": "Need",
+    "WORKSHOP": "Workshop",
+    "CAR": "Car",
+    "WOODEN": "Wooden",
+    "CARCASS": "Carcass",
+    "FOREST": "Forest",
+    "UNLOADING": "Unloading",
+    "ZONE": "Zone",
+    "PRODUCTION": "Production",
+    "SITE": "Site",
+    "RIVER": "River",
+    "LAKE": "Lake",
+    "ROAD": "Road",
+    "RD": "Road",
+    "GEN": "Generator",
+    "MAIN": "Main",
+    "NEW": "New",
+}
+
+
+def _cargo_loading_display_zone_name(zone_key: Any, localization: Optional[Dict[str, str]] = None) -> str:
+    map_id, zone_id = _cargo_loading_split_zone_key(zone_key)
+    working = str(zone_id or "").strip()
+    stripped_prefix = False
+    for prefix in _map_lookup_candidates(map_id):
+        if prefix and working.upper().startswith(prefix + "_"):
+            working = working[len(prefix) + 1 :]
+            stripped_prefix = True
+            break
+    if (not stripped_prefix) and re.match(r"^[A-Z]{2,}(?:_\d{2}){2}_", working):
+        working = re.sub(r"^[A-Z]{2,}(?:_\d{2}){2}_", "", working, count=1)
+    if not working:
+        working = str(zone_key or "").strip()
+
+    working = re.sub(r"_+", "_", working).strip("_")
+    if not working:
+        return str(zone_key or "").strip()
+
+    localized = _cargo_loading_localize_token(
+        localization,
+        zone_id,
+        working,
+    )
+    if localized:
+        return localized
+
+    combined_tokens = {
+        "LOG_STATION": "Log Station",
+        "SERVICE_HUB": "Service Hub",
+        "OLD_HOUSE": "Old House",
+        "LOG_HOUSE": "Log House",
+        "HEAVY_CARGO": "Heavy Cargo",
+        "WATER_HOUSE": "Water House",
+        "METAL_JUNK": "Metal Junk",
+        "WATER_TREATMENT": "Water Treatment",
+        "FUEL_STORAGE": "Fuel Storage",
+        "TOWN_STORAGE": "Town Storage",
+        "CHEMICAL_STATION": "Chemical Station",
+        "FOOD_FACTORY": "Food Factory",
+        "SILVER_FACTORY": "Silver Factory",
+        "WATER_CRANE": "Water Crane",
+    }
+    parts = [p for p in working.split("_") if p]
+    display_parts: List[str] = []
+    idx = 0
+    while idx < len(parts):
+        pair = "_".join(parts[idx : idx + 2]).upper()
+        if pair in combined_tokens:
+            display_parts.append(combined_tokens[pair])
+            idx += 2
+            continue
+        token = str(parts[idx] or "").strip()
+        token_upper = token.upper()
+        mapped = _CARGO_LOADING_ZONE_TOKEN_LABELS.get(token_upper)
+        if mapped:
+            display_parts.append(mapped)
+        elif re.fullmatch(r"\d+", token):
+            display_parts.append(token)
+        else:
+            display_parts.append(_objectives_local_humanize_identifier(token).title())
+        idx += 1
+
+    display = " ".join(part for part in display_parts if part).strip() or str(zone_key or "").strip()
+    return _cargo_loading_editor_translate_phrase(display) or display
+
+
+def _cargo_loading_format_count(count_value: Any) -> str:
+    try:
+        parsed = int(count_value)
+    except Exception:
+        return str(count_value or "")
+    if parsed == -1:
+        return "Unlimited"
+    return str(parsed)
+
+
+_CARGO_LOADING_TEMPLATE_COUNT = 1999255
+_CARGO_LOADING_HIDDEN_MAP_TOKENS = {"TEST", "TUTORIAL", "POLYGON", "SANDBOX"}
+
+
+def _cargo_loading_parse_count_value(raw_count: Any) -> Optional[int]:
+    try:
+        return int(raw_count)
+    except Exception:
+        try:
+            return int(float(raw_count))
+        except Exception:
+            return None
+
+
+def _cargo_loading_should_hide_zone(zone_key: Any) -> bool:
+    map_id, _ = _cargo_loading_split_zone_key(zone_key)
+    tokens = {part for part in _map_normalize_id(map_id).split("_") if part}
+    return bool(tokens & _CARGO_LOADING_HIDDEN_MAP_TOKENS)
+
+
+def _cargo_loading_zone_mode(zone_key: Any, cargo_map: Any, craft_zones: Optional[Set[str]] = None) -> str:
+    entries = cargo_map if isinstance(cargo_map, dict) else {}
+    known_craft_zones = craft_zones if isinstance(craft_zones, set) else set()
+    zone_name = str(zone_key or "").strip()
+    editable_entries = {
+        cargo_name: raw_value
+        for cargo_name, raw_value in entries.items()
+        if not _cargo_loading_is_protected_cargo(cargo_name)
+    }
+
+    has_unlimited = False
+    has_editable = False
+    for raw_value in editable_entries.values():
+        try:
+            value = int(raw_value)
+        except Exception:
+            continue
+        if value == -1:
+            has_unlimited = True
+        elif value >= 0:
+            has_editable = True
+
+    if zone_name in known_craft_zones:
+        return "Craft zone"
+    if entries and not editable_entries:
+        return "Water point entry"
+    if has_unlimited and has_editable:
+        return "Mixed limited + unlimited"
+    if has_unlimited:
+        return "Contains unlimited cargo"
+    return "Editable limited cargo"
+
+
+def _cargo_loading_read_state(path: str) -> Dict[str, Any]:
+    doc, had_null, save_keys = _experiments_read_save_doc(path)
+    save_key = save_keys[0]
+    save_obj = doc.get(save_key)
+    if not isinstance(save_obj, dict):
+        save_obj = {}
+        doc[save_key] = save_obj
+
+    ssl_value = save_obj.get("SslValue")
+    if not isinstance(ssl_value, dict):
+        ssl_value = {}
+        save_obj["SslValue"] = ssl_value
+
+    raw_zone_map = ssl_value.get("cargoLoadingCounts")
+    zone_map: Dict[str, Dict[str, int]] = {}
+    source_zone_map: Dict[str, Dict[str, int]] = {}
+    template_zones: Set[str] = set()
+    if isinstance(raw_zone_map, dict):
+        for raw_zone_key, raw_cargo_map in raw_zone_map.items():
+            zone_key = str(raw_zone_key or "").strip()
+            if (not zone_key) or (not isinstance(raw_cargo_map, dict)):
+                continue
+            zone_entries: Dict[str, int] = {}
+            source_entries: Dict[str, int] = {}
+            has_template_entries = False
+            for raw_cargo_name, raw_count in raw_cargo_map.items():
+                cargo_name = str(raw_cargo_name or "").strip()
+                if not cargo_name:
+                    continue
+                count_value = _cargo_loading_parse_count_value(raw_count)
+                if count_value is None:
+                    continue
+                source_entries[cargo_name] = count_value
+                if count_value == _CARGO_LOADING_TEMPLATE_COUNT:
+                    has_template_entries = True
+                    continue
+                zone_entries[cargo_name] = count_value
+            if source_entries:
+                source_zone_map[zone_key] = source_entries
+            if zone_entries or has_template_entries:
+                zone_map[zone_key] = zone_entries
+            if has_template_entries:
+                template_zones.add(zone_key)
+
+    return {
+        "doc": doc,
+        "had_null": had_null,
+        "save_key": save_key,
+        "raw_zones": source_zone_map,
+        "template_zones": template_zones,
+        "zones": zone_map,
+    }
+
+
+def _cargo_loading_write_state(
+    path: str,
+    zone_map: Dict[str, Dict[str, int]],
+    *,
+    save_key: str = "",
+    had_null: Optional[bool] = None,
+    raw_zone_map: Optional[Dict[str, Dict[str, int]]] = None,
+) -> int:
+    doc, current_had_null, save_keys = _experiments_read_save_doc(path)
+    target_save_key = save_key if save_key in save_keys else (save_keys[0] if save_keys else "")
+    if not target_save_key:
+        raise ValueError("No CompleteSave block was found in the selected file.")
+
+    if had_null is None:
+        had_null = current_had_null
+
+    save_obj = doc.get(target_save_key)
+    if not isinstance(save_obj, dict):
+        save_obj = {}
+        doc[target_save_key] = save_obj
+
+    ssl_value = save_obj.get("SslValue")
+    if not isinstance(ssl_value, dict):
+        ssl_value = {}
+        save_obj["SslValue"] = ssl_value
+
+    current_zone_map = zone_map if isinstance(zone_map, dict) else {}
+    existing_zone_map = raw_zone_map if isinstance(raw_zone_map, dict) else {}
+    clean_zone_map: Dict[str, Dict[str, int]] = {}
+    all_zone_keys = {
+        str(zone_key or "").strip()
+        for zone_key in list(current_zone_map.keys()) + list(existing_zone_map.keys())
+        if str(zone_key or "").strip()
+    }
+    for zone_key in all_zone_keys:
+        clean_entries: Dict[str, int] = {}
+
+        existing_entries = existing_zone_map.get(zone_key)
+        if isinstance(existing_entries, dict):
+            for raw_cargo_name, raw_count in existing_entries.items():
+                cargo_name = str(raw_cargo_name or "").strip()
+                if not cargo_name:
+                    continue
+                count_value = _cargo_loading_parse_count_value(raw_count)
+                if count_value == _CARGO_LOADING_TEMPLATE_COUNT or _cargo_loading_is_protected_cargo(cargo_name):
+                    clean_entries[cargo_name] = count_value
+
+        current_entries = current_zone_map.get(zone_key)
+        if isinstance(current_entries, dict):
+            for raw_cargo_name, raw_count in current_entries.items():
+                cargo_name = str(raw_cargo_name or "").strip()
+                if not cargo_name:
+                    continue
+                if _cargo_loading_is_protected_cargo(cargo_name):
+                    continue
+                count_value = _cargo_loading_parse_count_value(raw_count)
+                if count_value is None:
+                    continue
+                clean_entries[cargo_name] = count_value
+
+        if clean_entries:
+            clean_zone_map[zone_key] = clean_entries
+
+    ssl_value["cargoLoadingCounts"] = clean_zone_map
+    _experiments_write_save_doc(path, doc, had_null=bool(had_null))
+    return len(clean_zone_map)
+
+
+def create_cargo_loading_tab(tab, save_path_var):
+    known_cargo_names = _cargo_loading_known_cargo_names(force_reload=False)
+    craft_zones = _cargo_loading_craft_zones(force_reload=False)
+    cfg = _load_config_safe()
+
+    state = {
+        "path": "",
+        "save_key": "",
+        "had_null": False,
+        "localization": {},
+        "raw_zones": {},
+        "template_zones": set(),
+        "zones": {},
+        "zone_iids": {},
+        "cargo_iids": {},
+        "cargo_choice_lookup": {},
+        "selected_zone": "",
+        "dirty": False,
+        "filter_refreshing": False,
+        "translation_signature": (),
+        "ui_refresh_job": None,
+    }
+
+    search_var = tk.StringVar(tab, value="")
+    region_filter_var = tk.StringVar(tab, value=_editor_translate_display_text("All"))
+    map_filter_var = tk.StringVar(tab, value=_editor_translate_display_text("All"))
+    hide_unlimited_var = tk.BooleanVar(
+        tab,
+        value=_cfg_bool(cfg.get("cargo_loading_hide_unlimited", True), default=True),
+    )
+    selected_count_var = tk.StringVar(tab, value="")
+    new_cargo_var = tk.StringVar(tab, value="")
+    new_count_var = tk.StringVar(tab, value="1")
+
+    toolbar = ttk.Frame(tab)
+    toolbar.pack(fill="x", padx=10, pady=(10, 8))
+    toolbar.grid_columnconfigure(1, weight=1)
+    search_label = ttk.Label(toolbar, text="Search:")
+    search_label.grid(row=0, column=0, sticky="w")
+    search_entry = ttk.Entry(toolbar, textvariable=search_var, width=24)
+    search_entry.grid(row=0, column=1, sticky="ew", padx=(6, 12))
+    region_label = ttk.Label(toolbar, text="Region")
+    region_label.grid(row=0, column=2, sticky="w")
+    region_combo = ttk.Combobox(toolbar, textvariable=region_filter_var, state="readonly", width=14)
+    region_combo.grid(row=0, column=3, sticky="w", padx=(6, 12))
+    map_label = ttk.Label(toolbar, text="Map")
+    map_label.grid(row=0, column=4, sticky="w")
+    map_combo = ttk.Combobox(toolbar, textvariable=map_filter_var, state="readonly", width=20)
+    map_combo.grid(row=0, column=5, sticky="w", padx=(6, 12))
+    hide_unlimited_check = ttk.Checkbutton(toolbar, text="Hide unlimited", variable=hide_unlimited_var)
+    hide_unlimited_check.grid(row=0, column=6, sticky="w", padx=(0, 12))
+    reload_btn = ttk.Button(toolbar, text="Reload Save", command=lambda: _load_from_save())
+    reload_btn.grid(row=0, column=7, sticky="w")
+
+    content = ttk.Frame(tab)
+    content.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+    content.grid_columnconfigure(0, weight=1, uniform="cargo_loading_split")
+    content.grid_columnconfigure(1, weight=1, uniform="cargo_loading_split")
+    content.grid_rowconfigure(0, weight=1)
+
+    left_panel = ttk.Frame(content)
+    left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+    left_panel.grid_rowconfigure(0, weight=1)
+    left_panel.grid_columnconfigure(0, weight=1)
+
+    right_panel = ttk.Frame(content)
+    right_panel.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+    right_panel.grid_rowconfigure(0, weight=1)
+    right_panel.grid_columnconfigure(0, weight=1)
+
+    zone_frame = ttk.Frame(left_panel)
+    zone_frame.grid(row=0, column=0, sticky="nsew")
+    zone_frame.grid_rowconfigure(0, weight=1)
+    zone_frame.grid_columnconfigure(0, weight=1)
+    zone_tree = ttk.Treeview(
+        zone_frame,
+        columns=("region", "map", "name", "count"),
+        show="headings",
+        selectmode="browse",
+        height=18,
+    )
+    zone_tree.heading("region", text="Region")
+    zone_tree.heading("map", text="Map")
+    zone_tree.heading("name", text="Name")
+    zone_tree.heading("count", text="Count")
+    zone_tree.column("region", width=140, anchor="w", stretch=False)
+    zone_tree.column("map", width=180, anchor="w", stretch=True)
+    zone_tree.column("name", width=220, anchor="w", stretch=True)
+    zone_tree.column("count", width=70, anchor="center", stretch=False)
+    zone_tree.grid(row=0, column=0, sticky="nsew")
+    zone_scroll = ttk.Scrollbar(zone_frame, orient="vertical", command=zone_tree.yview)
+    zone_scroll.grid(row=0, column=1, sticky="ns")
+    zone_scroll_x = ttk.Scrollbar(zone_frame, orient="horizontal", command=zone_tree.xview)
+    zone_scroll_x.grid(row=1, column=0, sticky="ew")
+    zone_tree.configure(yscrollcommand=zone_scroll.set, xscrollcommand=zone_scroll_x.set)
+
+    cargo_frame = ttk.Frame(right_panel)
+    cargo_frame.grid(row=0, column=0, sticky="nsew")
+    cargo_frame.grid_rowconfigure(0, weight=1)
+    cargo_frame.grid_columnconfigure(0, weight=1)
+    cargo_tree = ttk.Treeview(cargo_frame, columns=("cargo", "count"), show="headings", selectmode="browse", height=18)
+    cargo_tree.heading("cargo", text="Cargo")
+    cargo_tree.heading("count", text="Count")
+    cargo_tree.column("cargo", width=420, anchor="w", stretch=True)
+    cargo_tree.column("count", width=110, anchor="center", stretch=False)
+    cargo_tree.grid(row=0, column=0, sticky="nsew")
+    cargo_scroll = ttk.Scrollbar(cargo_frame, orient="vertical", command=cargo_tree.yview)
+    cargo_scroll.grid(row=0, column=1, sticky="ns")
+    cargo_tree.configure(yscrollcommand=cargo_scroll.set)
+    cargo_tree.tag_configure("readonly", foreground="#7a7a7a")
+
+    footer = ttk.Frame(tab)
+    footer.pack(fill="x", padx=10, pady=(0, 10))
+    footer.grid_columnconfigure(3, weight=1)
+    selected_count_label = ttk.Label(footer, text="Count")
+    selected_count_label.grid(row=0, column=0, sticky="w")
+    selected_count_entry = ttk.Entry(footer, textvariable=selected_count_var, width=10)
+    selected_count_entry.grid(row=0, column=1, sticky="w", padx=(6, 10))
+    update_btn = ttk.Button(footer, text="Update Selected Count", command=lambda: _update_selected_count(), state="disabled")
+    update_btn.grid(row=0, column=2, sticky="w")
+    new_cargo_label = ttk.Label(footer, text="Cargo")
+    new_cargo_label.grid(row=0, column=4, sticky="w", padx=(18, 0))
+    cargo_combo = ttk.Combobox(footer, textvariable=new_cargo_var, values=(), state="readonly", width=28)
+    cargo_combo.grid(row=0, column=5, sticky="w", padx=(6, 10))
+    new_count_label = ttk.Label(footer, text="Count")
+    new_count_label.grid(row=0, column=6, sticky="w")
+    new_count_entry = ttk.Entry(footer, textvariable=new_count_var, width=8)
+    new_count_entry.grid(row=0, column=7, sticky="w", padx=(6, 10))
+    add_btn = ttk.Button(footer, text="Add Cargo to Zone", command=lambda: _add_cargo_to_zone(), state="disabled")
+    add_btn.grid(row=0, column=8, sticky="w")
+    save_btn = ttk.Button(footer, text="Save", command=lambda: _save_to_file(), state="disabled")
+    save_btn.grid(row=0, column=9, sticky="e", padx=(10, 0))
+
+    def _set_dirty(is_dirty: bool) -> None:
+        state["dirty"] = bool(is_dirty)
+        save_btn.configure(state=("normal" if state["dirty"] else "disabled"))
+
+    def _all_filter_label() -> str:
+        return _editor_translate_display_text("All")
+
+    def _current_translation_signature() -> Tuple[str, str, int]:
+        try:
+            editor_state = _editor_translation_get_state()
+        except Exception:
+            editor_state = {}
+        try:
+            generation = int(_get_objectives_source_generation())
+        except Exception:
+            generation = 0
+        return (
+            str(editor_state.get("resolved_language") or ""),
+            str(_objectives_get_language_preference() or ""),
+            generation,
+        )
+
+    def _refresh_static_texts() -> None:
+        search_label.configure(text=_editor_translate_display_text("Search:"))
+        region_label.configure(text=_editor_translate_display_text("Region"))
+        map_label.configure(text=_editor_translate_display_text("Map"))
+        hide_unlimited_check.configure(text=_editor_translate_display_text("Hide unlimited"))
+        reload_btn.configure(text=_editor_translate_display_text("Reload Save"))
+        zone_tree.heading("region", text=_editor_translate_display_text("Region"))
+        zone_tree.heading("map", text=_editor_translate_display_text("Map"))
+        zone_tree.heading("name", text=_editor_translate_display_text("Name"))
+        zone_tree.heading("count", text=_editor_translate_display_text("Count"))
+        cargo_tree.heading("cargo", text=_editor_translate_display_text("Cargo"))
+        cargo_tree.heading("count", text=_editor_translate_display_text("Count"))
+        selected_count_label.configure(text=_editor_translate_display_text("Count"))
+        update_btn.configure(text=_editor_translate_display_text("Update Selected Count"))
+        new_cargo_label.configure(text=_editor_translate_display_text("Cargo"))
+        new_count_label.configure(text=_editor_translate_display_text("Count"))
+        add_btn.configure(text=_editor_translate_display_text("Add Cargo to Zone"))
+        save_btn.configure(text=_editor_translate_display_text("Save"))
+
+    def _refresh_localized_ui(force_localization: bool = False) -> None:
+        try:
+            state["localization"] = _cargo_loading_get_localization(force_reload=bool(force_localization))
+        except Exception:
+            state["localization"] = {}
+        _refresh_static_texts()
+        _refresh_add_cargo_choices()
+        _render_zone_list()
+        state["translation_signature"] = _current_translation_signature()
+
+    def _schedule_translation_poll(delay_ms: int = 750) -> None:
+        try:
+            existing = state.get("ui_refresh_job")
+            if existing is not None:
+                tab.after_cancel(existing)
+        except Exception:
+            pass
+
+        def _poll():
+            state["ui_refresh_job"] = None
+            try:
+                if not bool(tab.winfo_exists()):
+                    return
+            except Exception:
+                return
+            current_signature = _current_translation_signature()
+            if tuple(state.get("translation_signature") or ()) != current_signature:
+                _refresh_localized_ui(force_localization=True)
+            _schedule_translation_poll(delay_ms)
+
+        try:
+            state["ui_refresh_job"] = tab.after(max(250, int(delay_ms)), _poll)
+        except Exception:
+            state["ui_refresh_job"] = None
+
+    def _refresh_add_cargo_choices() -> None:
+        localization = state.get("localization")
+        previous_lookup = state.get("cargo_choice_lookup") if isinstance(state.get("cargo_choice_lookup"), dict) else {}
+        current_value = str(new_cargo_var.get() or "").strip()
+        current_cargo_name = str(previous_lookup.get(current_value, "") or "").strip()
+        if (not current_cargo_name) and current_value in known_cargo_names:
+            current_cargo_name = current_value
+        display_pairs: List[Tuple[str, str]] = []
+        used_labels: Set[str] = set()
+        for cargo_name in sorted(
+            known_cargo_names,
+            key=lambda value: _cargo_loading_display_cargo_name(value, localization).lower(),
+        ):
+            if _cargo_loading_is_protected_cargo(cargo_name):
+                continue
+            label = _cargo_loading_display_cargo_name(cargo_name, localization) or str(cargo_name or "")
+            unique_label = label
+            if unique_label in used_labels:
+                unique_label = f"{label} ({cargo_name})"
+            used_labels.add(unique_label)
+            display_pairs.append((unique_label, cargo_name))
+
+        state["cargo_choice_lookup"] = dict(display_pairs)
+        cargo_combo.configure(values=[display for display, _ in display_pairs])
+
+        for display_label, cargo_name in display_pairs:
+            if cargo_name == current_cargo_name:
+                new_cargo_var.set(display_label)
+                return
+        new_cargo_var.set("")
+
+    def _selected_zone_key() -> str:
+        selection = zone_tree.selection()
+        if not selection:
+            return ""
+        return str(state["zone_iids"].get(selection[0], "") or "")
+
+    def _selected_cargo_name() -> str:
+        selection = cargo_tree.selection()
+        if not selection:
+            return ""
+        return str(state["cargo_iids"].get(selection[0], "") or "")
+
+    def _all_zone_rows() -> List[Dict[str, Any]]:
+        rendered_rows = [
+            _zone_meta(zone_key, state["zones"].get(zone_key, {}))
+            for zone_key in state["zones"].keys()
+            if not _cargo_loading_should_hide_zone(zone_key)
+        ]
+        rendered_rows.sort(
+            key=lambda item: (
+                str(item.get("region_name", "") or "").lower(),
+                str(item.get("map_name", "") or "").lower(),
+                str(item.get("display_zone", "") or "").lower(),
+            )
+        )
+        return rendered_rows
+
+    def _refresh_filter_values(rows: Optional[List[Dict[str, Any]]] = None) -> None:
+        all_label = _all_filter_label()
+        rendered_rows = rows if isinstance(rows, list) else _all_zone_rows()
+        region_values = [all_label] + sorted(
+            {str(meta.get("region_name", "") or "").strip() for meta in rendered_rows if str(meta.get("region_name", "") or "").strip()},
+            key=lambda value: value.lower(),
+        )
+
+        selected_region = str(region_filter_var.get() or "").strip() or all_label
+        if selected_region not in region_values:
+            selected_region = all_label
+
+        filtered_rows = rendered_rows
+        if selected_region != all_label:
+            filtered_rows = [
+                meta for meta in rendered_rows
+                if str(meta.get("region_name", "") or "").strip() == selected_region
+            ]
+
+        map_values = [all_label] + sorted(
+            {str(meta.get("map_name", "") or "").strip() for meta in filtered_rows if str(meta.get("map_name", "") or "").strip()},
+            key=lambda value: value.lower(),
+        )
+
+        selected_map = str(map_filter_var.get() or "").strip() or all_label
+        if selected_map not in map_values:
+            selected_map = all_label
+
+        state["filter_refreshing"] = True
+        try:
+            region_combo.configure(values=region_values)
+            map_combo.configure(values=map_values)
+            region_filter_var.set(selected_region)
+            map_filter_var.set(selected_map)
+        finally:
+            state["filter_refreshing"] = False
+
+    def _zone_meta(zone_key: Any, cargo_map: Any) -> Dict[str, Any]:
+        zone_name = str(zone_key or "").strip()
+        entries = cargo_map if isinstance(cargo_map, dict) else {}
+        map_id, raw_zone_id = _cargo_loading_split_zone_key(zone_name)
+        localization = state.get("localization")
+        map_info = _map_display_info(map_id)
+        region_name = _cargo_loading_display_region_name(
+            map_info.get("region_name", ""),
+            region_code=map_info.get("region_code", ""),
+            localization=localization,
+        )
+        map_name = _cargo_loading_display_map_name(
+            map_id,
+            localization=localization,
+            map_info=map_info,
+        )
+        display_zone = _cargo_loading_display_zone_name(zone_name, localization=localization)
+        mode = _cargo_loading_zone_mode(zone_name, entries, craft_zones)
+        has_unlimited = any(
+            int(value) == -1
+            for cargo_name, value in entries.items()
+            if not _cargo_loading_is_protected_cargo(cargo_name)
+        ) if entries else False
+        cargo_names = [
+            _cargo_loading_display_cargo_name(cargo_name, localization)
+            for cargo_name in entries.keys()
+        ]
+        search_blob = " ".join(
+            [
+                zone_name,
+                map_id,
+                raw_zone_id,
+                display_zone,
+                region_name,
+                map_name,
+                mode,
+            ]
+            + list(entries.keys())
+            + cargo_names
+        ).lower()
+        return {
+            "zone_key": zone_name,
+            "region_name": region_name,
+            "map_name": map_name,
+            "display_zone": display_zone,
+            "mode": mode,
+            "has_unlimited": has_unlimited,
+            "entry_count": len(entries),
+            "search_blob": search_blob,
+        }
+
+    def _refresh_action_state() -> None:
+        zone_key = str(state.get("selected_zone", "") or "")
+        cargo_name = _selected_cargo_name()
+        current_zone = state["zones"].get(zone_key, {}) if zone_key else {}
+        selected_count = current_zone.get(cargo_name) if cargo_name else None
+        can_update = bool(
+            zone_key
+            and cargo_name
+            and selected_count is not None
+            and int(selected_count) != -1
+            and not _cargo_loading_is_protected_cargo(cargo_name)
+        )
+        can_add = bool(zone_key and zone_key in craft_zones and state["cargo_choice_lookup"])
+        update_btn.configure(state=("normal" if can_update else "disabled"))
+        add_btn.configure(state=("normal" if can_add else "disabled"))
+        try:
+            selected_count_entry.configure(state=("normal" if can_update else "readonly"))
+        except Exception:
+            pass
+        try:
+            cargo_combo.configure(state=("readonly" if can_add else "disabled"))
+        except Exception:
+            pass
+        try:
+            new_count_entry.configure(state=("normal" if can_add else "disabled"))
+        except Exception:
+            pass
+
+    def _render_cargo_list(preserve_cargo: str = "") -> None:
+        for iid in cargo_tree.get_children():
+            cargo_tree.delete(iid)
+        state["cargo_iids"] = {}
+
+        zone_key = str(state.get("selected_zone", "") or "")
+        cargo_map = state["zones"].get(zone_key, {}) if zone_key else {}
+        selected_iid = ""
+
+        for index, cargo_name in enumerate(
+            sorted(
+                cargo_map.keys(),
+                key=lambda value: _cargo_loading_display_cargo_name(value, state.get("localization")).lower(),
+            )
+        ):
+            count_value = cargo_map.get(cargo_name, 0)
+            iid = f"cargo::{index}"
+            display_name = _cargo_loading_display_cargo_name(cargo_name, state.get("localization"))
+            row_tags = ("readonly",) if int(count_value) == -1 or _cargo_loading_is_protected_cargo(cargo_name) else ()
+            cargo_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(display_name, _editor_translate_display_text(_cargo_loading_format_count(count_value))),
+                tags=row_tags,
+            )
+            state["cargo_iids"][iid] = cargo_name
+            if preserve_cargo and cargo_name == preserve_cargo:
+                selected_iid = iid
+
+        if selected_iid:
+            cargo_tree.selection_set(selected_iid)
+            cargo_tree.focus(selected_iid)
+            cargo_tree.see(selected_iid)
+
+        if selected_iid:
+            try:
+                selected_count_var.set(_editor_translate_display_text(_cargo_loading_format_count(cargo_map.get(preserve_cargo, ""))))
+            except Exception:
+                selected_count_var.set("")
+        else:
+            selected_count_var.set("")
+
+        _refresh_action_state()
+
+    def _update_zone_details() -> None:
+        zone_key = str(state.get("selected_zone", "") or "")
+        if not zone_key:
+            _render_cargo_list()
+            return
+
+        _render_cargo_list(preserve_cargo=_selected_cargo_name())
+
+    def _render_zone_list() -> None:
+        previous_zone = str(state.get("selected_zone", "") or "")
+        for iid in zone_tree.get_children():
+            zone_tree.delete(iid)
+        state["zone_iids"] = {}
+
+        query = str(search_var.get() or "").strip().lower()
+        all_label = _all_filter_label()
+        rendered_rows = _all_zone_rows()
+        _refresh_filter_values(rendered_rows)
+        selected_region = str(region_filter_var.get() or "").strip() or all_label
+        selected_map = str(map_filter_var.get() or "").strip() or all_label
+        hide_unlimited = bool(hide_unlimited_var.get())
+        selected_iid = ""
+
+        for index, meta in enumerate(rendered_rows):
+            if query and query not in str(meta.get("search_blob", "") or ""):
+                continue
+            if selected_region != all_label and str(meta.get("region_name", "") or "").strip() != selected_region:
+                continue
+            if selected_map != all_label and str(meta.get("map_name", "") or "").strip() != selected_map:
+                continue
+            if hide_unlimited and bool(meta.get("has_unlimited")):
+                continue
+
+            iid = f"zone::{index}"
+            zone_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    str(meta.get("region_name", "") or ""),
+                    str(meta.get("map_name", "") or ""),
+                    str(meta.get("display_zone", "") or meta.get("zone_key", "")),
+                    int(meta.get("entry_count", 0) or 0),
+                ),
+            )
+            state["zone_iids"][iid] = str(meta.get("zone_key", "") or "")
+            if previous_zone and str(meta.get("zone_key", "") or "") == previous_zone:
+                selected_iid = iid
+
+        if selected_iid:
+            zone_tree.selection_set(selected_iid)
+            zone_tree.focus(selected_iid)
+            zone_tree.see(selected_iid)
+            state["selected_zone"] = previous_zone
+        else:
+            items = zone_tree.get_children()
+            if items:
+                first_iid = items[0]
+                zone_tree.selection_set(first_iid)
+                zone_tree.focus(first_iid)
+                state["selected_zone"] = str(state["zone_iids"].get(first_iid, "") or "")
+            else:
+                state["selected_zone"] = ""
+
+        _update_zone_details()
+
+    def _load_from_save() -> None:
+        path = str(save_path_var.get() or "").strip()
+        if (not path) or (not os.path.isfile(path)):
+            state["path"] = ""
+            state["save_key"] = ""
+            state["had_null"] = False
+            state["raw_zones"] = {}
+            state["template_zones"] = set()
+            state["zones"] = {}
+            state["selected_zone"] = ""
+            _set_dirty(False)
+            _refresh_localized_ui(force_localization=False)
+            return
+
+        try:
+            payload = _cargo_loading_read_state(path)
+        except Exception as e:
+            state["path"] = ""
+            state["save_key"] = ""
+            state["had_null"] = False
+            state["raw_zones"] = {}
+            state["template_zones"] = set()
+            state["zones"] = {}
+            state["selected_zone"] = ""
+            _set_dirty(False)
+            _refresh_localized_ui(force_localization=False)
+            messagebox.showerror("Error", str(e))
+            return
+
+        state["path"] = path
+        state["save_key"] = str(payload.get("save_key", "") or "")
+        state["had_null"] = bool(payload.get("had_null"))
+        state["raw_zones"] = copy.deepcopy(payload.get("raw_zones") or {})
+        state["template_zones"] = set(payload.get("template_zones") or set())
+        state["zones"] = copy.deepcopy(payload.get("zones") or {})
+        state["selected_zone"] = ""
+        _set_dirty(False)
+        _refresh_localized_ui(force_localization=False)
+
+    def _save_to_file() -> None:
+        path = str(state.get("path", "") or "").strip()
+        if (not path) or (not os.path.isfile(path)):
+            return show_info("Info", "Please select a valid save file first.")
+        try:
+            make_backup_if_enabled(path, force_full=True)
+            _cargo_loading_write_state(
+                path,
+                state["zones"],
+                save_key=str(state.get("save_key", "") or ""),
+                had_null=bool(state.get("had_null", False)),
+                raw_zone_map=state.get("raw_zones"),
+            )
+        except Exception as e:
+            return messagebox.showerror("Error", str(e))
+        _set_dirty(False)
+        set_app_status("Saved cargo loading counts to file.", timeout_ms=5000)
+
+    def _handle_zone_selected(_event=None) -> None:
+        state["selected_zone"] = _selected_zone_key()
+        _update_zone_details()
+
+    def _handle_cargo_selected(_event=None) -> None:
+        zone_key = str(state.get("selected_zone", "") or "")
+        cargo_name = _selected_cargo_name()
+        cargo_map = state["zones"].get(zone_key, {}) if zone_key else {}
+        if cargo_name:
+            selected_count_var.set(_editor_translate_display_text(_cargo_loading_format_count(cargo_map.get(cargo_name, ""))))
+        else:
+            selected_count_var.set("")
+        _refresh_action_state()
+
+    def _parse_nonnegative_count(raw_value: Any) -> Optional[int]:
+        text = str(raw_value or "").strip()
+        if not text:
+            return None
+        try:
+            count_value = int(text)
+        except Exception:
+            return None
+        if count_value < 0:
+            return -1
+        return count_value
+
+    def _update_selected_count() -> None:
+        zone_key = str(state.get("selected_zone", "") or "")
+        cargo_name = _selected_cargo_name()
+        if not cargo_name:
+            return show_info("Info", "Select a cargo entry first.")
+        if _cargo_loading_is_protected_cargo(cargo_name):
+            return show_info("Info", "Water entries are stored as points by the game and are not editable in the cargo tab.")
+
+        parsed_count = _parse_nonnegative_count(selected_count_var.get())
+        if parsed_count is None:
+            return messagebox.showerror("Error", "Count must be a whole number.")
+        if parsed_count < 0:
+            return messagebox.showerror("Error", "Count cannot be negative here. Unlimited entries stay at -1.")
+
+        cargo_map = state["zones"].get(zone_key, {})
+        if cargo_map.get(cargo_name) == -1:
+            return
+
+        cargo_map[cargo_name] = parsed_count
+        _set_dirty(True)
+        _render_cargo_list(preserve_cargo=cargo_name)
+
+    def _add_cargo_to_zone() -> None:
+        zone_key = str(state.get("selected_zone", "") or "")
+        if (not zone_key) or zone_key not in craft_zones:
+            return
+
+        selected_value = str(new_cargo_var.get() or "").strip()
+        cargo_name = str(state["cargo_choice_lookup"].get(selected_value, "") or "").strip()
+        if not cargo_name and selected_value in known_cargo_names:
+            cargo_name = selected_value
+        if not cargo_name:
+            return show_info("Info", "Select a cargo type to add.")
+        if _cargo_loading_is_protected_cargo(cargo_name):
+            return show_info("Info", "Water cannot be added to craft zones from the cargo tab.")
+
+        parsed_count = _parse_nonnegative_count(new_count_var.get())
+        if parsed_count is None:
+            return messagebox.showerror("Error", "Count must be a whole number.")
+        if parsed_count < 0:
+            return messagebox.showerror("Error", "Count cannot be negative here. Unlimited entries stay at -1.")
+
+        cargo_map = state["zones"].setdefault(zone_key, {})
+        if cargo_name in cargo_map:
+            return show_info("Info", "This cargo already exists in the selected zone. Use Update Selected Count instead.")
+
+        cargo_map[cargo_name] = parsed_count
+        _set_dirty(True)
+        _render_cargo_list(preserve_cargo=cargo_name)
+
+    zone_tree.bind("<<TreeviewSelect>>", _handle_zone_selected)
+    cargo_tree.bind("<<TreeviewSelect>>", _handle_cargo_selected)
+    _trace_var_write(search_var, _render_zone_list)
+    _trace_var_write(region_filter_var, lambda *_: None if state["filter_refreshing"] else _render_zone_list())
+    _trace_var_write(map_filter_var, lambda *_: None if state["filter_refreshing"] else _render_zone_list())
+    _trace_var_write(hide_unlimited_var, _render_zone_list)
+    _trace_var_write(
+        hide_unlimited_var,
+        lambda *_: _update_config_values({"cargo_loading_hide_unlimited": bool(hide_unlimited_var.get())}),
+    )
+
+    def _handle_cargo_loading_metadata_changed():
+        try:
+            if not bool(tab.winfo_exists()):
+                _vehicle_unregister_metadata_refresh_listener(_handle_cargo_loading_metadata_changed)
+                return
+        except Exception:
+            _vehicle_unregister_metadata_refresh_listener(_handle_cargo_loading_metadata_changed)
+            return
+
+        def _apply_refresh():
+            try:
+                if not bool(tab.winfo_exists()):
+                    _vehicle_unregister_metadata_refresh_listener(_handle_cargo_loading_metadata_changed)
+                    return
+            except Exception:
+                _vehicle_unregister_metadata_refresh_listener(_handle_cargo_loading_metadata_changed)
+                return
+            _refresh_localized_ui(force_localization=True)
+
+        try:
+            tab.after(0, _apply_refresh)
+        except Exception:
+            pass
+
+    def _cleanup_cargo_loading_listener(event=None):
+        if (event is not None) and (getattr(event, "widget", None) is not tab):
+            return
+        try:
+            if state.get("ui_refresh_job") is not None:
+                tab.after_cancel(state.get("ui_refresh_job"))
+        except Exception:
+            pass
+        state["ui_refresh_job"] = None
+        _vehicle_unregister_metadata_refresh_listener(_handle_cargo_loading_metadata_changed)
+
+    _vehicle_register_metadata_refresh_listener(_handle_cargo_loading_metadata_changed)
+    try:
+        tab.bind("<Destroy>", _cleanup_cargo_loading_listener, add="+")
+    except Exception:
+        pass
+
+    try:
+        selected_count_entry.configure(state="readonly")
+    except Exception:
+        pass
+    _refresh_static_texts()
+    _refresh_add_cargo_choices()
+    _refresh_filter_values([])
+    _trace_var_write(save_path_var, _load_from_save)
+    _load_from_save()
+    _schedule_translation_poll(750)
 
 # =============================================================================
 # SECTION: Vehicles Tab (STS object editing)
@@ -16539,11 +26373,14 @@ def _vehicle_humanize_id(raw: Any) -> str:
 _VEHICLE_REAL_NAME_MAP_CACHE = None
 _VEHICLE_MAP_DISPLAY_INDEX_CACHE = None
 _VEHICLE_METADATA_CACHE_INFO = None
+_VEHICLE_MODEL_INDEX_CACHE = None
 _VEHICLE_METADATA_CACHE_LOCK = threading.Lock()
 _VEHICLE_STATIC_ID_SOURCE_CACHE = None
 _VEHICLE_STATIC_ID_SOURCE_LOCK = threading.Lock()
 _VEHICLE_METADATA_REFRESH_LISTENERS = []
 _VEHICLE_METADATA_REFRESH_LOCK = threading.Lock()
+_VEHICLE_DIRECT_TRAILER_ENTRY_RE = re.compile(r'(^|/)classes/trucks/trailers/[^/]+\.xml$', flags=re.IGNORECASE)
+_VEHICLE_XML_UI_NAME_RE = re.compile(r'<UiDesc\b[^>]*\bUiName="(?P<token>[^"]+)"', flags=re.IGNORECASE)
 
 
 def _vehicle_static_ids_file_path() -> str:
@@ -16747,16 +26584,19 @@ def _vehicle_invalidate_metadata_caches(clear_disk: bool = False) -> None:
     global _VEHICLE_REAL_NAME_MAP_CACHE
     global _VEHICLE_MAP_DISPLAY_INDEX_CACHE
     global _VEHICLE_METADATA_CACHE_INFO
+    global _VEHICLE_MODEL_INDEX_CACHE
 
     try:
         with _VEHICLE_METADATA_CACHE_LOCK:
             _VEHICLE_REAL_NAME_MAP_CACHE = None
             _VEHICLE_MAP_DISPLAY_INDEX_CACHE = None
             _VEHICLE_METADATA_CACHE_INFO = None
+            _VEHICLE_MODEL_INDEX_CACHE = None
     except Exception:
         _VEHICLE_REAL_NAME_MAP_CACHE = None
         _VEHICLE_MAP_DISPLAY_INDEX_CACHE = None
         _VEHICLE_METADATA_CACHE_INFO = None
+        _VEHICLE_MODEL_INDEX_CACHE = None
 
     if not clear_disk:
         return
@@ -16934,6 +26774,385 @@ def _vehicle_normalize_map_index(payload: Any) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def _vehicle_lookup_name_in_map(name_map: Dict[str, str], key: Any) -> str:
+    if not isinstance(name_map, dict):
+        return ""
+    raw = str(key or "").strip()
+    if not raw:
+        return ""
+    for candidate in (raw, raw.lower(), raw.upper()):
+        value = str(name_map.get(candidate, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _vehicle_localize_ui_name_token(token: Any, localization: Dict[str, str], fallback_id: Any) -> str:
+    raw = str(token or "").strip()
+    text = _objectives_local_clean_text(_objectives_local_translate(raw, localization))
+    if text and (not _objectives_local_is_probably_token(text)):
+        return text
+    return _vehicle_humanize_id(fallback_id)
+
+
+def _vehicle_build_model_variants(type_id: Any) -> Set[str]:
+    base = str(type_id or "").strip().lower()
+    if not base:
+        return set()
+
+    variants: Set[str] = set()
+
+    def add_variant(raw: Any) -> None:
+        text = str(raw or "").strip().lower()
+        if not text:
+            return
+        text = text.replace("-", "_")
+        text = re.sub(r"_+", "_", text).strip("_")
+        if not text:
+            return
+        variants.add(text)
+        variants.add(text.replace("_", ""))
+        joined = re.sub(r"([a-z])_(\d)", r"\1\2", text)
+        joined = re.sub(r"(\d)_([a-z])", r"\1\2", joined)
+        if joined:
+            variants.add(joined)
+
+    add_variant(base)
+    parts = [p for p in re.split(r"[_\-]+", base) if p]
+    if parts:
+        add_variant(parts[0])
+        add_variant(parts[-1])
+    if len(parts) >= 2:
+        add_variant("_".join(parts[-2:]))
+        add_variant("_".join(parts[1:]))
+    return {v for v in variants if v}
+
+
+def _vehicle_should_keep_model_id(type_id: str, kind: str) -> bool:
+    tid = str(type_id or "").strip().lower()
+    k = str(kind or "").strip()
+    if not tid:
+        return False
+    if k == "Vehicle":
+        return _is_probable_truck_type_id(tid)
+    if tid.startswith(("trailer_", "semitrailer_", "scout_trailer_")):
+        return True
+    return tid in {"generator", "cultivator", "harvester", "planter", "driller"}
+
+
+def _vehicle_build_model_index_from_static_source(force_reload: bool = False) -> Dict[str, Any]:
+    by_id: Dict[str, Dict[str, str]] = {}
+    try:
+        static_data = _vehicle_load_static_id_source(force_reload=force_reload)
+    except Exception:
+        static_data = {}
+
+    name_map = static_data.get("name_map", {}) if isinstance(static_data, dict) else {}
+    truck_ids = set(static_data.get("truck_base_ids_lower", set()) or []) if isinstance(static_data, dict) else set()
+    trailer_ids = set(static_data.get("trailer_base_ids_lower", set()) or []) if isinstance(static_data, dict) else set()
+
+    for tid in sorted({str(v).strip().lower() for v in truck_ids if str(v).strip()}):
+        if not _vehicle_should_keep_model_id(tid, "Vehicle"):
+            continue
+        by_id[tid] = {
+            "type_id": tid,
+            "kind": "Vehicle",
+            "name": _vehicle_lookup_name_in_map(name_map, tid) or _vehicle_humanize_id(tid),
+            "source": "static",
+        }
+
+    for tid in sorted({str(v).strip().lower() for v in trailer_ids if str(v).strip()}):
+        if not _vehicle_should_keep_model_id(tid, "Trailer"):
+            continue
+        by_id[tid] = {
+            "type_id": tid,
+            "kind": "Trailer",
+            "name": _vehicle_lookup_name_in_map(name_map, tid) or _vehicle_humanize_id(tid),
+            "source": "static",
+        }
+
+    return {
+        "by_id": by_id,
+        "source": "static",
+        "kind": "",
+        "path": str(static_data.get("path") or "").strip() if isinstance(static_data, dict) else "",
+        "language": "",
+    }
+
+
+def _vehicle_build_model_index_from_local_source(
+    force_reload: bool = False,
+    allow_online: bool = False,
+) -> Dict[str, Any]:
+    try:
+        source_info = _objectives_get_preferred_source(
+            force_reload=bool(force_reload),
+            language=_objectives_get_language_preference(),
+            allow_download=bool(allow_online),
+        )
+    except Exception:
+        source_info = {}
+
+    if not isinstance(source_info, dict):
+        return {"by_id": {}, "source": "", "kind": "", "path": "", "language": ""}
+
+    if str(source_info.get("kind") or "").strip().lower() != "local":
+        return {
+            "by_id": {},
+            "source": "",
+            "kind": str(source_info.get("kind") or "").strip().lower(),
+            "path": str(source_info.get("path") or "").strip(),
+            "language": str(source_info.get("language") or "").strip(),
+        }
+
+    pak_path = _objectives_existing_file(source_info.get("path"))
+    if not pak_path or (not os.path.isfile(pak_path)):
+        return {
+            "by_id": {},
+            "source": "",
+            "kind": "local",
+            "path": str(source_info.get("path") or "").strip(),
+            "language": str(source_info.get("language") or "").strip(),
+        }
+
+    localization = source_info.get("localization") if isinstance(source_info.get("localization"), dict) else {}
+    by_id: Dict[str, Dict[str, str]] = {}
+
+    try:
+        with zipfile.ZipFile(pak_path, "r") as zf:
+            for info in zf.infolist():
+                filename = str(getattr(info, "filename", "") or "")
+                lower = filename.replace("\\", "/").lower()
+                if _INITIAL_PAK_DIRECT_TRUCK_ENTRY_RE.search(lower):
+                    kind = "Vehicle"
+                elif _VEHICLE_DIRECT_TRAILER_ENTRY_RE.search(lower):
+                    kind = "Trailer"
+                else:
+                    continue
+
+                type_id = os.path.splitext(os.path.basename(filename))[0].strip().lower()
+                if (not type_id) or (not re.fullmatch(r"[a-z0-9_\-./]+", type_id)):
+                    continue
+                if not _vehicle_should_keep_model_id(type_id, kind):
+                    continue
+
+                try:
+                    text = zf.read(filename).decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+
+                match = _VEHICLE_XML_UI_NAME_RE.search(text)
+                ui_name_token = str(match.group("token") or "").strip() if match else ""
+                display_name = _vehicle_localize_ui_name_token(ui_name_token, localization, type_id)
+
+                prev = by_id.get(type_id)
+                if (not isinstance(prev, dict)) or (_vehicle_name_quality(display_name, type_id) >= _vehicle_name_quality(prev.get("name", ""), type_id)):
+                    by_id[type_id] = {
+                        "type_id": type_id,
+                        "kind": kind,
+                        "name": display_name or _vehicle_humanize_id(type_id),
+                        "ui_name_token": ui_name_token,
+                        "source": "initial.pak",
+                    }
+    except Exception:
+        by_id = {}
+
+    return {
+        "by_id": by_id,
+        "source": "initial.pak" if by_id else "",
+        "kind": "local",
+        "path": pak_path,
+        "language": str(source_info.get("language") or "").strip(),
+    }
+
+
+def _vehicle_finalize_model_index(base_index: Dict[str, Any]) -> Dict[str, Any]:
+    by_id = {}
+    if isinstance(base_index, dict):
+        raw_by_id = base_index.get("by_id", {})
+        if isinstance(raw_by_id, dict):
+            for raw_id, raw_meta in raw_by_id.items():
+                type_id = str(raw_id or "").strip().lower()
+                if not type_id:
+                    continue
+                meta = raw_meta if isinstance(raw_meta, dict) else {}
+                kind = str(meta.get("kind") or "").strip()
+                if kind not in {"Vehicle", "Trailer"}:
+                    kind = "Trailer" if "trailer" in type_id else "Vehicle"
+                by_id[type_id] = {
+                    "type_id": type_id,
+                    "kind": kind,
+                    "name": str(meta.get("name") or "").strip() or _vehicle_humanize_id(type_id),
+                    "source": str(meta.get("source") or base_index.get("source") or "").strip(),
+                }
+
+    truck_ids = {tid for tid, meta in by_id.items() if str(meta.get("kind") or "") == "Vehicle"}
+    trailer_ids = {tid for tid, meta in by_id.items() if str(meta.get("kind") or "") == "Trailer"}
+    variant_to_ids: Dict[str, Set[str]] = {}
+    for type_id, meta in by_id.items():
+        for variant in _vehicle_build_model_variants(type_id):
+            variant_to_ids.setdefault(variant, set()).add(type_id)
+
+    return {
+        "by_id": by_id,
+        "truck_ids": truck_ids,
+        "trailer_ids": trailer_ids,
+        "variant_to_ids": variant_to_ids,
+        "source": str(base_index.get("source") or "").strip() if isinstance(base_index, dict) else "",
+        "kind": str(base_index.get("kind") or "").strip() if isinstance(base_index, dict) else "",
+        "path": str(base_index.get("path") or "").strip() if isinstance(base_index, dict) else "",
+        "language": str(base_index.get("language") or "").strip() if isinstance(base_index, dict) else "",
+    }
+
+
+def _vehicle_load_model_index(force_reload: bool = False, allow_online: bool = False) -> Dict[str, Any]:
+    global _VEHICLE_MODEL_INDEX_CACHE
+
+    with _VEHICLE_METADATA_CACHE_LOCK:
+        if (not force_reload) and isinstance(_VEHICLE_MODEL_INDEX_CACHE, dict):
+            return _VEHICLE_MODEL_INDEX_CACHE
+
+    static_index = _vehicle_build_model_index_from_static_source(force_reload=force_reload)
+    local_index = _vehicle_build_model_index_from_local_source(
+        force_reload=force_reload,
+        allow_online=allow_online,
+    )
+
+    merged_by_id = {}
+    if isinstance(static_index.get("by_id"), dict):
+        merged_by_id.update(static_index.get("by_id"))
+    if isinstance(local_index.get("by_id"), dict):
+        merged_by_id.update(local_index.get("by_id"))
+
+    merged = _vehicle_finalize_model_index(
+        {
+            "by_id": merged_by_id,
+            "source": str(local_index.get("source") or static_index.get("source") or "").strip(),
+            "kind": str(local_index.get("kind") or static_index.get("kind") or "").strip(),
+            "path": str(local_index.get("path") or static_index.get("path") or "").strip(),
+            "language": str(local_index.get("language") or static_index.get("language") or "").strip(),
+        }
+    )
+
+    with _VEHICLE_METADATA_CACHE_LOCK:
+        _VEHICLE_MODEL_INDEX_CACHE = merged
+        return _VEHICLE_MODEL_INDEX_CACHE
+
+
+def _vehicle_resolve_canonical_seed(
+    seed: Any,
+    model_index: Optional[Dict[str, Any]] = None,
+    kind_hint: str = "",
+) -> str:
+    index = model_index if isinstance(model_index, dict) else _vehicle_load_model_index(force_reload=False, allow_online=False)
+    by_id = index.get("by_id", {}) if isinstance(index, dict) else {}
+    variant_map = index.get("variant_to_ids", {}) if isinstance(index, dict) else {}
+    if not isinstance(by_id, dict) or not isinstance(variant_map, dict):
+        return ""
+
+    raw = str(seed or "").strip().lower().replace("-", "_")
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    if not raw:
+        return ""
+
+    def _matches_kind(candidate_id: str) -> bool:
+        if not kind_hint:
+            return True
+        meta = by_id.get(candidate_id, {})
+        return str(meta.get("kind") or "").strip().lower() == str(kind_hint or "").strip().lower()
+
+    if raw in by_id and _matches_kind(raw):
+        return raw
+
+    seeds = list(_vehicle_build_model_variants(raw))
+    seen = set()
+    for candidate_seed in seeds:
+        if candidate_seed in seen:
+            continue
+        seen.add(candidate_seed)
+        candidates = variant_map.get(candidate_seed, set())
+        if not isinstance(candidates, (set, list, tuple)):
+            continue
+        filtered = sorted({str(cid).strip().lower() for cid in candidates if str(cid).strip() and _matches_kind(str(cid).strip().lower())})
+        if len(filtered) == 1:
+            return filtered[0]
+    return ""
+
+
+def _vehicle_resolve_canonical_id(type_id: Any, object_id: Any = "", kind_hint: str = "") -> str:
+    raw_type = str(type_id or "").strip()
+    raw_object = str(object_id or "").strip()
+    model_index = _vehicle_load_model_index(force_reload=False, allow_online=False)
+    by_id = model_index.get("by_id", {}) if isinstance(model_index, dict) else {}
+
+    def normalize_exact(raw: Any) -> str:
+        text = str(raw or "").strip().lower().replace("-", "_")
+        text = re.sub(r"_+", "_", text).strip("_")
+        return text
+
+    def exact_match(raw: Any) -> str:
+        text = normalize_exact(raw)
+        if not text or not isinstance(by_id, dict):
+            return ""
+        meta = by_id.get(text)
+        if not isinstance(meta, dict):
+            return ""
+        if kind_hint and str(meta.get("kind") or "").strip().lower() != str(kind_hint or "").strip().lower():
+            return ""
+        return text
+
+    for exact in (raw_type, raw_object):
+        canonical = exact_match(exact)
+        if canonical:
+            return canonical
+
+    alias_seeds: List[str] = []
+
+    def add_alias_seed(raw: Any) -> None:
+        text = normalize_exact(raw)
+        if text and text not in alias_seeds:
+            alias_seeds.append(text)
+
+    cleaned_type = re.sub(r"^(?:g_special_|g_|w_)", "", raw_type, flags=re.IGNORECASE)
+    cleaned_type = re.sub(r"(?:_default|_skin_?\d*|_deleted)$", "", cleaned_type, flags=re.IGNORECASE)
+    cleaned_object = re.sub(r"^(?:g_special_|g_|w_)", "", raw_object, flags=re.IGNORECASE)
+    cleaned_object = re.sub(r"(?:_default|_skin_?\d*|_deleted)$", "", cleaned_object, flags=re.IGNORECASE)
+
+    for raw in (cleaned_type, cleaned_object):
+        canonical = exact_match(raw)
+        if canonical:
+            return canonical
+
+    for raw in (cleaned_type, cleaned_object):
+        text = normalize_exact(raw)
+        if not text:
+            continue
+
+        old_engine = re.search(r"(?:^|_)(?:truck|scout)_old_engine_([a-z0-9_]+?)(?:_\d+)?$", text)
+        if old_engine:
+            model = str(old_engine.group(1) or "").strip()
+            if model and model not in {"0", "default"}:
+                add_alias_seed(model)
+
+        prefab = re.search(r"^(?:truck|scout)_([a-z0-9_]+)$", text)
+        if prefab:
+            model = str(prefab.group(1) or "").strip()
+            if model and model not in {"0", "default"}:
+                add_alias_seed(model)
+
+    g_prefab = re.search(r"^(?:g_special_|g_|w_)(?:truck|scout)_(?P<model>[a-z0-9_]+)$", normalize_exact(raw_object))
+    if g_prefab:
+        model = str(g_prefab.group("model") or "").strip()
+        if model and model not in {"0", "default"}:
+            add_alias_seed(model)
+
+    for seed in alias_seeds:
+        canonical = _vehicle_resolve_canonical_seed(seed, model_index=model_index, kind_hint=kind_hint)
+        if canonical:
+            return canonical
+    return ""
+
+
 def _vehicle_name_quality(name: str, type_id: str = "") -> int:
     text = str(name or "").strip()
     if not text:
@@ -16944,7 +27163,7 @@ def _vehicle_name_quality(name: str, type_id: str = "") -> int:
     # Broken/unresolved strings should never win merges.
     if _experiments_is_likely_token(text):
         return 1
-    if any(mark in text for mark in ("�", "Ð", "Ñ", "Ã", "Â")):
+    if any(mark in text for mark in ("\u010f\u017c\u02dd", "\u0102\u0090", "\u0102\u2018", "\u0102\u0083", "\u0102\u201a")):
         return 1
     if low.startswith(("g ", "w ")):
         return 1
@@ -17042,25 +27261,19 @@ def _vehicle_load_metadata(force_reload: bool = False, allow_online: bool = Fals
             info = _VEHICLE_METADATA_CACHE_INFO if isinstance(_VEHICLE_METADATA_CACHE_INFO, dict) else {}
             return _VEHICLE_REAL_NAME_MAP_CACHE, _VEHICLE_MAP_DISPLAY_INDEX_CACHE, info
 
-    names_cache_path = _vehicle_metadata_cache_path("names")
     maps_cache_path = _vehicle_metadata_cache_path("maps")
-    name_map = _vehicle_normalize_name_map(_vehicle_read_json_cache(names_cache_path))
+    model_index = _vehicle_load_model_index(force_reload=force_reload, allow_online=allow_online)
+    model_by_id = model_index.get("by_id", {}) if isinstance(model_index, dict) else {}
+    name_map = {
+        str(type_id or "").strip(): str((meta or {}).get("name") or "").strip()
+        for type_id, meta in list(model_by_id.items()) if str(type_id or "").strip()
+    } if isinstance(model_by_id, dict) else {}
     map_index = _vehicle_normalize_map_index(_vehicle_read_json_cache(maps_cache_path))
     source_tags = []
-    if name_map or map_index:
+    if map_index:
         source_tags.append("backup")
-
-    try:
-        static_map = _vehicle_normalize_name_map(_vehicle_static_name_map(force_reload=force_reload))
-    except Exception:
-        static_map = {}
-    if static_map:
-        name_map = _vehicle_merge_name_maps(name_map, static_map)
-        source_tags.append("local_ids")
-        try:
-            _vehicle_write_json_cache(names_cache_path, name_map)
-        except Exception:
-            pass
+    if name_map:
+        source_tags.append(str(model_index.get("source") or "model_index"))
 
     needs_source = bool(force_reload or allow_online or not map_index)
     if needs_source:
@@ -17106,16 +27319,21 @@ def _vehicle_display_name(type_id: str) -> str:
     t = str(type_id or "").strip()
     if not t:
         return ""
-    name_map = _vehicle_load_real_name_map()
+    model_index = _vehicle_load_model_index(force_reload=False, allow_online=False)
+    by_id = model_index.get("by_id", {}) if isinstance(model_index, dict) else {}
+    canonical = _vehicle_resolve_canonical_seed(t, model_index=model_index)
     name = ""
-    if isinstance(name_map, dict):
-        name = str(name_map.get(t, "") or "").strip()
-        if not name:
-            name = str(name_map.get(t.lower(), "") or "").strip()
-        if not name:
-            name = str(name_map.get(t.upper(), "") or "").strip()
+    if canonical and isinstance(by_id, dict):
+        name = str((by_id.get(canonical) or {}).get("name") or "").strip()
+    if not name:
+        name_map = _vehicle_load_real_name_map()
+        if isinstance(name_map, dict):
+            name = str(name_map.get(t, "") or "").strip()
+            if not name:
+                name = str(name_map.get(t.lower(), "") or "").strip()
+            if not name:
+                name = str(name_map.get(t.upper(), "") or "").strip()
     if name:
-        # Reject low-quality labels from noisy metadata (description text, defaults, etc.).
         if _vehicle_name_quality(name, t) >= 3:
             return name
     return _vehicle_humanize_id(t)
@@ -17126,67 +27344,50 @@ def _vehicle_display_name_for_entry(type_id: str, object_id: str = "") -> str:
     o = str(object_id or "").strip()
     if not t and not o:
         return ""
-
-    def _clean_id(raw: str) -> str:
-        x = str(raw or "").strip()
-        if not x:
-            return ""
-        x = re.sub(r"^(?:g_special_|g_|w_)", "", x, flags=re.IGNORECASE)
-        x = re.sub(r"(?:_default|_skin_?\d*|_?\d+)$", "", x, flags=re.IGNORECASE)
-        return x
-
-    ids = []
-    for raw in (t, o):
-        rid = str(raw or "").strip()
-        if not rid:
-            continue
-        ids.append(rid)
-        ids.append(_clean_id(rid))
-        m = re.search(r"(?:^|_)(?:truck|scout)_old_engine_([a-z0-9_]+?)(?:_\d+)?$", rid.lower())
-        if m:
-            model = str(m.group(1) or "").strip()
-            if model:
-                ids.append(model)
-                ids.append(re.sub(r"([a-z])(\d)", r"\1_\2", model))
-                ids.append(re.sub(r"(\d)([a-z])", r"\1_\2", model))
-
-    seen = set()
-    candidates = []
-    for raw in ids:
-        rid = str(raw or "").strip()
-        if not rid:
-            continue
-        lk = rid.lower()
-        if lk in seen:
-            continue
-        seen.add(lk)
-        candidates.append(rid)
-
-    def _score(name: str, cid: str) -> int:
-        s = _vehicle_name_quality(name, cid)
-        low = str(name or "").strip().lower()
-        if not low:
-            return -100
-        if "deleted" in low:
-            s -= 5
-        if any(tok in low for tok in (" default", "skin ", " old engine", " g truck", " w truck", " g scout", " w scout")):
-            s -= 3
-        if low.startswith(("g ", "w ")):
-            s -= 2
-        return s
-
-    best_name = ""
-    best_score = -10000
-    for cid in candidates:
-        nm = _vehicle_display_name(cid)
-        sc = _score(nm, cid)
-        if sc > best_score:
-            best_score = sc
-            best_name = nm
-
-    if best_name:
-        return best_name
+    model_index = _vehicle_load_model_index(force_reload=False, allow_online=False)
+    by_id = model_index.get("by_id", {}) if isinstance(model_index, dict) else {}
+    canonical = _vehicle_resolve_canonical_id(t, o)
+    if canonical and isinstance(by_id, dict):
+        meta = by_id.get(canonical, {})
+        name = str(meta.get("name") or "").strip()
+        if name:
+            return name
+        return _vehicle_humanize_id(canonical)
     return _vehicle_display_name(t or o)
+
+
+def _vehicle_apply_identity_to_object(obj: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(obj, dict):
+        return obj
+
+    type_id = str(obj.get("type_id", "") or "").strip()
+    object_id = str(obj.get("object_id", "") or "").strip()
+    current_kind = str(obj.get("kind", "") or "").strip()
+    canonical_id = _vehicle_resolve_canonical_id(type_id, object_id, kind_hint=current_kind)
+    model_index = _vehicle_load_model_index(force_reload=False, allow_online=False)
+    by_id = model_index.get("by_id", {}) if isinstance(model_index, dict) else {}
+    meta = by_id.get(canonical_id, {}) if canonical_id and isinstance(by_id, dict) else {}
+
+    if canonical_id:
+        obj["canonical_id"] = canonical_id
+    else:
+        obj["canonical_id"] = ""
+
+    canonical_name = str(meta.get("name") or "").strip()
+    if canonical_name:
+        obj["canonical_name"] = canonical_name
+        obj["name"] = canonical_name
+    else:
+        obj["canonical_name"] = ""
+        obj["name"] = _vehicle_display_name_for_entry(type_id, object_id)
+
+    canonical_kind = str(meta.get("kind") or "").strip()
+    if canonical_kind in {"Vehicle", "Trailer"}:
+        obj["kind"] = canonical_kind
+    elif not str(obj.get("kind", "") or "").strip():
+        obj["kind"] = "Trailer" if "trailer" in type_id.lower() else "Vehicle"
+
+    return obj
 
 
 def _map_normalize_id(raw: Any) -> str:
@@ -17196,11 +27397,44 @@ def _map_normalize_id(raw: Any) -> str:
     return value
 
 
+def _map_lookup_candidates(raw: Any) -> List[str]:
+    mid = _map_normalize_id(raw)
+    candidates: List[str] = []
+
+    def _add(candidate: str) -> None:
+        clean = str(candidate or "").strip().upper()
+        if clean and clean not in candidates:
+            candidates.append(clean)
+
+    _add(mid)
+    for suffix in ("_NEW", "_CROP"):
+        if mid.endswith(suffix):
+            _add(mid[: -len(suffix)])
+
+    alias_region_code = _map_region_code_from_map_id(mid)
+    alias_parts = [part for part in mid.split("_") if part]
+    if alias_region_code and alias_parts:
+        numeric_tail = [part for part in alias_parts if part.isdigit()]
+        if numeric_tail:
+            _add(f"{alias_region_code}_{numeric_tail[-1]}")
+
+    parts = [part for part in mid.split("_") if part]
+    if len(parts) >= 3 and parts[0] in {"US", "RU"} and parts[1].isdigit() and parts[2].isdigit():
+        _add("_".join(parts[:3]))
+    if len(parts) > 3 and (not parts[-1].isdigit()):
+        _add("_".join(parts[:-1]))
+
+    return candidates
+
+
 def _map_region_code_from_map_id(map_id: str) -> str:
     mid = _map_normalize_id(map_id)
     parts = [p for p in mid.split("_") if p]
     if len(parts) >= 2 and parts[0] in {"US", "RU"} and parts[1].isdigit():
         return f"{parts[0]}_{parts[1]}"
+    for alias, region_code in sorted(_MAP_REGION_SLUG_TO_CODE.items(), key=lambda item: len(item[0]), reverse=True):
+        if mid == alias or mid.startswith(alias + "_"):
+            return region_code
     if parts and parts[0] == "TRIAL":
         return "TRIALS"
     return ""
@@ -17228,6 +27462,20 @@ def _map_humanize_slug(value: str) -> str:
     return " ".join(w[:1].upper() + w[1:] if w else "" for w in token.split())
 
 
+_MAP_DISPLAY_FALLBACKS = {
+    "US_18_01": {
+        "region_code": "US_18",
+        "region_name": "Chiapas",
+        "map_name": "Costa Atardecer",
+    },
+    "US_18_02": {
+        "region_code": "US_18",
+        "region_name": "Chiapas",
+        "map_name": "Sierra Fuerte",
+    },
+}
+
+
 def _vehicle_load_map_display_index(force_reload: bool = False) -> Dict[str, Dict[str, str]]:
     _, map_index, _ = _vehicle_load_metadata(force_reload=force_reload, allow_online=False)
     return map_index if isinstance(map_index, dict) else {}
@@ -17237,14 +27485,24 @@ def _map_display_info(map_id: str) -> Dict[str, str]:
     mid = _map_normalize_id(map_id)
     index = _vehicle_load_map_display_index()
     if isinstance(index, dict):
-        found = index.get(mid)
-        if isinstance(found, dict):
-            return {
-                "map_id": _map_normalize_id(found.get("map_id", mid)),
-                "region_code": str(found.get("region_code", "") or "").upper(),
-                "region_name": str(found.get("region_name", "") or "").strip(),
-                "map_name": str(found.get("map_name", "") or "").strip() or mid,
-            }
+        for candidate in _map_lookup_candidates(mid):
+            found = index.get(candidate)
+            if isinstance(found, dict):
+                return {
+                    "map_id": mid,
+                    "region_code": str(found.get("region_code", "") or "").upper(),
+                    "region_name": str(found.get("region_name", "") or "").strip(),
+                    "map_name": str(found.get("map_name", "") or "").strip() or candidate,
+                }
+
+    fallback = _MAP_DISPLAY_FALLBACKS.get(mid)
+    if isinstance(fallback, dict):
+        return {
+            "map_id": mid,
+            "region_code": str(fallback.get("region_code", "") or "").upper(),
+            "region_name": str(fallback.get("region_name", "") or "").strip(),
+            "map_name": str(fallback.get("map_name", "") or "").strip() or mid,
+        }
 
     region_code = _map_region_code_from_map_id(mid)
     region_name = _map_region_name_from_code(region_code)
@@ -17311,21 +27569,28 @@ def _sts_is_vehicle_or_trailer_type(type_id: str, object_id: str = "") -> bool:
     if base == "skin" or base.startswith("skin_"):
         return False
 
+    model_index = _vehicle_load_model_index(force_reload=False, allow_online=False)
+    by_id = model_index.get("by_id", {}) if isinstance(model_index, dict) else {}
+    truck_ids = model_index.get("truck_ids", set()) if isinstance(model_index, dict) else set()
+    trailer_ids = model_index.get("trailer_ids", set()) if isinstance(model_index, dict) else set()
     static_data = _vehicle_load_static_id_source(force_reload=False)
     static_known = static_data.get("base_ids_lower", set()) if isinstance(static_data, dict) else set()
+
+    if isinstance(by_id, dict) and base in by_id:
+        return True
     if isinstance(static_known, set) and base in static_known:
         return True
 
-    # Accept explicit old-engine world prefab ids early.
-    # Example: us_truck_old_engine_avenhorn_a15_0
-    if re.search(r"^(?:[a-z]{2,4}_)?(?:truck|scout)_old_engine_[a-z0-9_]+$", base):
+    canonical_vehicle = _vehicle_resolve_canonical_id(base, object_id, kind_hint="Vehicle")
+    canonical_trailer = _vehicle_resolve_canonical_id(base, object_id, kind_hint="Trailer")
+    if canonical_vehicle or canonical_trailer:
         return True
 
     for blocked in _STS_COMPONENT_TYPE_BLOCKLIST_PARTS:
         if blocked in base:
             return False
 
-    if "trailer" in t:
+    if ("trailer" in t) and (isinstance(trailer_ids, (set, list, tuple)) and base in set(trailer_ids)):
         return True
 
     for blocked in _VEHICLE_ID_BLOCKLIST_PARTS:
@@ -17342,19 +27607,23 @@ def _sts_is_vehicle_or_trailer_type(type_id: str, object_id: str = "") -> bool:
     if isinstance(static_known, set) and oid_lower in static_known:
         return True
 
-    parts = [p for p in re.split(r"[_\-]+", base) if p]
-    if parts and parts[0] in _VEHICLE_BRAND_HINTS:
+    if isinstance(truck_ids, (set, list, tuple)) and oid_lower in {str(v).strip().lower() for v in truck_ids if str(v).strip()}:
         return True
-    if t in _KNOWN_TRUCK_IDS_DEFAULT:
+    if isinstance(trailer_ids, (set, list, tuple)) and oid_lower in {str(v).strip().lower() for v in trailer_ids if str(v).strip()}:
         return True
 
     oid = str(object_id or "").upper()
-    # GUID-style object IDs in STS are commonly used for movable trucks/trailers.
-    # If the type passed blocklists above, accept unknown models too.
-    if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", str(object_id or "").strip()):
+    if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", str(object_id or "").strip()) and (canonical_vehicle or canonical_trailer or base in _KNOWN_TRUCK_IDS_DEFAULT):
         return True
-    if "TRUCK" in oid or "SCOUT" in oid or "TRAILER" in oid:
+    if ("TRAILER" in oid and canonical_trailer) or (("TRUCK" in oid or "SCOUT" in oid) and canonical_vehicle):
         return True
+
+    if not isinstance(by_id, dict) or not by_id:
+        parts = [p for p in re.split(r"[_\-]+", base) if p]
+        if parts and parts[0] in _VEHICLE_BRAND_HINTS:
+            return True
+        if t in _KNOWN_TRUCK_IDS_DEFAULT:
+            return True
 
     return False
 
@@ -17598,6 +27867,7 @@ def _sts_parse_guid_vehicle_blocks(data: bytes, source_file: str, existing_objec
             "y": float(ay),
             "z": float(az),
         }
+        obj = _vehicle_apply_identity_to_object(obj)
         out.append(obj)
         existing.append(obj)
 
@@ -17825,38 +28095,40 @@ def _sts_parse_movable_objects(payload: bytes, source_file: str) -> List[Dict[st
             seen.add(key)
             is_trailer = ("trailer" in type_id.lower()) or ("TRAILER" in object_id.upper())
             out.append(
-                {
-                    "file": os.path.basename(source_file),
-                    "map_id": map_info.get("map_id", ""),
-                    "map_name": map_info.get("map_name", ""),
-                    "region_code": map_info.get("region_code", ""),
-                    "region_name": map_info.get("region_name", ""),
-                    "kind": "Trailer" if is_trailer else "Vehicle",
-                    "type_id": type_id,
-                    "name": _vehicle_display_name_for_entry(type_id, object_id),
-                    "object_id": object_id,
-                    "start_off": int(parsed.get("start_off", -1)),
-                    "type_len_off": int(parsed.get("type_len_off", -1)),
-                    "type_len_size": int(parsed.get("type_len_size", 0)),
-                    "type_beg": int(parsed.get("type_beg", -1)),
-                    "type_end": int(parsed.get("type_end", -1)),
-                    "obj_len_off": int(parsed.get("obj_len_off", -1)),
-                    "obj_len_size": int(parsed.get("obj_len_size", 0)),
-                    "obj_beg": int(parsed.get("obj_beg", -1)),
-                    "obj_end": int(parsed.get("obj_end", -1)),
-                    "guid": str(parsed.get("guid", "") or ""),
-                    "guid_len_off": int(parsed.get("guid_len_off", -1)),
-                    "guid_len_size": int(parsed.get("guid_len_size", 0)),
-                    "guid_beg": int(parsed.get("guid_beg", -1)),
-                    "guid_end": int(parsed.get("guid_end", -1)),
-                    "coord_off": coord_off,
-                    "coord_offs": [int(coord_off)],
-                    "end_off": int(parsed.get("entry_min_end", coord_off + 12)),
-                    "allow_delete": True,
-                    "x": x,
-                    "y": y,
-                    "z": z,
-                }
+                _vehicle_apply_identity_to_object(
+                    {
+                        "file": os.path.basename(source_file),
+                        "map_id": map_info.get("map_id", ""),
+                        "map_name": map_info.get("map_name", ""),
+                        "region_code": map_info.get("region_code", ""),
+                        "region_name": map_info.get("region_name", ""),
+                        "kind": "Trailer" if is_trailer else "Vehicle",
+                        "type_id": type_id,
+                        "name": _vehicle_display_name_for_entry(type_id, object_id),
+                        "object_id": object_id,
+                        "start_off": int(parsed.get("start_off", -1)),
+                        "type_len_off": int(parsed.get("type_len_off", -1)),
+                        "type_len_size": int(parsed.get("type_len_size", 0)),
+                        "type_beg": int(parsed.get("type_beg", -1)),
+                        "type_end": int(parsed.get("type_end", -1)),
+                        "obj_len_off": int(parsed.get("obj_len_off", -1)),
+                        "obj_len_size": int(parsed.get("obj_len_size", 0)),
+                        "obj_beg": int(parsed.get("obj_beg", -1)),
+                        "obj_end": int(parsed.get("obj_end", -1)),
+                        "guid": str(parsed.get("guid", "") or ""),
+                        "guid_len_off": int(parsed.get("guid_len_off", -1)),
+                        "guid_len_size": int(parsed.get("guid_len_size", 0)),
+                        "guid_beg": int(parsed.get("guid_beg", -1)),
+                        "guid_end": int(parsed.get("guid_end", -1)),
+                        "coord_off": coord_off,
+                        "coord_offs": [int(coord_off)],
+                        "end_off": int(parsed.get("entry_min_end", coord_off + 12)),
+                        "allow_delete": True,
+                        "x": x,
+                        "y": y,
+                        "z": z,
+                    }
+                )
             )
 
         i = max(i + 1, int(parsed.get("next_off", i + 1)))
@@ -17877,12 +28149,17 @@ def _sts_parse_movable_objects(payload: bytes, source_file: str) -> List[Dict[st
             type_id = str(obj.get("type_id", "") or "").strip().lower()
             object_id = str(obj.get("object_id", "") or "").strip().lower()
             name = str(obj.get("name", "") or "").strip().lower()
+            canonical_id = str(obj.get("canonical_id", "") or "").strip().lower()
             score = 0
             if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", str(obj.get("guid", "") or "")):
                 score += 8
-            if ("trailer" in type_id) or _is_probable_truck_type_id(type_id):
+            if canonical_id:
+                score += 8
+                if canonical_id == type_id:
+                    score += 4
+            if ("trailer" in type_id) or _is_probable_truck_type_id(canonical_id or type_id):
                 score += 4
-            score += int(_vehicle_name_quality(name, type_id))
+            score += int(_vehicle_name_quality(name, canonical_id or type_id))
             if any(tok in type_id for tok in ("_default", "skin", "deleted")):
                 score -= 4
             if "_old_engine_" in type_id:
@@ -17950,6 +28227,73 @@ def _sts_parse_movable_objects(payload: bytes, source_file: str) -> List[Dict[st
                 chosen2[key2] = obj
 
         out = [chosen2[k] for k in order2 if k in chosen2]
+
+        def _is_guid_value(value: Any) -> bool:
+            return bool(re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", str(value or "").strip()))
+
+        def _logical_object_key(obj: Dict[str, Any]):
+            canonical_id = str(obj.get("canonical_id", "") or "").strip().lower()
+            object_id = str(obj.get("object_id", "") or "").strip().lower()
+            kind = str(obj.get("kind", "") or "").strip().lower()
+            if (not canonical_id) or (not object_id) or _is_guid_value(object_id):
+                return None
+            return (kind, canonical_id, object_id)
+
+        def _is_alias_shell(obj: Dict[str, Any]) -> bool:
+            type_id = str(obj.get("type_id", "") or "").strip().lower()
+            object_id = str(obj.get("object_id", "") or "").strip().lower()
+            guid = str(obj.get("guid", "") or "").strip()
+            if guid:
+                return False
+            if "_old_engine_" in type_id:
+                return True
+            if type_id.startswith(("g_", "w_", "g_special_")):
+                return True
+            return object_id in {"g_truck_default", "g_scout_default", "w_truck_default", "w_scout_default"}
+
+        # Third pass: if the same logical object exists both as a plain template row
+        # and as a GUID-backed state row, keep the GUID-backed entry only.
+        logical_groups = {}
+        for obj in out:
+            key3 = _logical_object_key(obj)
+            if key3 is not None:
+                logical_groups.setdefault(key3, []).append(obj)
+
+        drop_ids = set()
+        for items in logical_groups.values():
+            if len(items) < 2:
+                continue
+            guid_items = [obj for obj in items if _is_guid_value(obj.get("guid", ""))]
+            if not guid_items:
+                continue
+            keep = max(guid_items, key=_entry_quality)
+            for obj in items:
+                if obj is not keep:
+                    drop_ids.add(id(obj))
+
+        if drop_ids:
+            out = [obj for obj in out if id(obj) not in drop_ids]
+
+        # Fourth pass: hide leftover default/old-engine shell rows when a cleaner
+        # representation of the same vehicle/trailer already exists in the file.
+        canonical_groups = {}
+        for obj in out:
+            canonical_id = str(obj.get("canonical_id", "") or "").strip().lower()
+            kind = str(obj.get("kind", "") or "").strip().lower()
+            if canonical_id:
+                canonical_groups.setdefault((kind, canonical_id), []).append(obj)
+
+        alias_drop_ids = set()
+        for items in canonical_groups.values():
+            clean_items = [obj for obj in items if not _is_alias_shell(obj)]
+            if not clean_items:
+                continue
+            for obj in items:
+                if _is_alias_shell(obj):
+                    alias_drop_ids.add(id(obj))
+
+        if alias_drop_ids:
+            out = [obj for obj in out if id(obj) not in alias_drop_ids]
     except Exception:
         pass
 
@@ -18074,6 +28418,10 @@ def create_vehicles_tab(tab, save_path_var):
         "refresh_done": False,
     }
     sts_state["raw_objects"] = []
+    objective_label_state = {
+        "loaded": False,
+        "labels": {},
+    }
 
     _GROUP_AXIS_TOL = 1.0
     _GROUP_DIST_TOL = 1.35
@@ -18088,11 +28436,13 @@ def create_vehicles_tab(tab, save_path_var):
         file_path = str(obj.get("file_path", "") or "").strip().lower()
         kind = str(obj.get("kind", "") or "").strip().lower()
         map_id = str(obj.get("map_id", "") or "").strip().lower()
-        # Group by resolved display name first; fallback to type id.
-        name = str(obj.get("name", "") or "").strip().lower()
-        if not name:
-            name = str(obj.get("type_id", "") or "").strip().lower()
-        return (file_path, kind, map_id, name)
+        canonical_id = str(obj.get("canonical_id", "") or "").strip().lower()
+        if canonical_id:
+            return (file_path, kind, map_id, canonical_id)
+        type_id = str(obj.get("type_id", "") or "").strip().lower()
+        cleaned_type = re.sub(r"^(?:g_special_|g_|w_)", "", type_id)
+        cleaned_type = re.sub(r"(?:_default|_skin_?\d*|_deleted)$", "", cleaned_type)
+        return (file_path, kind, map_id, cleaned_type or type_id)
 
     def _obj_is_close(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         ax, ay, az = _obj_num(a, "x"), _obj_num(a, "y"), _obj_num(a, "z")
@@ -18108,13 +28458,23 @@ def create_vehicles_tab(tab, save_path_var):
         score = 0
         guid = str(obj.get("guid", "") or "").strip()
         oid = str(obj.get("object_id", "") or "").strip()
+        canonical_id = str(obj.get("canonical_id", "") or "").strip()
+        type_id = str(obj.get("type_id", "") or "").strip().lower()
         if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", guid):
             score += 8
         if re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", oid):
             score += 6
+        if canonical_id:
+            score += 8
+            if canonical_id == type_id:
+                score += 4
         if oid and (not oid.lower().startswith("deleted")):
             score += 2
-        score += int(_vehicle_name_quality(str(obj.get("name", "") or ""), str(obj.get("type_id", "") or "")))
+        score += int(_vehicle_name_quality(str(obj.get("name", "") or ""), str(canonical_id or type_id)))
+        if re.search(r"(?:^|_)(?:truck|scout)_old_engine_", type_id):
+            score -= 2
+        if type_id.startswith(("g_", "w_", "g_special_")):
+            score -= 4
         return score
 
     def _build_grouped_objects_from_raw(raw_objects: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -18169,9 +28529,106 @@ def create_vehicles_tab(tab, save_path_var):
         )
         return grouped
 
+    def _load_objective_display_labels() -> Dict[str, str]:
+        if objective_label_state.get("loaded"):
+            labels = objective_label_state.get("labels", {})
+            return labels if isinstance(labels, dict) else {}
+
+        labels = {}
+        try:
+            source_info = _objectives_get_preferred_source(
+                force_reload=False,
+                language=_objectives_get_language_preference(),
+                allow_download=False,
+            )
+        except Exception:
+            source_info = {}
+
+        rows = source_info.get("rows", []) if isinstance(source_info, dict) else []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("key", "") or "").strip().upper()
+                value = _objectives_local_clean_text(row.get("displayname", ""))
+                if key and value and (not _objectives_local_is_probably_token(value)):
+                    labels[key] = value
+
+        objective_label_state["labels"] = labels
+        objective_label_state["loaded"] = True
+        return labels
+
+    def _object_context_label(object_id: Any) -> str:
+        raw = str(object_id or "").strip()
+        if (not raw) or re.fullmatch(r"\{[0-9A-Fa-f\-]{36}\}", raw):
+            return ""
+        low = raw.lower()
+        if low in {"g_truck_default", "g_scout_default", "w_truck_default", "w_scout_default"}:
+            return ""
+
+        labels = _load_objective_display_labels()
+        candidate = raw.upper()
+        seen = set()
+        while candidate and candidate not in seen:
+            seen.add(candidate)
+            label = str(labels.get(candidate, "") or "").strip()
+            if label:
+                return label
+            if "_" not in candidate:
+                break
+            candidate = candidate.rsplit("_", 1)[0]
+
+        if re.fullmatch(r"[A-Z]{2}_\d{2}_\d{2}_.+", raw.upper()):
+            return ""
+
+        human = _objectives_local_humanize_identifier(raw)
+        human = re.sub(r"\s+", " ", str(human or "")).strip()
+        if human and human.upper() == human:
+            human = human.title()
+        return human
+
+    def _refresh_vehicle_display_names() -> None:
+        objs = sts_state.get("objects", [])
+        if not isinstance(objs, list):
+            return
+
+        counts = {}
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            base_name = str(obj.get("canonical_name", "") or obj.get("name", "") or "").strip()
+            if not base_name:
+                continue
+            key = (
+                str(obj.get("map_id", "") or "").strip().lower(),
+                str(obj.get("kind", "") or "").strip().lower(),
+                base_name.lower(),
+            )
+            counts[key] = int(counts.get(key, 0)) + 1
+
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            base_name = str(obj.get("canonical_name", "") or obj.get("name", "") or "").strip()
+            if not base_name:
+                obj["display_name"] = str(obj.get("name", "") or "").strip()
+                continue
+            key = (
+                str(obj.get("map_id", "") or "").strip().lower(),
+                str(obj.get("kind", "") or "").strip().lower(),
+                base_name.lower(),
+            )
+            display_name = base_name
+            if int(counts.get(key, 0)) > 1:
+                context = _object_context_label(obj.get("object_id"))
+                if context and context.lower() != base_name.lower():
+                    display_name = f"{base_name} ({context})"
+            obj["display_name"] = display_name
+
     def _rebuild_grouped_objects():
         raw = sts_state.get("raw_objects", [])
         sts_state["objects"] = _build_grouped_objects_from_raw(raw if isinstance(raw, list) else [])
+        _refresh_vehicle_display_names()
 
     top = ttk.Frame(tab)
     top.pack(fill="x", padx=10, pady=(10, 6))
@@ -18390,7 +28847,7 @@ def create_vehicles_tab(tab, save_path_var):
     def _row_values(obj: Dict[str, Any]):
         return (
             obj.get("kind", ""),
-            obj.get("name", ""),
+            obj.get("display_name", "") or obj.get("name", ""),
             obj.get("region_name", ""),
             obj.get("map_name", "") or obj.get("map_id", ""),
             f"{float(obj.get('x', 0.0)):.3f}",
@@ -18425,7 +28882,7 @@ def create_vehicles_tab(tab, save_path_var):
             kind = str(obj.get("kind", "") or "").strip().lower()
             region = str(obj.get("region_name", "") or "").strip().lower()
             map_name = str(obj.get("map_name", "") or obj.get("map_id", "") or "").strip().lower()
-            disp_name = str(obj.get("name", "") or "").strip().lower()
+            disp_name = str(obj.get("display_name", "") or obj.get("name", "") or "").strip().lower()
             type_id = str(obj.get("type_id", "") or "").strip().lower()
             object_id = str(obj.get("object_id", "") or "").strip()
             # Name filter should be based on real display names only.
@@ -18519,13 +28976,16 @@ def create_vehicles_tab(tab, save_path_var):
         for obj in objs:
             if not isinstance(obj, dict):
                 continue
-            type_id = str(obj.get("type_id", "") or "").strip()
-            object_id = str(obj.get("object_id", "") or "").strip()
-            if type_id or object_id:
-                new_name = _vehicle_display_name_for_entry(type_id, object_id)
-                if new_name and new_name != str(obj.get("name", "") or ""):
-                    obj["name"] = new_name
-                    changed = True
+            prev_name = str(obj.get("name", "") or "").strip()
+            prev_kind = str(obj.get("kind", "") or "").strip()
+            prev_canonical = str(obj.get("canonical_id", "") or "").strip()
+            _vehicle_apply_identity_to_object(obj)
+            if (
+                str(obj.get("name", "") or "").strip() != prev_name
+                or str(obj.get("kind", "") or "").strip() != prev_kind
+                or str(obj.get("canonical_id", "") or "").strip() != prev_canonical
+            ):
+                changed = True
 
             map_id = str(obj.get("map_id", "") or "").strip()
             if map_id:
@@ -20876,7 +31336,7 @@ FACTOR_RULE_DEFINITIONS = [
     ("Trailer pricing", "trailerPricingFactor", {"normal price": 1, "free": 0, "2x": 2, "4x": 4, "6x": 6}),
     ("Trailer selling price", "trailerSellingFactor", {"normal price": 1, "50%": 0.5, "30%": 0.3, "10%": 0.1, "cant be sold": -1}),
     ("Fuel price", "fuelPriceFactor", {
-        "default": 0,
+        "default": 1,
         "free": 0,
         "2x": 2,
         "4x": 4,
@@ -21063,6 +31523,38 @@ def _rule_option_matches_value(option_value, raw_value):
         pass
     return str(option_value) == str(raw_value)
 
+def _is_custom_multiplier_rule_key(key):
+    return str(key or "").endswith("Factor")
+
+def _normalize_rule_multiplier_value(raw_value, fallback=1.0):
+    try:
+        value = float(raw_value)
+    except Exception:
+        value = float(fallback)
+    if not math.isfinite(value):
+        value = float(fallback)
+    return float(value)
+
+def _slider_rule_multiplier_value(raw_value):
+    value = _normalize_rule_multiplier_value(raw_value)
+    return round(max(-10.0, min(10.0, value)), 3)
+
+def _limit_rule_multiplier_decimals(raw_value):
+    value = _normalize_rule_multiplier_value(raw_value)
+    return math.trunc(value * 100.0) / 100.0
+
+def _format_rule_multiplier_value(raw_value):
+    value = _limit_rule_multiplier_decimals(raw_value)
+    if abs(value - round(value)) <= 1e-9:
+        return str(int(round(value)))
+    return f"{value:.2f}".rstrip("0").rstrip(".") or "0"
+
+def _json_rule_multiplier_value(raw_value):
+    value = _limit_rule_multiplier_decimals(raw_value)
+    if abs(value - round(value)) <= 1e-9:
+        return int(round(value))
+    return float(value)
+
 def _make_key_saver(key, options, var):
     def saver(path):
         try:
@@ -21120,6 +31612,18 @@ def create_rules_tab(tab_rules, save_path_var):
     rule_savers = []
     dropdown_widgets = {}
     random_rules_var = tk.BooleanVar(value=False)
+    custom_rules_mode_var = tk.BooleanVar(
+        value=bool((_load_config_safe() or {}).get("rules_custom_rules_enabled", False))
+    )
+
+    def _is_custom_multiplier_rule(rule):
+        return _is_custom_multiplier_rule_key((rule or {}).get("key"))
+
+    def _custom_rules_active():
+        try:
+            return bool(custom_rules_mode_var.get())
+        except Exception:
+            return False
 
     def _set_all_rules_to_random():
         for rule in FACTOR_RULE_VARS:
@@ -21151,12 +31655,199 @@ def create_rules_tab(tab_rules, save_path_var):
                 return label
         return next(iter(options.keys()), "")
 
+    def _get_rule_default_value(rule):
+        label = _get_rule_default_label(rule)
+        return (rule.get("options") or {}).get(label, 1.0)
+
+    def _matching_numeric_rule_label(rule, value):
+        options = rule.get("options") or {}
+        for label, option_value in options.items():
+            if label == _RULE_RANDOM_LABEL or option_value == _RULE_RANDOM_VALUE:
+                continue
+            if isinstance(option_value, bool):
+                continue
+            if not isinstance(option_value, (int, float)):
+                continue
+            if _rule_option_matches_value(option_value, value):
+                return label
+        return None
+
+    def _custom_rule_ngp_label(rule, value):
+        exact_label = _matching_numeric_rule_label(rule, value)
+        if exact_label is not None:
+            return exact_label
+        meta = _RULE_NGP_DICT_META.get((rule or {}).get("key"))
+        if not meta:
+            return None
+        _ngp_key, label_to_state = meta
+        options = (rule or {}).get("options") or {}
+        candidates = []
+        for label, state in label_to_state.items():
+            option_value = options.get(label)
+            if label == _RULE_RANDOM_LABEL or option_value == _RULE_RANDOM_VALUE:
+                continue
+            if isinstance(option_value, bool) or not isinstance(option_value, (int, float)):
+                continue
+            try:
+                candidates.append((label, float(option_value), int(state)))
+            except Exception:
+                pass
+        if not candidates:
+            return None
+        target = _normalize_rule_multiplier_value(value)
+        chosen = min(candidates, key=lambda item: abs(item[1] - target))
+        if chosen[2] == 0 and abs(chosen[1] - target) > 1e-6:
+            non_default = [item for item in candidates if item[2] != 0]
+            if non_default:
+                chosen = min(non_default, key=lambda item: abs(item[1] - target))
+        return chosen[0]
+
+    def _set_custom_rule_value(rule, value):
+        if not rule or not _is_custom_multiplier_rule(rule):
+            return _normalize_rule_multiplier_value(value)
+        setter = ((rule.get("custom_control") or {}).get("set"))
+        if callable(setter):
+            return setter(value)
+        entry_var = rule.get("custom_entry_var")
+        scale_var = rule.get("custom_scale_var")
+        normalized = _normalize_rule_multiplier_value(value)
+        try:
+            if scale_var is not None:
+                scale_var.set(_slider_rule_multiplier_value(normalized))
+            if entry_var is not None:
+                entry_var.set(_format_rule_multiplier_value(normalized))
+        except Exception:
+            pass
+        return normalized
+
+    def _get_custom_rule_value(rule):
+        if not rule or not _is_custom_multiplier_rule(rule):
+            return _normalize_rule_multiplier_value(_get_rule_default_value(rule or {}))
+        getter = ((rule.get("custom_control") or {}).get("get"))
+        if callable(getter):
+            return getter()
+        entry_var = rule.get("custom_entry_var")
+        if entry_var is not None:
+            return _normalize_rule_multiplier_value(entry_var.get(), _get_rule_default_value(rule))
+        return _normalize_rule_multiplier_value(_get_rule_default_value(rule))
+
+    def _sync_custom_rule_from_dropdown(rule):
+        if not rule or not _is_custom_multiplier_rule(rule):
+            return
+        options = rule.get("options") or {}
+        label = ""
+        try:
+            label = str(rule.get("var").get() or "")
+        except Exception:
+            pass
+        value = options.get(label, _get_rule_default_value(rule))
+        if value == _RULE_RANDOM_VALUE or isinstance(value, bool) or not isinstance(value, (int, float)):
+            value = _get_rule_default_value(rule)
+        _set_custom_rule_value(rule, value)
+
+    def _mark_custom_rule_edited():
+        if _custom_rules_active():
+            _set_game_difficulty_label("New Game+")
+
+    def _bind_custom_rule_control(rule, scale_widget, scale_var, entry_widget, entry_var):
+        state = {"busy": False, "last_value": _normalize_rule_multiplier_value(_get_rule_default_value(rule))}
+
+        def _set_value(raw_value):
+            value = _normalize_rule_multiplier_value(raw_value, state.get("last_value", 1.0))
+            state["busy"] = True
+            try:
+                scale_var.set(_slider_rule_multiplier_value(value))
+                entry_var.set(_format_rule_multiplier_value(value))
+            finally:
+                state["busy"] = False
+            state["last_value"] = value
+            return value
+
+        def _get_value():
+            raw = str(entry_var.get() or "").strip()
+            if raw in {"", "-", ".", "-.", "+", "+."}:
+                return _normalize_rule_multiplier_value(state.get("last_value", 1.0))
+            try:
+                value = float(raw)
+            except Exception:
+                return _normalize_rule_multiplier_value(state.get("last_value", 1.0))
+            if not math.isfinite(value):
+                return _normalize_rule_multiplier_value(state.get("last_value", 1.0))
+            return float(value)
+
+        def _on_scale(value):
+            if state["busy"]:
+                return
+            _set_value(value)
+            _mark_custom_rule_edited()
+
+        def _on_entry_change(*_args):
+            if state["busy"]:
+                return
+            raw = str(entry_var.get() or "").strip()
+            if raw in {"", "-", ".", "-.", "+", "+."}:
+                return
+            if raw.endswith("."):
+                try:
+                    preview = float(raw[:-1])
+                except Exception:
+                    return
+                if math.isfinite(preview):
+                    state["last_value"] = float(preview)
+                state["busy"] = True
+                try:
+                    scale_var.set(_slider_rule_multiplier_value(preview))
+                finally:
+                    state["busy"] = False
+                _mark_custom_rule_edited()
+                return
+            try:
+                value = float(raw)
+            except Exception:
+                return
+            if not math.isfinite(value):
+                return
+            state["last_value"] = float(value)
+            state["busy"] = True
+            try:
+                scale_var.set(_slider_rule_multiplier_value(value))
+            finally:
+                state["busy"] = False
+            _mark_custom_rule_edited()
+
+        def _commit_entry(_event=None):
+            raw = str(entry_var.get() or "").strip()
+            if raw in {"", "-", ".", "-.", "+", "+."}:
+                _set_value(state.get("last_value", 1.0))
+                return
+            try:
+                value = float(raw)
+            except Exception:
+                value = state.get("last_value", 1.0)
+            if not math.isfinite(value):
+                value = state.get("last_value", 1.0)
+            _set_value(value)
+
+        scale_widget.configure(command=_on_scale)
+        try:
+            entry_var.trace_add("write", _on_entry_change)
+        except Exception:
+            entry_var.trace("w", _on_entry_change)
+        entry_widget.bind("<FocusOut>", _commit_entry, add="+")
+        entry_widget.bind("<Return>", _commit_entry, add="+")
+        return {"get": _get_value, "set": _set_value}
+
     def _reset_rules_ui_to_defaults():
         for rule in FACTOR_RULE_VARS:
             try:
                 rule["var"].set(_get_rule_default_label(rule))
             except Exception:
                 pass
+            if _is_custom_multiplier_rule(rule):
+                try:
+                    _set_custom_rule_value(rule, _get_rule_default_value(rule))
+                except Exception:
+                    pass
 
     def _get_rule_by_key(key):
         for rule in FACTOR_RULE_VARS:
@@ -21195,11 +31886,53 @@ def create_rules_tab(tab_rules, save_path_var):
             return
 
         # Any manual rule edit should move the save mode to New Game+ immediately.
+        _sync_custom_rule_from_dropdown(selected_rule)
         _set_game_difficulty_label("New Game+")
 
     # UI container + scrollable canvas
     container = ttk.Frame(tab_rules)
     container.pack(fill="both", expand=True, padx=8, pady=8)
+
+    def _refresh_custom_rules_mode():
+        active = _custom_rules_active()
+        for rule in FACTOR_RULE_VARS:
+            if not _is_custom_multiplier_rule(rule):
+                continue
+            combo_widget = rule.get("combo_widget")
+            custom_frame = rule.get("custom_frame")
+            try:
+                if active:
+                    if combo_widget is not None:
+                        combo_widget.pack_forget()
+                    if custom_frame is not None and not custom_frame.winfo_manager():
+                        custom_frame.pack(fill="x")
+                else:
+                    if custom_frame is not None:
+                        custom_frame.pack_forget()
+                    if combo_widget is not None and not combo_widget.winfo_manager():
+                        combo_widget.pack(fill="x")
+            except Exception:
+                pass
+        try:
+            container.after_idle(_refresh_rules_scrollregion)
+        except Exception:
+            pass
+
+    def _on_custom_rules_toggle():
+        try:
+            _update_config_values({"rules_custom_rules_enabled": bool(custom_rules_mode_var.get())})
+        except Exception:
+            pass
+        if _custom_rules_active():
+            _set_game_difficulty_label("New Game+")
+        _refresh_custom_rules_mode()
+        fit_window = globals().get("_EDITOR_FIT_WINDOW_TO_TABS_AND_RULES")
+        if callable(fit_window):
+            try:
+                container.after_idle(fit_window)
+                container.after(50, fit_window)
+            except Exception:
+                pass
 
     canvas_wrap = ttk.Frame(container)
     canvas_wrap.pack(fill="both", expand=True)
@@ -21218,6 +31951,7 @@ def create_rules_tab(tab_rules, save_path_var):
         globals()["_RULES_TAB_CONTAINER"] = container
         globals()["_RULES_CONTENT_FRAME"] = wrapper
         globals()["_RULES_CANVAS"] = canvas
+        globals()["_RULES_CANVAS_WRAP"] = canvas_wrap
     except Exception:
         pass
 
@@ -21295,8 +32029,20 @@ def create_rules_tab(tab_rules, save_path_var):
             options[_RULE_RANDOM_LABEL] = _RULE_RANDOM_VALUE
         var = tk.StringVar(value=list(options.keys())[0])
         rule = {"label": label, "key": key, "options": options, "var": var}
+        if _is_custom_multiplier_rule(rule):
+            default_value = _normalize_rule_multiplier_value(_get_rule_default_value(rule))
+            rule["custom_scale_var"] = tk.DoubleVar(tab_rules, value=_slider_rule_multiplier_value(default_value))
+            rule["custom_entry_var"] = tk.StringVar(tab_rules, value=_format_rule_multiplier_value(default_value))
         FACTOR_RULE_VARS.append(rule)
         entries.append(rule)
+
+    entries.sort(
+        key=lambda rule: (
+            0 if str(rule.get("key") or "") == "gameDifficultyMode" else 1,
+            str(rule.get("label") or "").casefold(),
+        )
+    )
+    FACTOR_RULE_VARS[:] = entries
 
     COLS = 3
     for ci in range(COLS):
@@ -21311,17 +32057,35 @@ def create_rules_tab(tab_rules, save_path_var):
         var = rule["var"]
         card = ttk.Frame(center_frame, padding=(10, 8), relief="groove")
         card.grid(row=r, column=c, padx=12, pady=8, sticky="nsew")
+        rule["card_widget"] = card
         ttk.Label(card, text=label_text + ":", font=("TkDefaultFont", 9)).pack(anchor="w")
-        cb = ttk.Combobox(card, textvariable=var, values=list(opts.keys()), state="readonly")
-        cb.pack(fill="x", pady=(6,2))
+        control_slot = ttk.Frame(card, height=22)
+        control_slot.pack(fill="x", pady=(6, 2))
+        control_slot.pack_propagate(False)
+        rule["control_slot"] = control_slot
+        cb = ttk.Combobox(control_slot, textvariable=var, values=list(opts.keys()), state="readonly")
+        cb.pack(fill="x")
         cb.bind("<<ComboboxSelected>>", lambda _e, current_rule=rule: _on_rule_dropdown_selected(current_rule))
+        rule["combo_widget"] = cb
         dropdown_widgets[key] = cb
+        if _is_custom_multiplier_rule(rule):
+            custom_frame = ttk.Frame(control_slot)
+            scale_var = rule["custom_scale_var"]
+            entry_var = rule["custom_entry_var"]
+            scale = ttk.Scale(custom_frame, from_=-10.0, to=10.0, variable=scale_var, orient="horizontal", length=150)
+            scale.pack(side="left", fill="x", expand=True)
+            entry = ttk.Entry(custom_frame, textvariable=entry_var, width=8)
+            entry.pack(side="left", padx=(8, 0))
+            rule["custom_frame"] = custom_frame
+            rule["custom_control"] = _bind_custom_rule_control(rule, scale, scale_var, entry, entry_var)
         rule_savers.append(_make_key_saver(key, opts, var))
 
         c += 1
         if c >= COLS:
             c = 0
             r += 1
+
+    _refresh_custom_rules_mode()
 
     # ---------- sanitizers/helpers used in save ----------
     def _ensure_key_with_default_text(text, key, pyvalue, treat_zero_as_missing=False):
@@ -21466,13 +32230,20 @@ def create_rules_tab(tab_rules, save_path_var):
         try:
             if random_rules_var.get():
                 _set_all_rules_to_random()
+            if _custom_rules_active():
+                _set_game_difficulty_label("New Game+")
 
             # 1) Resolve "random" labels to concrete choices up-front.
             #    This guarantees savers, linked logic, and dictionary sync all use
             #    the same final choice.
             resolved_rule_choices = {}
             for rule in FACTOR_RULE_VARS:
-                resolved_rule_choices[rule["key"]] = _resolve_rule_selection(rule)
+                if _custom_rules_active() and _is_custom_multiplier_rule(rule):
+                    custom_value = _get_custom_rule_value(rule)
+                    matched_label = _custom_rule_ngp_label(rule, custom_value)
+                    resolved_rule_choices[rule["key"]] = (matched_label, custom_value)
+                else:
+                    resolved_rule_choices[rule["key"]] = _resolve_rule_selection(rule)
 
             difficulty_rule = _get_rule_by_key("gameDifficultyMode")
             difficulty_label = resolved_rule_choices.get(
@@ -21509,6 +32280,17 @@ def create_rules_tab(tab_rules, save_path_var):
             # 3) Read back for custom/special rule handling.
             with open(tmp, "r", encoding="utf-8") as f:
                 text = f.read()
+
+            if _custom_rules_active():
+                for rule in FACTOR_RULE_VARS:
+                    if not _is_custom_multiplier_rule(rule):
+                        continue
+                    _, custom_value = resolved_rule_choices.get(rule["key"], (None, _get_custom_rule_value(rule)))
+                    text = _set_key_in_text(
+                        text,
+                        rule["key"],
+                        json.dumps(_json_rule_multiplier_value(custom_value)),
+                    )
 
             # 4) Ensure each rule key exists and is not null.
             for rule in FACTOR_RULE_VARS:
@@ -21557,7 +32339,7 @@ def create_rules_tab(tab_rules, save_path_var):
 
                 if key == "regionRepaireMoneyFactor":
                     # Keep money and points factors in sync for regional repair rule.
-                    text = _set_key_in_text(text, "regionRepairePointsFactor", json.dumps(selected_value))
+                    text = _set_key_in_text(text, "regionRepairePointsFactor", json.dumps(_json_rule_multiplier_value(selected_value)))
                     continue
 
                 if key == "needToAddDlcTrucks":
@@ -21641,6 +32423,15 @@ def create_rules_tab(tab_rules, save_path_var):
                 internal_key = rule["key"]
                 options = rule["options"]
                 var = rule["var"]
+
+                if _is_custom_multiplier_rule(rule):
+                    rawv = _read_scalar_key(content, internal_key)
+                    if rawv is not None and not isinstance(rawv, bool):
+                        _set_custom_rule_value(rule, rawv)
+                        matched_label = _matching_numeric_rule_label(rule, rawv)
+                        if matched_label is not None:
+                            var.set(matched_label)
+                        continue
 
                 meta = _RULE_NGP_DICT_META.get(internal_key)
                 if meta:
@@ -21747,7 +32538,33 @@ def create_rules_tab(tab_rules, save_path_var):
     # bottom Save button (centered)
     bottom = ttk.Frame(container)
     bottom.pack(fill="x", pady=(6,10))
-    ttk.Checkbutton(bottom, text="Random rules", variable=random_rules_var, command=_on_random_rules_toggle).pack(anchor="center", pady=(0, 6))
+    try:
+        globals()["_RULES_BOTTOM_FRAME"] = bottom
+    except Exception:
+        pass
+    rules_option_row = ttk.Frame(bottom)
+    rules_option_row.pack(anchor="center", pady=(0, 6))
+    ttk.Checkbutton(rules_option_row, text="Random rules", variable=random_rules_var, command=_on_random_rules_toggle).pack(side="left", padx=(0, 14))
+    ttk.Checkbutton(rules_option_row, text="Custom rules", variable=custom_rules_mode_var, command=_on_custom_rules_toggle).pack(side="left")
+    custom_rules_info_badge = tk.Label(
+        rules_option_row,
+        text="i",
+        width=2,
+        relief="ridge",
+        bd=1,
+        highlightthickness=0,
+        cursor="question_arrow",
+        bg="#b3261e",
+        fg="white",
+    )
+    custom_rules_info_badge.pack(side="left", padx=(5, 0))
+    _attach_hover_tooltip(
+        custom_rules_info_badge,
+        "Custom rules replace multiplier presets with exact numbers.\n\n"
+        "Only multiplier rules change; option-only rules stay as dropdowns.\n\n"
+        "The value is applied as a multiplier to the rule's default value. "
+        "Example: 50 means default value × 50.",
+    )
     button_row = ttk.Frame(bottom)
     button_row.pack(fill="x")
     ttk.Frame(button_row).pack(side="left", expand=True)
@@ -23065,6 +33882,10 @@ def launch_gui(start_minimized=False):
     # Check for required/optional dependencies first
     check_dependencies()
     _log_platform_support_status()
+    try:
+        _migrate_known_legacy_backup_locations()
+    except Exception as e:
+        print("[Backup] Startup migration failed:", e)
 
     # --- Set AppUserModelID early (must happen before creating the Tk root) ---
     if platform.system() == "Windows":
@@ -23084,6 +33905,10 @@ def launch_gui(start_minimized=False):
     
     # Create root window first
     root = tk.Tk()
+    try:
+        root.withdraw()
+    except Exception:
+        pass
     _EDITOR_ROOT = root
     _editor_translation_install_hooks()
     try:
@@ -23096,12 +33921,7 @@ def launch_gui(start_minimized=False):
     except Exception:
         pass
     _editor_register_window(root)
-    _editor_apply_language(root=root, language=_editor_get_language_preference(), allow_download=True, force_reload=False)
-    # Hide during initial layout to avoid size jump on startup
-    try:
-        root.withdraw()
-    except Exception:
-        pass
+    _editor_apply_language(root=root, language=_editor_get_language_preference(), allow_download=False, force_reload=False)
     _close_state = {"requested": False, "cleanup_done": False}
     # Run cleanup again after GUI startup so updater leftovers are removed
     # while the app is open (not only on next restart).
@@ -23140,6 +33960,12 @@ def launch_gui(start_minimized=False):
     except Exception:
         # Non-fatal: icon is optional
         pass
+
+    def _refresh_root_app_icon():
+        try:
+            set_app_icon(root)
+        except Exception:
+            pass
 
     # Initialize all variables after root window exists
     max_backups_var = tk.StringVar(root, value="20")
@@ -23204,8 +34030,9 @@ def launch_gui(start_minimized=False):
     dont_remember_path_var.set(config.get("dont_remember_path", False))
     enable_legacy_tabs_var = tk.BooleanVar(root, value=bool(config.get("enable_legacy_tabs", False)))
     dark_mode_var.set(bool(config.get("dark_mode", False)))
+    objectives_safe_fallback_var = tk.BooleanVar(root, value=bool(config.get("objectives_use_safe_fallback", False)))
     try:
-        _delete_config_keys(["objectives_use_safe_fallback", "objectives_use_backup"])
+        _set_objectives_safe_fallback_mode(bool(objectives_safe_fallback_var.get()))
     except Exception:
         pass
     improve_share_raw = config.get("improve_share_enabled", False)
@@ -23594,67 +34421,121 @@ def launch_gui(start_minimized=False):
         if a == 2 and amt_key in addon_amount_ranges:
             addon_amount_var.set(amt_key)
 
-
-
-    # Auto-load values if last path is valid
-    last_path = save_path_var.get()
-    plugin_loaders.append(sync_factor_rule_dropdowns)
-    sync_factor_rule_dropdowns(last_path)
-
-    # Set default values in case no file exists
-    day, night = 1.0, 1.0
-    if os.path.exists(last_path):
-        with open(last_path, 'r', encoding='utf-8') as f:
-            content = f.read()
+    def _build_startup_save_snapshot(path: str, content: str) -> Dict[str, Any]:
         m, r, xp, d, t, s, day, night, tp = get_file_info(content)
-        money_var.set(str(m))
-        rank_var.set(str(r))
-        difficulty_var.set(difficulty_map.get(d, "Normal"))
-        truck_avail_var.set(truck_avail_map.get(t, "default"))
-        truck_price_var.set(truck_price_map.get(tp, "default"))
+        if day is None or night is None:
+            raise ValueError("Missing time settings")
         addon_avail_val = re.search(r'"internalAddonAvailability"\s*:\s*(\d+)', content)
         addon_avail = int(addon_avail_val.group(1)) if addon_avail_val else 0
-        addon_avail_var.set(addon_avail_map.get(addon_avail, "default"))
-
+        addon_amount_key = None
         if addon_avail == 2:
             amount_val = re.search(r'"internalAddonAmount"\s*:\s*(\d+)', content)
             if amount_val:
                 amt = int(amount_val.group(1))
                 for key, (min_v, max_v) in addon_amount_ranges.items():
                     if min_v <= amt <= max_v:
-                        addon_amount_var.set(key)
+                        addon_amount_key = key
                         break
-
-        skip_time_var.set(s)
-        # Call plugin GUI loaders to refresh their values from file
-        for loader in plugin_loaders:
-            try:
-                loader(save_path_var.get())
-            except Exception as e:
-                print(f"Plugin failed to update GUI from file: {e}")
-
         if day is None or night is None:
-            time_preset_var.set("Custom")
+            preset = "Custom"
         else:
-            time_preset_var.set(
-                next(
-                    (k for k, v in time_presets.items()
-                     if abs(day - v[0]) < 0.01 and abs(night - v[1]) < 0.01),
-                    "Custom"
-                )
+            preset = next(
+                (
+                    k for k, v in time_presets.items()
+                    if abs(day - v[0]) < 0.01 and abs(night - v[1]) < 0.01
+                ),
+                "Custom",
             )
+        return {
+            "path": path,
+            "money": m,
+            "rank": r,
+            "xp": xp,
+            "difficulty": difficulty_map.get(d, "Normal"),
+            "truck_availability": truck_avail_map.get(t, "default"),
+            "truck_price": truck_price_map.get(tp, "default"),
+            "skip_time": s,
+            "day": day,
+            "night": night,
+            "time_preset": preset,
+            "addon_availability": addon_avail_map.get(addon_avail, "default"),
+            "addon_amount_key": addon_amount_key,
+            "garage_refuel": ('"enableGarageRefuel": true' in content),
+        }
 
-        # Also sync all rule dropdowns on startup
-        sync_rule_dropdowns(last_path)
-        for loader in plugin_loaders:
+    def _apply_startup_save_snapshot(snapshot: Dict[str, Any]):
+        if not isinstance(snapshot, dict):
+            return
+        path = str(snapshot.get("path") or "").strip()
+        if path:
             try:
-                loader(last_path)
-            except Exception as e:
-                print(f"Plugin failed to update GUI on startup: {e}")
+                save_path_var.set(path)
+            except Exception:
+                pass
+        try:
+            money_var.set(str(snapshot.get("money") if snapshot.get("money") is not None else ""))
+        except Exception:
+            pass
+        try:
+            rank_var.set(str(snapshot.get("rank") if snapshot.get("rank") is not None else ""))
+        except Exception:
+            pass
+        try:
+            xp_value = snapshot.get("xp")
+            xp_var.set(str(xp_value) if xp_value is not None else "")
+        except Exception:
+            pass
+        try:
+            difficulty_var.set(str(snapshot.get("difficulty") or "Normal"))
+        except Exception:
+            pass
+        try:
+            truck_avail_var.set(str(snapshot.get("truck_availability") or "default"))
+        except Exception:
+            pass
+        try:
+            truck_price_var.set(str(snapshot.get("truck_price") or "default"))
+        except Exception:
+            pass
+        try:
+            addon_avail_var.set(str(snapshot.get("addon_availability") or "default"))
+        except Exception:
+            pass
+        try:
+            addon_amount_key = snapshot.get("addon_amount_key")
+            if addon_amount_key:
+                addon_amount_var.set(str(addon_amount_key))
+        except Exception:
+            pass
+        try:
+            garage_refuel_var.set(bool(snapshot.get("garage_refuel")))
+        except Exception:
+            pass
+        try:
+            _sync_time_ui(
+                day=snapshot.get("day"),
+                night=snapshot.get("night"),
+                skip_time=bool(snapshot.get("skip_time")),
+            )
+        except Exception:
+            pass
+        try:
+            time_preset_var.set(str(snapshot.get("time_preset") or "Custom"))
+        except Exception:
+            pass
+        try:
+            base = os.path.basename(path) if path else "save file"
+            set_app_status(f"Loaded {base}.", timeout_ms=4000)
+        except Exception:
+            pass
+
+
+    # Auto-load values if last path is valid
+    plugin_loaders.append(sync_factor_rule_dropdowns)
 
     def browse_file():
         file_path = filedialog.askopenfilename(
-            filetypes=[("SnowRunner Save", "*.cfg *.dat")]
+            filetypes=_snowrunner_save_picker_filetypes()
         )
         if not file_path:
             return
@@ -23841,15 +34722,15 @@ def launch_gui(start_minimized=False):
             set_app_status(f"{tab_name} tab failed to load: {e}", timeout_ms=10000)
 
     # TAB: Save File (inline UI built below)
-    tab_control.add(tab_file, text='Save File')
+    _editor_add_notebook_tab(tab_control, tab_file, 'Save File')
 
     # TAB: Backups (create_backups_tab)
     tab_backups = ttk.Frame(tab_control)
-    tab_control.add(tab_backups, text='Backups')
+    _editor_add_notebook_tab(tab_control, tab_backups, 'Backups')
     _register_lazy_tab(tab_backups, "Backups", lambda: create_backups_tab(tab_backups, save_path_var))
 
     # TAB: Money & Rank (inline UI built below)
-    tab_control.add(tab_money, text='Money & Rank')
+    _editor_add_notebook_tab(tab_control, tab_money, 'Money & Rank')
 
     # TAB: Missions (legacy, optional; inline UI built below)
     # Visibility is controlled by the Settings -> Enable legacy tabs option.
@@ -23860,16 +34741,25 @@ def launch_gui(start_minimized=False):
 
     # TAB: Objectives+ (create_objectives_tab)
     tab_objectives = ttk.Frame(tab_control)
-    tab_control.add(tab_objectives, text='Objectives+')
+    _editor_add_notebook_tab(tab_control, tab_objectives, 'Objectives+')
     _register_lazy_tab(tab_objectives, "Objectives+", lambda: create_objectives_tab(tab_objectives, save_path_var))
 
     # TAB: Regions+ (merged region actions)
     tab_regions = ttk.Frame(tab_control)
-    tab_control.add(tab_regions, text="Regions+")
+    _editor_add_notebook_tab(tab_control, tab_regions, "Regions+")
     _register_lazy_tab(
         tab_regions,
         "Regions+",
         lambda: create_region_tools_tab(tab_regions, save_path_var, enable_legacy_tabs_var),
+    )
+
+    # TAB: Cargo Loading (create_cargo_loading_tab)
+    tab_cargo_loading = ttk.Frame(tab_control)
+    _editor_add_notebook_tab(tab_control, tab_cargo_loading, "Cargo Loading")
+    _register_lazy_tab(
+        tab_cargo_loading,
+        "Cargo Loading",
+        lambda: create_cargo_loading_tab(tab_cargo_loading, save_path_var),
     )
 
     def _tab_present(tab_frame):
@@ -23906,12 +34796,12 @@ def launch_gui(start_minimized=False):
 
     # TAB: Trials (create_trials_tab)
     tab_trials = ttk.Frame(tab_control)
-    tab_control.add(tab_trials, text='Trials')
+    _editor_add_notebook_tab(tab_control, tab_trials, 'Trials')
     _register_lazy_tab(tab_trials, "Trials", lambda: create_trials_tab(tab_trials, save_path_var, plugin_loaders))
 
     # TAB: Achievements (create_achievements_tab)
     tab_achievements = ttk.Frame(tab_control)
-    tab_control.add(tab_achievements, text='Achievements')
+    _editor_add_notebook_tab(tab_control, tab_achievements, 'Achievements')
     _register_lazy_tab(
         tab_achievements,
         "Achievements",
@@ -23920,13 +34810,18 @@ def launch_gui(start_minimized=False):
 
     # TAB: PROS (create_pros_tab)
     tab_pros = ttk.Frame(tab_control)
-    tab_control.add(tab_pros, text='PROS')
+    _editor_add_notebook_tab(tab_control, tab_pros, 'PROS')
     _register_lazy_tab(tab_pros, "PROS", lambda: create_pros_tab(tab_pros, save_path_var, plugin_loaders))
 
     # TAB: Vehicles (create_vehicles_tab)
     tab_vehicles = ttk.Frame(tab_control)
-    tab_control.add(tab_vehicles, text="Vehicles")
+    _editor_add_notebook_tab(tab_control, tab_vehicles, "Vehicles")
     _register_lazy_tab(tab_vehicles, "Vehicles", lambda: create_vehicles_tab(tab_vehicles, save_path_var))
+
+    # TAB: Mods (create_mods_tab)
+    tab_mods = ttk.Frame(tab_control)
+    _editor_add_notebook_tab(tab_control, tab_mods, "Mods")
+    _register_lazy_tab(tab_mods, "Mods", lambda: create_mods_tab_expanded(tab_mods, save_path_var))
 
     # start autosave monitor if autosave enabled in config
     try:
@@ -23947,14 +34842,14 @@ def launch_gui(start_minimized=False):
     _register_lazy_tab(tab_rules, "Rules", lambda: create_rules_tab(tab_rules, save_path_var))
     # End TAB: Rules
 
-    tab_control.add(tab_rules, text='Rules')
+    _editor_add_notebook_tab(tab_control, tab_rules, 'Rules')
 
     # TAB: Time (inline UI built below)
-    tab_control.add(tab_time, text='Time')
+    _editor_add_notebook_tab(tab_control, tab_time, 'Time')
 
     # TAB: Game Stats (create_game_stats_tab)
     tab_stats = ttk.Frame(tab_control)
-    tab_control.add(tab_stats, text="Game Stats")
+    _editor_add_notebook_tab(tab_control, tab_stats, "Game Stats")
     _register_lazy_tab(
         tab_stats,
         "Game Stats",
@@ -23963,7 +34858,7 @@ def launch_gui(start_minimized=False):
 
     # TAB: Settings (inline UI built below)
     tab_settings = ttk.Frame(tab_control)
-    tab_control.add(tab_settings, text='Settings')
+    _editor_add_notebook_tab(tab_control, tab_settings, 'Settings')
 
     # TAB: Fog Tool (FogToolFrame)
     tab_fog = ttk.Frame(tab_control)
@@ -24000,7 +34895,7 @@ def launch_gui(start_minimized=False):
                 justify="center"
             ).pack(expand=True, fill="both", padx=20, pady=20)
 
-    tab_control.add(tab_fog, text="Fog Tool")
+    _editor_add_notebook_tab(tab_control, tab_fog, "Fog Tool")
     _register_lazy_tab(tab_fog, "Fog Tool", _build_fog_tab)
     # End TAB: Fog Tool
 
@@ -24060,7 +34955,7 @@ def launch_gui(start_minimized=False):
         tab_control.forget(tab_settings)   # remove if already added
     except Exception:
         pass
-    tab_control.add(tab_settings, text='Settings')
+    _editor_add_notebook_tab(tab_control, tab_settings, 'Settings')
 
     # Restore last selected tab if available
     config = load_config() or {}
@@ -24071,6 +34966,7 @@ def launch_gui(start_minimized=False):
         "Contests [Legacy]": "Regions+",
         "Missions": "Regions+",
         "Contests": "Regions+",
+        "Cargo": "Cargo Loading",
         "Upgrades": "Regions+",
         "Watchtowers": "Regions+",
         "Discoveries": "Regions+",
@@ -24083,7 +34979,9 @@ def launch_gui(start_minimized=False):
         try:
             for tab_id in tab_control.tabs():
                 try:
-                    if str(tab_control.tab(tab_id, "text")) == target_text:
+                    raw_tab_text = _editor_get_notebook_tab_raw_text(tab_control, tab_id)
+                    display_tab_text = str(tab_control.tab(tab_id, "text") or "")
+                    if target_text in {raw_tab_text, display_tab_text}:
                         tab_control.select(tab_id)
                         restored = True
                         break
@@ -24121,7 +35019,7 @@ def launch_gui(start_minimized=False):
             config = load_config() or {}
             current_tab_id = tab_control.select()
             config["last_tab"] = tab_control.index(current_tab_id)
-            config["last_tab_text"] = str(tab_control.tab(current_tab_id, "text") or "")
+            config["last_tab_text"] = _editor_get_notebook_tab_raw_text(tab_control, current_tab_id)
             save_config(config)
         except Exception:
             pass
@@ -24821,7 +35719,7 @@ def launch_gui(start_minimized=False):
     editor_language_combo = ttk.Combobox(language_row, textvariable=editor_language_var, state="readonly", width=20)
     editor_language_combo.pack(side="left", fill="x", expand=True, padx=(8, 0))
     editor_language_combo.bind("<<ComboboxSelected>>", on_editor_language_changed)
-    refresh_editor_language_values(allow_download=True)
+    refresh_editor_language_values(allow_download=False)
     ttk.Button(appearance_box, text="Theme Customizer", command=open_theme_customizer).pack(anchor="w", pady=(8, 0))
 
     editor_box = ttk.LabelFrame(settings_top, text="Editor", padding=(10, 8))
@@ -24899,7 +35797,9 @@ def launch_gui(start_minimized=False):
             _parse_nonnegative_int(config.get("max_autobackups", 50), 50),
         )
         config["autosave"] = bool(autosave_var.get() if autosave_var is not None else False)
-        config.pop("objectives_use_safe_fallback", None)
+        config["objectives_use_safe_fallback"] = bool(
+            objectives_safe_fallback_var.get() if objectives_safe_fallback_var is not None else _get_objectives_safe_fallback_mode()
+        )
         config.pop("objectives_use_backup", None)
         startup_normal, startup_minimized = _get_settings_startup_mode()
         config["start_with_windows"] = bool(startup_normal)
@@ -25195,17 +36095,32 @@ def launch_gui(start_minimized=False):
         except Exception:
             pass
 
-    def _choose_complete_save_in_folder(folder):
-        """Find CompleteSave(.cfg/.dat / CompleteSave1..3) and let user pick if multiple."""
-        candidates = []
-        names = [("CompleteSave", 1), ("CompleteSave1", 2), ("CompleteSave2", 3), ("CompleteSave3", 4)]
-        for base, idx in names:
-            for ext in (".cfg", ".dat"):
-                p = os.path.join(folder, base + ext)
-                if os.path.exists(p):
-                    candidates.append((idx, p))
+    def _slot_candidates_for_folder(folder):
+        slot_map = {}
+        for slot_idx, path in _iter_complete_save_candidates(folder):
+            if slot_idx not in slot_map:
+                slot_map[int(slot_idx)] = path
+        return sorted(slot_map.items(), key=lambda item: item[0])
+
+    def _choose_complete_save_in_folder(folder, preferred_slot=None):
+        """Find CompleteSave(.cfg/.dat or extensionless) and let user pick if multiple."""
+        candidates = _slot_candidates_for_folder(folder)
         if not candidates:
-            return show_info("Not found", f"No CompleteSave*.cfg/.dat files found in:\n{folder}")
+            return show_info(
+                "Not found",
+                _editor_translate_display_text("No CompleteSave files were found in:\n{folder}").format(folder=folder),
+            )
+
+        if preferred_slot is not None:
+            try:
+                requested_slot = int(preferred_slot)
+            except Exception:
+                requested_slot = None
+            if requested_slot is not None:
+                for slot_idx, slot_path in candidates:
+                    if int(slot_idx) == requested_slot:
+                        _apply_path_selection(slot_path)
+                        return
 
         if len(candidates) == 1:
             _apply_path_selection(candidates[0][1])
@@ -25221,6 +36136,195 @@ def launch_gui(start_minimized=False):
             def _make_handler(p=path, w=win):
                 return lambda: (_apply_path_selection(p), w.destroy())
             ttk.Button(btn_frame, text=f"[{idx}]", command=_make_handler()).pack(side="left", padx=6)
+
+    def _collect_wgs_complete_save_candidates(source_info):
+        if not isinstance(source_info, dict):
+            return []
+        source_dir = os.path.abspath(str(source_info.get("path") or "").strip())
+        if not source_dir or not os.path.isdir(source_dir):
+            return []
+
+        kind = str(source_info.get("kind") or "auto").strip().lower()
+        if kind == "auto":
+            kind = "user_dir" if os.path.isfile(os.path.join(source_dir, "containers.index")) else "container_dir"
+
+        try:
+            if kind == "user_dir":
+                entries = _wgs_collect_entries_from_user_dir(source_dir)
+            elif kind == "container_dir":
+                entries = _wgs_collect_entries_from_container_dir(source_dir)
+            else:
+                return []
+        except Exception:
+            return []
+
+        slot_map = {}
+        for entry in entries:
+            rel_path = _wgs_logical_name_to_relpath(entry.get("logical_name"))
+            if not _is_complete_save_filename(rel_path):
+                continue
+            slot_idx = _detect_complete_save_slot_from_path(rel_path)
+            slot_map.setdefault(int(slot_idx), rel_path)
+        return sorted(slot_map.items(), key=lambda item: item[0])
+
+    def _collect_ps4_save_folders():
+        seeds = []
+        current_path = str(save_path_var.get() or "").strip()
+        if current_path:
+            seeds.append(current_path)
+        for slot_idx in (1, 2):
+            stored = str(_get_saved_path(slot_idx) or "").strip()
+            if stored:
+                seeds.append(stored)
+        seeds.append(load_initial_path())
+        try:
+            last_dir = load_editor_last_path()
+            if last_dir:
+                seeds.append(last_dir)
+        except Exception:
+            pass
+
+        found = []
+        seen = set()
+        for raw_seed in seeds:
+            seed = os.path.abspath(str(raw_seed or "").strip())
+            if not seed:
+                continue
+            folder = seed if os.path.isdir(seed) else os.path.dirname(seed)
+            folder = os.path.abspath(str(folder or "").strip())
+            if (not folder) or (not os.path.isdir(folder)):
+                continue
+            key = os.path.normcase(folder)
+            if key in seen:
+                continue
+            slot_candidates = _slot_candidates_for_folder(folder)
+            extensionless = [
+                (slot_idx, path)
+                for slot_idx, path in slot_candidates
+                if _is_complete_save_filename(path) and not os.path.splitext(path)[1]
+            ]
+            if not extensionless:
+                continue
+            seen.add(key)
+            found.append(
+                {
+                    "platform": "ps4",
+                    "path": folder,
+                    "slots": extensionless,
+                    "label": _editor_translate_display_text("Remembered PS4 folder"),
+                }
+            )
+        return found
+
+    def _build_auto_save_sources():
+        sources = []
+        for folder in _collect_steam_save_folders():
+            slot_candidates = _slot_candidates_for_folder(folder)
+            if slot_candidates:
+                sources.append({"platform": "steam", "path": folder, "slots": slot_candidates, "label": ""})
+        for folder in _collect_epic_save_folders():
+            slot_candidates = _slot_candidates_for_folder(folder)
+            if slot_candidates:
+                sources.append({"platform": "epic", "path": folder, "slots": slot_candidates, "label": ""})
+        for source_info in _wgs_auto_detect_sources():
+            slot_candidates = _collect_wgs_complete_save_candidates(source_info)
+            if slot_candidates:
+                sources.append(
+                    {
+                        "platform": "wgs",
+                        "path": os.path.abspath(str(source_info.get("path") or "").strip()),
+                        "slots": slot_candidates,
+                        "label": str(source_info.get("label") or "").strip(),
+                        "source_info": dict(source_info),
+                    }
+                )
+        sources.extend(_collect_ps4_save_folders())
+        return sources
+
+    def _show_auto_save_picker():
+        sources = _build_auto_save_sources()
+        if not sources:
+            return show_info(
+                _editor_translate_display_text("Auto"),
+                _editor_translate_display_text("No automatically detected save folders were found."),
+            )
+
+        win = _create_themed_toplevel()
+        win.title(_editor_translate_display_text("Auto-detected saves"))
+        ttk.Label(
+            win,
+            text=_editor_translate_display_text("Choose a detected save slot to load:"),
+            justify="left",
+        ).pack(fill="x", padx=12, pady=(10, 6))
+
+        body = ttk.Frame(win)
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        canvas = tk.Canvas(body, highlightthickness=0, borderwidth=0)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync_scrollregion(_event=None):
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+
+        def _sync_inner_width(event):
+            try:
+                canvas.itemconfigure(inner_id, width=event.width)
+            except Exception:
+                pass
+
+        inner.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_inner_width)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        for item in sources:
+            platform_name = {
+                "steam": "Steam",
+                "epic": "Epic",
+                "wgs": "WGS",
+                "ps4": "PS4",
+            }.get(str(item.get("platform") or "").lower(), str(item.get("platform") or "").upper())
+            frame = ttk.Labelframe(inner, text=platform_name)
+            frame.pack(fill="x", expand=True, pady=(0, 8))
+
+            label_text = str(item.get("label") or "").strip()
+            if label_text:
+                ttk.Label(frame, text=label_text, justify="left", wraplength=760).pack(anchor="w", padx=10, pady=(8, 0))
+            ttk.Label(frame, text=str(item.get("path") or ""), justify="left", wraplength=760).pack(anchor="w", padx=10, pady=(4, 8))
+
+            slot_row = ttk.Frame(frame)
+            slot_row.pack(anchor="w", padx=10, pady=(0, 8))
+            for slot_idx, slot_value in item.get("slots", []):
+                def _open_detected_slot(source=item, slot=int(slot_idx), slot_payload=slot_value, picker=win):
+                    def _run():
+                        try:
+                            picker.destroy()
+                        except Exception:
+                            pass
+                        if str(source.get("platform") or "").lower() == "wgs":
+                            _activate_wgs_source(source.get("source_info") or {}, preferred_slot=slot)
+                        else:
+                            _apply_path_selection(str(slot_payload or ""))
+                    return _run
+                ttk.Button(slot_row, text=f"[{slot_idx}]", width=5, command=_open_detected_slot()).pack(side="left", padx=(0, 6))
+
+        try:
+            win.transient(root)
+        except Exception:
+            pass
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        try:
+            win.wait_window()
+        except Exception:
+            pass
 
     def _prompt_select_path(candidates, title, message, label_builder=None):
         if not candidates:
@@ -25414,7 +36518,7 @@ def launch_gui(start_minimized=False):
         if selected:
             _choose_complete_save_in_folder(selected)
 
-    def _activate_wgs_source(source_info):
+    def _activate_wgs_source(source_info, preferred_slot=None):
         try:
             _wgs_reset_session(remove_mirror=True, sync=True)
             session = _wgs_build_session(source_info.get("path"), source_kind=source_info.get("kind", "auto"))
@@ -25446,7 +36550,7 @@ def launch_gui(start_minimized=False):
         except Exception:
             pass
 
-        _choose_complete_save_in_folder(mirror_dir)
+        _choose_complete_save_in_folder(mirror_dir, preferred_slot=preferred_slot)
 
     def _prompt_select_wgs_source(candidates, title=None, message=None):
         if not candidates:
@@ -25731,6 +36835,7 @@ def launch_gui(start_minimized=False):
             "steam": "Steam",
             "epic": "Epic",
             "wgs": "WGS",
+            "ps4": "PS4",
             "unknown": "current",
         }
         return table.get(str(platform_name or "").lower(), str(platform_name or "current"))
@@ -25901,15 +37006,15 @@ def launch_gui(start_minimized=False):
             return show_info("Empty", f"No saved path stored for slot {slot_idx}.")
         _apply_path_selection(p)
 
-    # ---- Layout: Save buttons + Entry + Steam/Epic (row 1) ; Load + Browse (row 2) ----
+    # ---- Layout: Save buttons + Entry + platform buttons (row 1) ; Load + Browse (row 2) ----
     row1 = ttk.Frame(path_container)
-    row1.pack(fill="x", pady=6)
+    row1.pack(fill="x", pady=(2, 0))
 
     # Left column: Save Path 1 / Save Path 2 (stacked)
     left_col = ttk.Frame(row1)
-    left_col.pack(side="left", anchor="n")
-    ttk.Button(left_col, text="Save Path 1", width=14, command=lambda: _persist_saved_path(1)).pack(pady=2)
-    ttk.Button(left_col, text="Save Path 2", width=14, command=lambda: _persist_saved_path(2)).pack(pady=2)
+    left_col.pack(side="left", anchor="center")
+    ttk.Button(left_col, text="Save Path 1", width=14, command=lambda: _persist_saved_path(1)).pack(pady=(0, 2))
+    ttk.Button(left_col, text="Save Path 2", width=14, command=lambda: _persist_saved_path(2)).pack(pady=(2, 0))
 
     # Middle: Entry (expands)
     mid_col = ttk.Frame(row1)
@@ -25917,16 +37022,17 @@ def launch_gui(start_minimized=False):
     entry = ttk.Entry(mid_col, textvariable=save_path_var)
     entry.pack(fill="x", expand=True)
 
-    # Right column: Steam / Epic / WGS (stacked)
+    # Right column: Steam / Epic / WGS / Auto (compact grid)
     right_col = ttk.Frame(row1)
-    right_col.pack(side="left", anchor="n")
-    ttk.Button(right_col, text="Steam", width=12, command=_find_steam_saves).pack(pady=2)
-    ttk.Button(right_col, text="Epic", width=12, command=_find_epic_saves).pack(pady=2)
-    ttk.Button(right_col, text="wgs", width=12, command=_find_wgs_saves).pack(pady=2)
+    right_col.pack(side="left", anchor="center")
+    ttk.Button(right_col, text="Steam", width=10, command=_find_steam_saves).grid(row=0, column=0, padx=(0, 3), pady=(0, 2))
+    ttk.Button(right_col, text="Epic", width=10, command=_find_epic_saves).grid(row=0, column=1, padx=(3, 0), pady=(0, 2))
+    ttk.Button(right_col, text="WGS", width=10, command=_find_wgs_saves).grid(row=1, column=0, padx=(0, 3), pady=(2, 0))
+    ttk.Button(right_col, text="Auto", width=10, command=_show_auto_save_picker).grid(row=1, column=1, padx=(3, 0), pady=(2, 0))
 
     # Replace the previous Row 2 block with this centered layout
     row2 = ttk.Frame(path_container)
-    row2.pack(fill="x", pady=(4,6))
+    row2.pack(fill="x", pady=(0, 4))
 
     center_frame = ttk.Frame(row2)
     center_frame.pack()
@@ -26056,6 +37162,13 @@ def launch_gui(start_minimized=False):
         justify="left",
         font=("TkDefaultFont", 9),
     ).pack(pady=(6, 10))
+    ttk.Label(
+        tab_file,
+        text="PS4 exports use the same file names but without .cfg/.dat (example: CompleteSave, CompleteSave1). Use Browse... to pick the file directly.",
+        wraplength=700,
+        justify="left",
+        font=("TkDefaultFont", 9),
+    ).pack(pady=(0, 10))
     # ---------- end replacement block ----------
 
     ttk.Label(
@@ -26645,9 +37758,6 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
     # -------------------------------------------------------------------------
     # END TAB UI: Time
     # -------------------------------------------------------------------------
-
-    # External rules/extensions no longer mounted into the Rules tab (tab intentionally left empty).
-
     
     if delete_path_on_close_var.get():
         try:
@@ -26669,6 +37779,14 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
             pass
         try:
             stop_autosave_monitor(wait=False)
+        except Exception:
+            pass
+        try:
+            for job_id in root.tk.call("after", "info"):
+                try:
+                    root.after_cancel(job_id)
+                except Exception:
+                    pass
         except Exception:
             pass
         try:
@@ -26697,29 +37815,65 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
     def _run_deferred_startup_syncs():
         if _close_state.get("requested"):
             return
+        last_path = str(load_last_path() or "").strip()
+        if not last_path:
+            return
+
         try:
-            try_autoload_last_save(save_path_var)
-        except Exception as e:
-            print("[Startup] remembered save autoload failed:", e)
+            set_app_status("Loading remembered save...", timeout_ms=0)
+        except Exception:
+            pass
 
-        if _close_state.get("requested"):
-            return
-        current_path = str(save_path_var.get() or "")
-        if not current_path or not os.path.exists(current_path):
-            return
-
-        def _finish_startup_sync(path=current_path):
+        def _apply_startup_result(result: Dict[str, Any]):
             if _close_state.get("requested"):
                 return
+            path = str((result or {}).get("path") or "").strip()
+            if result.get("missing"):
+                try:
+                    save_path_var.set("")
+                except Exception:
+                    pass
+                try:
+                    set_app_status(f"Remembered save not found: {path}", timeout_ms=9000)
+                except Exception:
+                    pass
+                return
+            error_text = str((result or {}).get("error") or "").strip()
+            if error_text:
+                try:
+                    save_path_var.set("")
+                except Exception:
+                    pass
+                try:
+                    set_app_status(f"Could not load remembered save: {error_text}", timeout_ms=10000)
+                except Exception:
+                    pass
+                return
+            snapshot = result.get("snapshot")
+            if isinstance(snapshot, dict):
+                _apply_startup_save_snapshot(snapshot)
+
+        def _startup_worker(path: str):
+            result = {"path": path, "snapshot": None, "missing": False, "error": ""}
             try:
-                sync_all_rules(path)
+                if not os.path.exists(path):
+                    result["missing"] = True
+                else:
+                    with open(path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    result["snapshot"] = _build_startup_save_snapshot(path, content)
             except Exception as e:
-                print("[Warning] Auto-sync failed:", e)
+                result["error"] = str(e)
+
+            try:
+                root.after(0, lambda payload=result: _apply_startup_result(payload))
+            except Exception:
+                _apply_startup_result(result)
 
         try:
-            root.after(40, _finish_startup_sync)
-        except Exception:
-            _finish_startup_sync()
+            threading.Thread(target=_startup_worker, args=(last_path,), daemon=True).start()
+        except Exception as e:
+            print("[Startup] remembered save autoload failed:", e)
 
     def _run_post_show_background_maintenance():
         if _close_state.get("requested"):
@@ -26769,6 +37923,29 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
             nb_req_h = tab_control.winfo_reqheight()
             rules_req_w = tab_rules.winfo_reqwidth() if 'tab_rules' in locals() else 0
             rules_req_h = tab_rules.winfo_reqheight() if 'tab_rules' in locals() else 0
+            rules_notebook_req_h = 0
+
+            def _widget_req_size(widget):
+                if widget is None:
+                    return 0, 0
+                try:
+                    return int(widget.winfo_reqwidth() or 0), int(widget.winfo_reqheight() or 0)
+                except Exception:
+                    return 0, 0
+
+            def _notebook_header_height():
+                header_h = 0
+                try:
+                    count = int(tab_control.index("end") or 0)
+                except Exception:
+                    count = 0
+                for i in range(count):
+                    try:
+                        _x, y, _w, h = tab_control.bbox(i)
+                        header_h = max(header_h, int(y) + int(h))
+                    except Exception:
+                        pass
+                return header_h if header_h > 0 else 30
 
             rules_container = globals().get("_RULES_TAB_CONTAINER")
             if rules_container is not None:
@@ -26786,6 +37963,26 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
                     rules_req_h = max(rules_req_h, rules_frame.winfo_reqheight())
                 except Exception:
                     pass
+
+            rules_bottom = globals().get("_RULES_BOTTOM_FRAME")
+            rules_canvas_wrap = globals().get("_RULES_CANVAS_WRAP")
+            frame_w, frame_h = _widget_req_size(rules_frame)
+            bottom_w, bottom_h = _widget_req_size(rules_bottom)
+            _wrap_w, wrap_h = _widget_req_size(rules_canvas_wrap)
+            if frame_h > 0:
+                # Rules tab content is a scrollable canvas plus bottom controls.
+                # Measure those pieces directly instead of relying on the canvas
+                # viewport height, which can lag behind swapped custom controls.
+                rules_inner_w = max(frame_w, bottom_w)
+                rules_inner_h = frame_h
+                if bottom_h > 0:
+                    rules_inner_h += bottom_h + 16  # bottom.pack(pady=(6, 10))
+                rules_inner_h += 16  # container.pack(pady=8)
+                if wrap_h > 0:
+                    rules_inner_h = max(rules_inner_h, wrap_h + bottom_h + 32)
+                rules_req_w = max(rules_req_w, rules_inner_w + 16)
+                rules_req_h = max(rules_req_h, rules_inner_h)
+                rules_notebook_req_h = int(_notebook_header_height() + rules_inner_h + 10)
 
             header_width = 0
             if tab_count > 0:
@@ -26814,11 +38011,16 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
                 status_h = status_bar.winfo_reqheight() if "status_bar" in locals() else 0
             except Exception:
                 status_h = 0
-            target_h = int(max(nb_req_h, rules_req_h) + 72 + status_h)
+            if rules_notebook_req_h > 0:
+                target_h = int(max(nb_req_h, rules_notebook_req_h) + status_h + 8)
+            else:
+                target_h = int(max(nb_req_h, rules_req_h) + 72 + status_h)
             if target_w > 0 and target_h > 0:
                 root.geometry(f"{target_w}x{target_h}")
         except Exception as e:
             print("[Warning] auto-size failed:", e)
+
+    globals()["_EDITOR_FIT_WINDOW_TO_TABS_AND_RULES"] = _fit_window_to_tabs_and_rules
 
     # Size before showing the window (avoid visible resize jump)
     _fit_window_to_tabs_and_rules()
@@ -26827,10 +38029,20 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
         _fit_window_to_tabs_and_rules()
     except Exception:
         pass
+    try:
+        _refresh_root_app_icon()
+        root.update_idletasks()
+    except Exception:
+        pass
     if bool(start_minimized):
         try:
             # On Windows autostart we want the app available in taskbar but not foreground.
             root.deiconify()
+            try:
+                root.update()
+            except Exception:
+                root.update_idletasks()
+            _refresh_root_app_icon()
             root.after(10, root.iconify)
         except Exception:
             try:
@@ -26840,8 +38052,23 @@ time will freeze at the transition (day to night or night to day).""", wraplengt
     else:
         try:
             root.deiconify()
+            try:
+                root.update()
+            except Exception:
+                root.update_idletasks()
+            _refresh_root_app_icon()
         except Exception:
             pass
+    try:
+        root.after(0, _refresh_root_app_icon)
+        root.after(120, _refresh_root_app_icon)
+        root.after(500, _refresh_root_app_icon)
+    except Exception:
+        pass
+    try:
+        root.after(250, lambda: _editor_refresh_language_download_async(root=root))
+    except Exception:
+        pass
     try:
         root.after(40, lambda: _apply_windows_titlebar_theme(root, dark_mode=dark_mode_var.get()))
         root.after(180, lambda: _apply_windows_titlebar_theme(root, dark_mode=dark_mode_var.get()))
@@ -26947,6 +38174,74 @@ def run_self_test():
     for raw_line, expected in process_cases:
         actual = _looks_like_snowrunner_game_process_line(raw_line)
         _check(actual == expected, f"process detection mismatch for sample line: {raw_line!r}")
+
+    discovery_ids = _truck_shop_unlock_ids_for_regions(["US_02", "RU_02"], DISCOVERY_TRUCK_SHOP_UNLOCKS_BY_LEVEL)
+    regional_ids = _truck_shop_unlock_ids_for_regions(["US_02", "RU_02"], REGIONAL_TRUCK_SHOP_UNLOCKS_BY_LEVEL)
+    _check(
+        discovery_ids == ["royal_bm17", "ank_mk38", "tuz_420_tatarin"],
+        f"Alaska/Taymyr discovery shop unlocks mismatch: {discovery_ids!r}",
+    )
+    _check(
+        len(regional_ids) == 10,
+        f"Alaska/Taymyr regional shop unlock count mismatch: {len(regional_ids)}",
+    )
+    ontario_discovery_ids = _truck_shop_unlock_ids_for_regions(["US_09"], DISCOVERY_TRUCK_SHOP_UNLOCKS_BY_LEVEL)
+    _check(
+        ontario_discovery_ids == ["cat_th357", "ank_mk38_ht", "freightliner_114sd", "gmc_9500"],
+        f"Ontario discovery shop unlocks mismatch: {ontario_discovery_ids!r}",
+    )
+    _check(
+        "zikz_566a" not in ontario_discovery_ids,
+        "Ontario ZiKZ 566A should stay in the optional mission/reward bucket",
+    )
+    all_region_codes = [region_code for region_code, _region_label in ALL_REGION_CODE_LABELS]
+    all_discovery_map_entries = 0
+    all_discovery_truck_count = 0
+    for level_id, values in DISCOVERED_TRUCKS_DEFAULTS.items():
+        if not _level_key_matches_regions(level_id, all_region_codes):
+            continue
+        try:
+            level_total = int(values.get("all", 0) or 0)
+        except Exception:
+            level_total = 0
+        if level_total > 0:
+            all_discovery_map_entries += 1
+            all_discovery_truck_count += level_total
+    all_discovery_ids = _truck_shop_unlock_ids_for_regions(all_region_codes, DISCOVERY_TRUCK_SHOP_UNLOCKS_BY_LEVEL)
+    _check(
+        all_discovery_map_entries == 20,
+        f"all-regions discovery map entry count mismatch: {all_discovery_map_entries}",
+    )
+    _check(
+        all_discovery_truck_count == 29,
+        f"all-regions discovered truck counter mismatch: {all_discovery_truck_count}",
+    )
+    _check(
+        len(all_discovery_ids) == 26,
+        f"all-regions unique discovery shop unlock count mismatch: {len(all_discovery_ids)}",
+    )
+    for region_code, _region_label in ALL_REGION_CODE_LABELS:
+        expected_discovery_count = 0
+        for level_id, values in DISCOVERED_TRUCKS_DEFAULTS.items():
+            if _level_key_matches_regions(level_id, [region_code]):
+                try:
+                    expected_discovery_count += int(values.get("all", 0) or 0)
+                except Exception:
+                    pass
+        region_discovery_ids = _truck_shop_unlock_ids_for_regions([region_code], DISCOVERY_TRUCK_SHOP_UNLOCKS_BY_LEVEL)
+        region_regional_ids = _truck_shop_unlock_ids_for_regions([region_code], REGIONAL_TRUCK_SHOP_UNLOCKS_BY_LEVEL)
+        _check(
+            len(region_discovery_ids) == expected_discovery_count,
+            (
+                f"{region_code} discovery shop unlock count mismatch: "
+                f"expected {expected_discovery_count}, got {len(region_discovery_ids)}"
+            ),
+        )
+        missing_from_regional = [truck_id for truck_id in region_discovery_ids if truck_id not in region_regional_ids]
+        _check(
+            not missing_from_regional,
+            f"{region_code} discovery shop unlocks missing from regional table: {missing_from_regional!r}",
+        )
 
     now = 1_700_000_000.0
     _check(_should_run_background_update_check({}, now_ts=now), "background update throttle helper should run with no prior timestamp")
@@ -27079,6 +38374,136 @@ def run_self_test():
     except Exception as e:
         _check(False, f"atomic text writer self-test failed: {e}")
 
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            pak_path = os.path.join(td, "initial.pak")
+            truck_entry = "[media]/classes/trucks/test_truck.xml"
+            addon_entry = "[media]/classes/trucks/addons/test_addon.xml"
+            wheel_entry = "[media]/classes/wheels/test_wheel.xml"
+            template_entry = "[media]/_templates/trucks.xml"
+            truck_xml = (
+                '<Truck><TruckData FuelCapacity="100" HideDistance="120" ShadowHideDistance="80">'
+                '<CameraPos FOV="65" MaxZoom="8" /></TruckData>'
+                '<GameData Country="US,NE,CE" Price="1000" UnlockByRank="2" /></Truck>'
+            )
+            addon_xml = '<TruckAddon><GameData Price="50" /></TruckAddon>'
+            wheel_xml = '<TruckTire><WheelFriction BodyFriction="1.2" /></TruckTire>'
+            template_xml = '<_templates><WheelFriction IsIgnoreIce="false" BodyFriction="2.0" /></_templates>'
+            with zipfile.ZipFile(pak_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(truck_entry, truck_xml)
+                zf.writestr(addon_entry, addon_xml)
+                zf.writestr(wheel_entry, wheel_xml)
+                zf.writestr(template_entry, template_xml)
+
+            def _read_test_entry(entry_name: str) -> str:
+                with zipfile.ZipFile(pak_path, "r") as zf:
+                    text, _encoding = _initial_pak_decode_text(zf.read(entry_name))
+                    return text
+
+            with zipfile.ZipFile(pak_path, "r") as zf:
+                direct_names = _initial_pak_list_entry_names_for_spec(zf, {"direct_trucks": True})
+                _check(truck_entry in direct_names, "direct truck spec did not include direct truck XML")
+                _check(addon_entry not in direct_names, "direct truck spec incorrectly included addon XML")
+
+            ice_state = _initial_pak_analyze_boolean_attr_module(pak_path, "all_tires_ignore_ice")
+            _check(ice_state.get("state") == "default", "initial tire ice state should be default/missing")
+            ice_on = _initial_pak_apply_boolean_attr_module(pak_path, "all_tires_ignore_ice", "on")
+            _check(int(ice_on.get("changed_values") or 0) == 2, "tire ice on should update both WheelFriction tags")
+            _check(_initial_pak_analyze_boolean_attr_module(pak_path, "all_tires_ignore_ice").get("state") == "enabled", "tire ice on did not analyze as enabled")
+            ice_off = _initial_pak_apply_boolean_attr_module(pak_path, "all_tires_ignore_ice", "off")
+            _check(int(ice_off.get("changed_values") or 0) == 2, "tire ice off should update both WheelFriction tags")
+            _check(_initial_pak_analyze_boolean_attr_module(pak_path, "all_tires_ignore_ice").get("state") == "disabled", "tire ice off did not analyze as disabled")
+            _initial_pak_apply_boolean_attr_module(pak_path, "all_tires_ignore_ice", "default")
+            _check('IsIgnoreIce="' not in _read_test_entry(wheel_entry), "tire ice default did not remove added IsIgnoreIce")
+            _check('IsIgnoreIce="false"' in _read_test_entry(template_entry), "tire ice default did not restore existing IsIgnoreIce")
+
+            store_on = _initial_pak_apply_truck_store_everywhere_module(pak_path, "on")
+            _check(int(store_on.get("changed_values") or 0) == 1, "truck store everywhere should update one Country value")
+            _check(_INITIAL_PAK_ALL_STORE_COUNTRIES in _read_test_entry(truck_entry), "truck store everywhere did not write all regions")
+            _initial_pak_apply_truck_store_everywhere_module(pak_path, "default")
+            _check('Country="US,NE,CE"' in _read_test_entry(truck_entry), "truck store everywhere default did not restore country")
+
+            _initial_pak_apply_numeric_module(pak_path, "truck_store_price", 2)
+            _check('Price="2000"' in _read_test_entry(truck_entry), "truck store price multiplier did not update truck price")
+            _check('Price="50"' in _read_test_entry(addon_entry), "truck store price multiplier incorrectly touched addon price")
+            _initial_pak_apply_numeric_module(pak_path, "truck_store_price", 1)
+            _check('Price="1000"' in _read_test_entry(truck_entry), "truck store price default did not restore truck price")
+    except Exception as e:
+        _check(False, f"initial.pak mods self-test failed: {e}")
+
+    try:
+        translation_snapshot = _editor_translation_get_state()
+        try:
+            for language in sorted(_EDITOR_TRANSLATION_SUPPLEMENT_COMMON.keys()):
+                catalog = _editor_translation_catalog_from_payload(language, {}, source="builtin")
+                _EDITOR_TRANSLATION_STATE.update(catalog)
+                _check(
+                    _editor_translate_display_text("Count") != "Count",
+                    f"translation supplement missing Count for {language}",
+                )
+                _check(
+                    _editor_translate_display_text("Update Selected Count") != "Update Selected Count",
+                    f"translation supplement missing Update Selected Count for {language}",
+                )
+                _check(
+                    _editor_translate_display_text("Truck store everywhere") != "Truck store everywhere",
+                    f"mods translation supplement missing Truck store everywhere for {language}",
+                )
+                _check(
+                    _editor_translate_display_text("All tires ignore ice") != "All tires ignore ice",
+                    f"mods translation supplement missing All tires ignore ice for {language}",
+                )
+                _check(
+                    _editor_translate_display_text("Remembered save not found: C:/Save") != "Remembered save not found: C:/Save",
+                    f"translation supplement pattern failed for {language}",
+                )
+        finally:
+            _EDITOR_TRANSLATION_STATE.update(translation_snapshot)
+    except Exception as e:
+        _check(False, f"translation supplement self-test failed: {e}")
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            test_path = os.path.join(td, "CompleteSave.cfg")
+            zone_key = "level_us_18_01 || US_18_01_WAREHOUSE"
+            doc = {
+                "CompleteSave": {
+                    "SslValue": {
+                        "cargoLoadingCounts": {
+                            zone_key: {
+                                "CargoTetrapod": 2,
+                                "CargoWater": 7,
+                            }
+                        }
+                    }
+                },
+                "cfg_version": 1,
+            }
+            _experiments_write_save_doc(test_path, doc, had_null=True)
+            payload = _cargo_loading_read_state(test_path)
+            _check(payload.get("had_null") is True, "cargo loading reader did not detect trailing NUL")
+            _check(payload.get("save_key") == "CompleteSave", "cargo loading reader did not find CompleteSave")
+            zones = payload.get("zones") or {}
+            _check(zones.get(zone_key, {}).get("CargoTetrapod") == 2, "cargo loading reader missed editable cargo")
+            zones[zone_key]["CargoTetrapod"] = 5
+            _cargo_loading_write_state(
+                test_path,
+                zones,
+                save_key=str(payload.get("save_key") or ""),
+                had_null=bool(payload.get("had_null")),
+                raw_zone_map=payload.get("raw_zones"),
+            )
+            with open(test_path, "r", encoding="utf-8") as fh:
+                saved_text = fh.read()
+            _check(saved_text.endswith("\0"), "cargo loading writer did not preserve trailing NUL")
+            saved_doc, saved_had_null, _ = _experiments_read_save_doc(test_path)
+            saved_counts = saved_doc["CompleteSave"]["SslValue"]["cargoLoadingCounts"][zone_key]
+            _check(saved_had_null is True, "cargo loading reread lost trailing NUL flag")
+            _check(saved_counts.get("CargoTetrapod") == 5, "cargo loading writer did not update cargo count")
+            _check(saved_counts.get("CargoWater") == 7, "cargo loading writer did not preserve protected water points")
+    except Exception as e:
+        _check(False, f"cargo loading save round-trip self-test failed: {e}")
+
     class _SelfTestRoot:
         def __init__(self, state_value, viewable):
             self._state_value = state_value
@@ -27122,5 +38547,3 @@ if __name__ == "__main__":
         except Exception:
             pass
         sys.exit(1)
-
-
