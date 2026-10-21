@@ -8,9 +8,9 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 
 <p align="center">
 
-<a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/108a" style="font-size:20px;">➡️ <b>Download for Windows</b></a><br><br>
-<a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/108c" style="font-size:20px;">➡️ <b>Download for Mac</b></a><br><br>
-<a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/108b" style="font-size:20px;">➡️ <b>Download for Linux</b></a>
+<a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/174a" style="font-size:20px;">➡️ <b>Download for Windows</b></a><br><br>
+<a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/174c" style="font-size:20px;">➡️ <b>Download for Mac</b></a><br><br>
+<a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/174b" style="font-size:20px;">➡️ <b>Download for Linux</b></a>
 
 <a href="https://github.com/MrBoxik/SnowRunner-Save-Editor/releases/tag/70" style="font-size:20px;">
   ➡️ <b>Download live video maker in map (windows only)</b>
@@ -54,7 +54,7 @@ A desktop tool to modify your **SnowRunner** save game file using a simple GUI.
 
 > Here is my SnowRunner Save Editor that I made after losing progress in my 300 hour save specifically in the Quebec map.  
 >  
-> All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 18**, and it *should* work fine for upcoming Seasons 19, 20, etc.  
+> All the other save editors I found online weren’t made for the newer seasons, so I made this editor that supports up to **Season 19**, and it *should* work fine for upcoming Seasons 20, 21, etc.  
 >  
 > Also no save editor I found could change **game rules**, **game mode** or **time**, so I added those too.  
 >  
